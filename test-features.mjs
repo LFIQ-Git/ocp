@@ -4167,6 +4167,10 @@ test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SP
   assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
 });
 
+test("models.json aliases.opus === 'claude-opus-5' (opus-alias SPOT)", () => {
+  assert.equal(_spotModels.aliases.opus, "claude-opus-5");
+});
+
 // ── Referential integrity (PR #152 review) ──────────────────────────────────
 // The value-mirror assertions above only prove the alias equals a string literal —
 // they pass even if that literal points at a model that does not exist in
@@ -4178,6 +4182,25 @@ const _spotModelIds = new Set(_spotModels.models.map(m => m.id));
 
 test("models.json: claude-sonnet-5 is present in models[] (the entry this PR adds)", () => {
   assert.ok(_spotModelIds.has("claude-sonnet-5"), "claude-sonnet-5 must exist as a models[].id");
+});
+
+test("models.json: claude-opus-5 is present in models[] (the entry this PR adds)", () => {
+  assert.ok(_spotModelIds.has("claude-opus-5"), "claude-opus-5 must exist as a models[].id");
+});
+
+// The prompt-char budget is GLOBAL (max across every entry × 3 chars/token), not
+// per-model — see lib/prompt.mjs derivePromptCharBudget. An entry declaring a native 1M
+// window would therefore raise the truncation ceiling for claude-haiku-4-5 too (genuinely
+// 200k), turning OCP-side truncation into an upstream API rejection.
+//
+// Asserts the MAX, deliberately, not every entry: ADR 0009 states the budget "scales
+// automatically — no code change", so a future entry with a SMALLER window (say a 128k
+// model) must stay legal and must not fail this suite. Only raising the ceiling is the
+// hazard, and that is an ADR-level decision requiring per-model budgets first.
+test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", () => {
+  const windows = _spotModels.models.map(m => m.contextWindow);
+  assert.equal(Math.max(...windows), 200000,
+    `max contextWindow re-scales MAX_PROMPT_CHARS for ALL models incl. the 200k-native haiku (see lib/prompt.mjs + ADR 0009)`);
 });
 
 test("models.json: every aliases value resolves to a real models[].id (referential integrity)", () => {
