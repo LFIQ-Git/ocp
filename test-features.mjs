@@ -959,7 +959,8 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 // a request — and boot-gate refusals are asserted by the process exit code. Without these, the
 // wiring (extractSystemPrompt using SYSTEM_PROMPT_WRAPPER, the boot gate, the epoch fold) can be
 // silently reverted with the unit suite still green — the maintainer's #1 rejection pattern.
-import { spawn as _ltSpawn } from "node:child_process";
+import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
+import { createServer as _ltNetServer } from "node:net";
 import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
 import { fileURLToPath as _ltF2P } from "node:url";
@@ -984,8 +985,8 @@ exit 0
 
 function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
 function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
-function ltBoot(env, dir) {
-  const child = _ltSpawn(process.execPath, [LT_SERVER], {
+function ltBoot(env, dir, nodeArgs = []) {
+  const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
     env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -1102,6 +1103,95 @@ test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response ca
     assert.equal(off, 1, "first request (cache empty) must spawn claude");
     assert.equal(on, 1, "after toggling the flag the identical request must NOT be served from the old cache (epoch differs → re-spawn)");
   } finally { _ltRm(dir, { recursive: true, force: true }); }
+});
+
+// ── active-request counter is paired to the process lifecycle (#180 / #193) ──
+// The counter used to be incremented ~40 lines before the spawn, while its only decrement
+// (cleanup()) is wired to that proc's events — so any SYNCHRONOUS throw in between leaked +1
+// permanently. Driving that fault needs no production hook and no test double: buildCliArgs
+// does `args.push("--allowedTools", ...ALLOWED_TOOLS)`, and a spread of enough elements throws
+// RangeError synchronously, right inside the window.
+//
+// Getting there on Linux needs one more turn of the screw. The spread's cost is per ELEMENT,
+// so the naive form needs ~124k elements ≈ 250KB in one env var — and Linux caps a single env
+// string at MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072 on x86-64), so execve rejects it (E2BIG).
+// Encoding around it fails too: empty items are 1 byte each, but `.filter(Boolean)`
+// (server.mjs:355) strips them, so ALLOWED_TOOLS ends up empty and the spread branch is never
+// entered at all.
+//
+// The lever is the stack: the throw threshold scales with it, and ltBoot spawns the server, so
+// the test owns its argv. Running the child under --stack-size=200 drops the threshold ~5x
+// (~24k elements ≈ 48KB), which fits Linux's limit with room to spare.
+//
+// The threshold is DISCOVERED, in a child under the SAME --stack-size (measuring it in this
+// process would report the parent's stack, which is not the one that matters), then taken with
+// 1.5x margin and hard-asserted under MAX_ARG_STRLEN. A hard-coded count would silently stop
+// triggering on another machine and the test would pass vacuously.
+const LT_STACK = 200;                 // child V8 stack (KB); lowers the spread-throw threshold
+const LT_MAX_ARG_STRLEN = 131072;     // Linux, x86-64: 32 * 4096
+function ltSpreadThrowCount(stackKb) {
+  // Binary-search the smallest element count whose spread throws, inside a child running with
+  // the stack the server will actually use.
+  const src = `const t=n=>{try{const a=[];a.push("--allowedTools",...Array(n).fill("x"));return false}catch{return true}};` +
+              `let lo=500,hi=400000;if(!t(hi)){console.log(0)}else{while(lo<hi){const m=(lo+hi)>>1;t(m)?hi=m:lo=m+1}console.log(lo)}`;
+  try {
+    return Number(String(_ltExecFile(process.execPath, [`--stack-size=${stackKb}`, "-e", src], { encoding: "utf8" })).trim()) || 0;
+  } catch { return 0; }
+}
+async function ltFreePort() {
+  const srv = _ltNetServer();
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  const p = srv.address().port;
+  await new Promise(r => srv.close(r));
+  return p;
+}
+async function ltPostStatus(port, body) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    return { status: r.status, text: await r.text() };
+  } catch { return { status: 0, text: "" }; }
+}
+
+console.log("\nactive-request counter pairing (#180 / #193):");
+
+test("integration: a synchronous pre-spawn throw must not leak stats.activeRequests", async () => {
+  if (!LT_POSIX) return;
+  const thr = ltSpreadThrowCount(LT_STACK);
+  assert.ok(thr > 0, `no spread-throw threshold found under --stack-size=${LT_STACK}`);
+  const n = Math.ceil(thr * 1.5);                       // margin over the measured threshold
+  const entry = Array(n).fill("x").join(",");
+  const bytes = Buffer.byteLength(entry);
+  // Hard gate: if this ever stops fitting, fail loudly rather than regress to an E2BIG skip.
+  assert.ok(bytes <= LT_MAX_ARG_STRLEN,
+    `env entry ${bytes}B exceeds MAX_ARG_STRLEN ${LT_MAX_ARG_STRLEN}B — lower LT_STACK`);
+  const port = await ltFreePort();
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf } = ltBoot({
+    CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_ALLOWED_TOOLS: entry,
+  }, dir, [`--stack-size=${LT_STACK}`]);
+  let spawnErr = null;
+  child.on("error", e => { spawnErr = e; });
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || spawnErr, 20000);
+    assert.ok(up && !spawnErr, `did not start: ${spawnErr ? spawnErr.message : buf.err.slice(0, 300)}`);
+    const req = { model: "haiku", messages: [{ role: "user", content: "leak-probe" }] };
+    const res = [];
+    for (let i = 0; i < 3; i++) res.push(await ltPostStatus(port, req));
+    // Non-vacuous on two axes: the requests must actually fail, AND the failure must be the
+    // stack overflow from the --allowedTools spread — not some unrelated 500 that a small
+    // stack happened to produce. Without the second check a different fault would still leave
+    // the counter at 0 and the test would "pass" for the wrong reason.
+    assert.deepEqual(res.map(r => r.status), [500, 500, 500],
+      `expected the pre-spawn throw to surface as 500s, got ${res.map(r => r.status)}`);
+    assert.ok(res.every(r => /call stack size exceeded/i.test(r.text)),
+      `500s must come from the spread's RangeError; got: ${res[0].text.slice(0, 200)}`);
+    const r = await fetch(`http://127.0.0.1:${port}/status`);
+    const active = (await r.json()).requests.active;
+    assert.equal(active, 0,
+      `3 requests threw before their spawn; the counter must be back to 0, got ${active} (this is the #180 leak)`);
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
 });
 
 // ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
