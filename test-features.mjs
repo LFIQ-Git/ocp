@@ -991,16 +991,69 @@ function ltBoot(env, dir, nodeArgs = []) {
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const buf = { out: "", err: "", exit: undefined };
+  const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, closeMs: undefined, spawnErr: null, t0: Date.now() };
   child.stdout.on("data", d => { buf.out += d; });
   child.stderr.on("data", d => { buf.err += d; });
-  child.on("exit", code => { buf.exit = code; });
+  // 'exit' fires when the process terminates, but its stdio pipes may still hold unread data —
+  // 'close' is the one that guarantees both are drained. A test that terminates the child and
+  // then asserts on buf.err/buf.out must wait for `closed`, not `exit != null`, or it can read
+  // an empty buffer.
+  child.on("exit", (code, signal) => { buf.exit = code; buf.signal = signal; });
+  child.on("close", () => { buf.closed = true; buf.closeMs = Date.now() - buf.t0; });
+  // Without a listener, a spawn 'error' is re-thrown as an uncaught exception and takes down the
+  // whole runner instead of failing one test.
+  child.on("error", e => { buf.spawnErr = e; });
   return { child, buf };
+}
+// child.kill("SIGKILL") kills server.mjs but NOT the fake `claude` grandchildren it spawned, and
+// those can still be writing sp.txt / spawns.txt into `dir` while rmSync walks it — which surfaced
+// as an intermittent ENOTEMPTY (4/200 in review). Node's own retry loop handles the window.
+function _ltRmRetry(dir) {
+  try { _ltRm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+  catch (e) {
+    // Never throw: this runs in a finally, so a throw here would REPLACE the real assertion
+    // error and make a flake look like a regression. LT_DEBUG surfaces it without that risk.
+    if (process.env.LT_DEBUG) console.warn(`    [ltRmRetry] ${dir}: ${e.code || e.message}`);
+  }
+}
+// Every ltBoot assertion failure should be self-diagnosing. The historical failure text was
+// `expected a local-tools FATAL, got: ` — an empty string, which says nothing about whether the
+// child never wrote, wrote to the other stream, died on a signal, or was never spawned.
+// stdout is sampled HEAD+TAIL, not tail-only. The decisive string for "it booted instead of
+// refusing" is "Local tools: ON", and it lives in the boot banner — a tail-only sample answered
+// the wrong question for exactly the tests this exists to diagnose.
+//
+// The head is sized to the BANNER, not picked round: measured on this tree, the banner runs 1118B
+// with "Local tools: ON" at byte 581, so 900 clears it with ~5 banner lines of margin. That sizing
+// is what makes it robust — the banner is emitted first and is bounded, so however much request
+// noise follows, byte 581 stays in the head. A head of 120 does NOT reach it (verified: the string
+// landed in the elided middle), which is why this is not the obvious small window.
+// stderr stays head-only: a fatal is the first thing it writes.
+function ltHeadTail(s, head = 900, tail = 160) {
+  return s.length <= head + tail ? s : `${s.slice(0, head)}…[${s.length - head - tail}B]…${s.slice(-tail)}`;
+}
+function ltDiag(buf) {
+  // closeMs disambiguates "died before reaching the gate" from "ran, then gated" — an exit=1
+  // with empty stderr is equally consistent with both, and they have unrelated root causes.
+  // node= is here because a Node-version-specific stderr warning (22's SQLite ExperimentalWarning)
+  // once masqueraded as "server did not start" for ~23 of 50 runs on a Linux box.
+  const ms = buf.closeMs !== undefined ? `${buf.closeMs}ms` : `${Date.now() - buf.t0}ms(still open)`;
+  return `exit=${buf.exit} signal=${buf.signal} closed=${buf.closed} closeMs=${ms} node=${process.version}` +
+         (buf.spawnErr ? ` spawnErr=${buf.spawnErr.code || buf.spawnErr.message}` : "") +
+         ` | stderr(${buf.err.length}B)=${JSON.stringify(buf.err.slice(0, 240))}` +
+         ` | stdout(${buf.out.length}B)=${JSON.stringify(ltHeadTail(buf.out))}`;
 }
 async function ltWait(cond, ms = 9000) {
   const start = Date.now();
   while (Date.now() - start < ms) { if (cond()) return true; await new Promise(r => setTimeout(r, 40)); }
   return false;
+}
+async function ltFreePort() {
+  const srv = _ltNetServer();
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  const p = srv.address().port;
+  await new Promise(r => srv.close(r));
+  return p;
 }
 async function ltPost(port, body) {
   try {
@@ -1015,29 +1068,31 @@ console.log("\nOCP_LOCAL_TOOLS integration (boot server.mjs):");
 test("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrapper (kills the no-op mutation)", async () => {
   if (!LT_POSIX) return; // sh fake — skip on Windows CI
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
-  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39321", SP_CAPTURE: cap }, dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), SP_CAPTURE: cap }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
-    await ltPost(39321, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
     assert.ok(await ltWait(() => _ltExists(cap)), "fake claude was spawned and captured --system-prompt");
     const sp = _ltRead(cap, "utf8");
     assert.ok(sp.includes(LT_POS_MARK), `expected POSITIVE wrapper in --system-prompt, got: ${sp.slice(0,90)}`);
     assert.ok(!sp.includes(LT_NEG_MARK), "positive wrapper must REPLACE the negative one, not append");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39322", SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
-    await ltPost(39322, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
     assert.ok(await ltWait(() => _ltExists(cap)), "fake claude captured --system-prompt");
     const sp = _ltRead(cap, "utf8");
     // No system messages + no CLAUDE_SYSTEM_PROMPT → the wrapper is passed verbatim.
     assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`);
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
@@ -1049,25 +1104,47 @@ test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / 
     { label: "anon", env: { PROXY_ANONYMOUS_KEY: "pub" } },
   ];
   try {
-    for (const [i, c] of cases.entries()) {
-      const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(39330 + i), ...c.env }, dir);
+    for (const c of cases) {
+      const port = await ltFreePort();
+      const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), ...c.env }, dir);
       try {
-        assert.ok(await ltWait(() => buf.exit != null), `[${c.label}] expected the process to exit`);
-        assert.notEqual(buf.exit, 0, `[${c.label}] must exit non-zero`);
-        assert.ok(/FATAL[\s\S]*OCP_LOCAL_TOOLS/.test(buf.err), `[${c.label}] expected a local-tools FATAL, got: ${buf.err.slice(0,160)}`);
+        // Wait for `closed`, not `exit`: the assertion below reads buf.err, and stderr is only
+        // guaranteed drained at 'close'. This is the ordering #203 was filed for.
+        assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `[${c.label}] process never closed — ${ltDiag(buf)}`);
+        assert.notEqual(buf.exit, 0, `[${c.label}] must exit non-zero — ${ltDiag(buf)}`);
+        assert.ok(/FATAL[\s\S]*OCP_LOCAL_TOOLS/.test(buf.err), `[${c.label}] expected a local-tools FATAL — ${ltDiag(buf)}`);
       } finally { child.kill("SIGKILL"); }
     }
-  } finally { _ltRm(dir, { recursive: true, force: true }); }
+  } finally { _ltRmRetry(dir); }
 });
 
 test("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
-  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39340" }, dir); // loopback + none
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir); // loopback + none
   try {
-    assert.ok(await ltWait(() => buf.out.includes("listening on")), `safe config must boot, got: ${buf.err.slice(0,200)}`);
-    assert.ok(buf.out.includes("Local tools: ON"), "startup must announce local tools when active");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+    // Same race as #199, one line over: "Local tools: ON" (server.mjs:3640) is written 12
+    // console.log calls after "listening on" (:3627) — 10 of them in this env, since the
+    // SYSTEM_PROMPT and MCP_CONFIG lines are conditional and unset here. Gating on the boot
+    // marker and then asserting the announcement can therefore read a buffer holding only the
+    // first chunk. Wait for the line actually under assertion. Measured by review at 8/200
+    // before this change and 0/200 after — it was the suite's top flake.
+    assert.ok(await ltWait(() => buf.out.includes("Local tools: ON") || buf.closed || buf.spawnErr),
+      `startup must announce local tools when active — ${ltDiag(buf)}`);
+    assert.ok(buf.out.includes("Local tools: ON"),
+      `startup must announce local tools when active — ${ltDiag(buf)}`);
+    // Nails ltHeadTail's head budget to the thing it exists to capture. Without this the
+    // coupling is silent: every added banner line pushes "Local tools: ON" later (Models:
+    // alone is ~18B per model), and the day it crosses 900 the diagnostic degrades back to
+    // the exact blind spot this PR fixed — with no test going red. Measured offset here is
+    // 581 of a 1118B banner, so the margin is ~17 more models.
+    const _ltOffset = buf.out.indexOf("Local tools: ON");
+    assert.ok(_ltOffset < 900,
+      `ltHeadTail's head budget (900B) no longer reaches the local-tools announcement — it is ` +
+      `now at byte ${_ltOffset}. The banner grew. Raise the head in ltHeadTail, or ltDiag will ` +
+      `silently stop showing the one line that distinguishes "booted" from "refused".`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not refused", async () => {
@@ -1075,12 +1152,22 @@ test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not ref
   const dir = ltMkdir(); const fake = ltFake(dir);
   // Non-loopback would normally trip the local-tools gate; under TUI the flag is inert so the
   // gate must NOT fire on its behalf. Use loopback here to isolate TUI's own guards from ours.
-  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39341" }, dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir);
   try {
-    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `did not start: ${buf.err.slice(0,200)}`);
-    assert.ok(!buf.out.includes("Local tools: ON"), "must NOT claim local tools are ON in TUI mode (the wrapper is unused there)");
-    assert.ok(/ignored in TUI mode/.test(buf.out + buf.err), "must warn that OCP_LOCAL_TOOLS is inert under TUI");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+    // Wait for the line actually under assertion, not for a proxy signal. "listening on" and the
+    // inert-flag warning are written independently, so gating on the former and then asserting
+    // the latter is a race — the flake #199 was filed for. Still bounded by the same timeout, and
+    // the boot markers are kept in the predicate so a failed boot ends the wait immediately
+    // rather than burning it.
+    const ready = await ltWait(() => /ignored in TUI mode/.test(buf.out + buf.err)
+                                  || buf.closed || buf.spawnErr);
+    assert.ok(ready, `no inert-flag warning appeared — ${ltDiag(buf)}`);
+    assert.ok(/ignored in TUI mode/.test(buf.out + buf.err),
+      `must warn that OCP_LOCAL_TOOLS is inert under TUI — ${ltDiag(buf)}`);
+    assert.ok(!buf.out.includes("Local tools: ON"),
+      `must NOT claim local tools are ON in TUI mode (the wrapper is unused there) — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
@@ -1098,11 +1185,11 @@ test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response ca
     } finally { child.kill("SIGKILL"); }
   };
   try {
-    const off = await bootOnce({}, 39350);                       // caches "OK" under epoch(negative)
-    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, 39351);  // same DB, epoch(positive) → must MISS → re-spawn
+    const off = await bootOnce({}, await ltFreePort());                       // caches "OK" under epoch(negative)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());  // same DB, epoch(positive) → must MISS → re-spawn
     assert.equal(off, 1, "first request (cache empty) must spawn claude");
     assert.equal(on, 1, "after toggling the flag the identical request must NOT be served from the old cache (epoch differs → re-spawn)");
-  } finally { _ltRm(dir, { recursive: true, force: true }); }
+  } finally { _ltRmRetry(dir); }
 });
 
 // ── active-request counter is paired to the process lifecycle (#180 / #193) ──
@@ -1137,13 +1224,6 @@ function ltSpreadThrowCount(stackKb) {
   try {
     return Number(String(_ltExecFile(process.execPath, [`--stack-size=${stackKb}`, "-e", src], { encoding: "utf8" })).trim()) || 0;
   } catch { return 0; }
-}
-async function ltFreePort() {
-  const srv = _ltNetServer();
-  await new Promise(r => srv.listen(0, "127.0.0.1", r));
-  const p = srv.address().port;
-  await new Promise(r => srv.close(r));
-  return p;
 }
 async function ltPostStatus(port, body) {
   try {
@@ -1191,7 +1271,7 @@ test("integration: a synchronous pre-spawn throw must not leak stats.activeReque
     const active = (await r.json()).requests.active;
     assert.equal(active, 0,
       `3 requests threw before their spawn; the counter must be back to 0, got ${active} (this is the #180 leak)`);
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
@@ -1219,36 +1299,38 @@ console.log("\nCache key resolves the model alias (#194):");
 test("integration: an alias and its canonical target share ONE cache slot (normal path)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39360", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
     const msgs = [{ role: "user", content: "alias-resolution-probe" }];
-    await ltPost(39360, { model: "sonnet", messages: msgs });                 // miss → spawn
+    await ltPost(port, { model: "sonnet", messages: msgs });                 // miss → spawn
     await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
-    await ltPost(39360, { model: "claude-sonnet-5", messages: msgs });        // same resolved model → HIT
+    await ltPost(port, { model: "claude-sonnet-5", messages: msgs });        // same resolved model → HIT
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39361", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
     const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
     const msgs = [{ role: "user", content: "structured-alias-probe" }];
-    await ltPost(39361, { model: "sonnet", messages: msgs, response_format: rf });
+    await ltPost(port, { model: "sonnet", messages: msgs, response_format: rf });
     await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
-    await ltPost(39361, { model: "claude-sonnet-5", messages: msgs, response_format: rf });
+    await ltPost(port, { model: "claude-sonnet-5", messages: msgs, response_format: rf });
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "structured cache key must resolve the alias too — this is the path the epoch-only fix missed");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // MODEL_MAP is models[] + aliases + legacyAliases, so resolving covers legacyAliases for free.
@@ -1257,18 +1339,19 @@ test("integration: an alias and its canonical target share ONE cache slot (STRUC
 test("integration: a legacyAlias shares ONE cache slot with its canonical target", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39364", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
     const msgs = [{ role: "user", content: "legacy-alias-probe" }];
-    await ltPost(39364, { model: "claude-haiku-4-5", messages: msgs });            // legacyAlias
+    await ltPost(port, { model: "claude-haiku-4-5", messages: msgs });            // legacyAlias
     await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
-    await ltPost(39364, { model: "claude-haiku-4-5-20251001", messages: msgs });   // canonical
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: msgs });   // canonical
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "legacyAliases live in MODEL_MAP too — resolving must collapse them onto the canonical slot");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
@@ -1287,11 +1370,11 @@ test("integration: a config change invalidates the STRUCTURED cache too (closes 
     } finally { child.kill("SIGKILL"); }
   };
   try {
-    const off = await bootOnce({}, 39362);                        // caches under epoch(negative wrapper)
-    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, 39363);   // same DB, epoch differs → must re-spawn
+    const off = await bootOnce({}, await ltFreePort());                        // caches under epoch(negative wrapper)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());   // same DB, epoch differs → must re-spawn
     assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
     assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
-  } finally { _ltRm(dir, { recursive: true, force: true }); }
+  } finally { _ltRmRetry(dir); }
 });
 
 // ── Upgrade Tests ──
