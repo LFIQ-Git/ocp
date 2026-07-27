@@ -4382,6 +4382,38 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
   }
 });
 
+// maxTokens is ADVERTISED metadata, not an OCP-enforced limit (#195). OCP never reads it —
+// buildCliArgs passes no output-token flag to the CLI — and OpenClaw reaches a local OCP over
+// `openai-completions`, whose request field (max_completion_tokens) appears nowhere in this repo.
+// It is consumed only by clients that choose to honour it, via setup.mjs / sync-openclaw.mjs /
+// ocp-connect. So the invariant worth testing is simply that models.json tells the truth: each
+// value must equal the model's max_output_tokens.default in the CLI registry.
+//
+// Pinned per model deliberately. A threshold assertion would let every entry sit at some arbitrary
+// value above the bar and still call itself "registry-aligned" — which is the actual claim. Adding
+// a model means adding a row here, and that is the point: the row is where you record what the
+// registry said when you checked.
+// Keys are models.json ids; values are the CLI 2.1.220 registry's max_output_tokens.default,
+// each extracted id-anchored (grep 'id:"<id>"' + the following bytes) — never by bare-string
+// search, which matches cross-references inside OTHER models' records and silently attributes
+// the wrong number. ONE KEY IS NOT A REGISTRY ID: models.json carries the dated haiku id, but
+// the registry record is id:"claude-haiku-4-5" (the dated string appears only as that record's
+// provider_ids.first_party). Anchor the haiku row on the SHORT id; anchoring on the dated one
+// returns nothing, which is what tempts the next reader back into a bare-string search.
+const _spotRegistryMaxTokens = {
+  "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
+  "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
+  "claude-haiku-4-5-20251001": 32000,       // registry id: claude-haiku-4-5
+};
+test("models.json: every maxTokens equals the CLI registry's max_output_tokens.default (#195)", () => {
+  for (const m of _spotModels.models) {
+    const want = _spotRegistryMaxTokens[m.id];
+    assert.ok(want !== undefined,
+      `${m.id} has no recorded registry value — extract it id-anchored from the CLI binary and add a row`);
+    assert.equal(m.maxTokens, want, `${m.id}: models.json says ${m.maxTokens}, CLI registry says ${want}`);
+  }
+});
+
 test("models.json: every legacyAliases value resolves to a real models[].id (referential integrity)", () => {
   for (const [name, target] of Object.entries(_spotModels.legacyAliases || {})) {
     assert.ok(_spotModelIds.has(target), `legacyAliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
