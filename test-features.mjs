@@ -5686,6 +5686,580 @@ test("listKeys does not depend on rows left behind by an earlier or concurrent r
   assert.equal(mine.length, 1, "exactly one test-user-1 — a shared store would accumulate duplicates");
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ── ocp-connect model-registry coverage (issue #210) ─────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// `ocp-connect` is a user-facing installer that writes model metadata straight into the
+// user's OpenClaw registry (~/.openclaw/openclaw.json). Before this PR, `test-features.mjs`
+// mentioned `ocp-connect` exactly once (`grep -c 'ocp-connect' test-features.mjs` -> `1`) — a
+// comment noting it as a maxTokens consumer, not a test — and exercised none of its logic. Two
+// real defects shipped in exactly this uncovered surface and were caught only by human review
+// during #208's review: the unknown-id fallback over-advertised by 4x (8192 -> 32000), and a
+// comment describing the family maxTokens table misdescribed its own scope. Meanwhile the
+// equivalent claim on the models.json side of the same feature IS pinned and mutation-verified
+// (`_spotRegistryMaxTokens` above, #195/#208). This section brings ocp-connect's classifier up
+// to the same bar.
+//
+// Harness (verified during #208's review, see #210): the REAL `model_meta` table and REAL
+// `get_model_meta()` function are sliced out of ocp-connect's own source verbatim — between two
+// textual anchors — and exec'd in a fresh python namespace, in a child `python3` process.
+// Nothing here is a JS re-implementation ("replica") of the classifier: a change to
+// ocp-connect's table, its prefix-matching order, or its fallback is a change to what this
+// harness EXECUTES, not merely what it reads. A test that grepped ocp-connect's source text for
+// an expected number would not do that — it would pin whatever string is on the page today,
+// including a wrong one, and miss any regression that changes the computed VALUE without
+// changing the literal text near it.
+//
+// Scope, precisely: covers the classifier (`model_meta` + `get_model_meta()`) AND the loop that
+// maps its output into `provider.models` entries (still pure in-memory — no file I/O). It does
+// NOT cover: the JSON config load/merge/write that follows, per-agent auth-profile seeding, or
+// any network/install path (connectivity probing, shell-rc rewriting, launchctl/systemd env
+// writes) — those are out of scope per #210 and untouched here. (#218 review MED-3: an earlier
+// draft of this section claimed to cover "the model metadata ocp-connect hands OpenClaw" without
+// actually reaching the mapping loop — narrowed here, and the mapping loop is now covered by a
+// dedicated test below instead of just a narrower claim.)
+console.log("\nocp-connect model registry (#210):");
+
+const _ocConnectPath = spotJoin(_spotDir, "ocp-connect");
+
+// Every python harness below slices ocp-connect's source between two textual anchors and execs
+// the slice. Four failure modes were found across three rounds of #218 review:
+//   - MED-1a: an anchor that fails to match makes `.index()` throw — loud, fine. But if the
+//     START and END anchors are found in the WRONG order (or the slice is otherwise degenerate),
+//     python slicing silently returns `''`, and `py_compile`/`exec` on an empty string trivially
+//     "succeeds" — a vacuous pass, not a check. Guarded in every harness below: each asserts its
+//     slice is non-empty and contains what it must contain before doing anything with it.
+//   - MED-1b: `.index(marker)` (no bound) matches the FIRST occurrence of `marker` in the whole
+//     file. If unrelated code elsewhere in ocp-connect ever introduces an earlier occurrence of
+//     the same text, the slice silently grows or shifts. Concretely: `for mid in model_ids:`
+//     appears twice in ocp-connect (the classify loop, and the alias-building loop 49 lines
+//     later); renaming the FIRST one makes the (unbounded) end-anchor search land on the SECOND,
+//     and the slice silently grows to include code that was never meant to be in it. Guarded in
+//     every harness below by a narrow assertion naming the SPECIFIC adjacent-section markers
+//     each slice must never contain (`os.makedirs` / `open(config_path` / `provider = {`,
+//     depending on which section is adjacent) — this is a slice-CORRECTNESS check, distinct from
+//     the file-I/O concern below, and stays a substring check because false positives here are
+//     rare (these are long, specific strings unlikely to appear by coincidence) and a hit is
+//     genuinely informative (it means the slice boundary moved).
+//   - round-2 MED-1: `_OC_PROVIDER_PY` — the harness ending closest to ocp-connect's real config
+//     writer, right before `if os.path.exists(config_path)` — had NO 1b-style guard at all,
+//     unlike its siblings. What stopped it from actually running that writer was `config_path`
+//     being undefined (a NameError), not a guard: ordering luck. Demonstrated by mutation-proof:
+//     inserting `os.makedirs(...)` + `open(..., "w")` between the write loop and that line made
+//     `npm test` actually create a directory and write a file, all green.
+//   - round-3 MED-1: the round-2 fix — copy the 1b-style two-marker check into `_OC_PROVIDER_PY`,
+//     then (when THAT was shown bypassable by `open("<arbitrary path>", "w")`, containing
+//     neither marker) broaden it to a blanket `'open(' not in blk and 'os.' not in blk` in every
+//     harness — was ALSO bypassed, by `pathlib.Path(...).write_text(...)`, which contains
+//     neither substring either and also wrote a real file. Three rounds, one shape: no substring
+//     denylist can express "this code cannot touch the filesystem", because that is a property
+//     of what the code may DO at runtime, not of what substrings appear in its source text —
+//     and a broad enough denylist to catch every I/O idiom (pathlib, shutil, subprocess,
+//     `__import__`, tempfile, ...) starts also matching unrelated PROSE: adding "Deliberately
+//     does no os.path work." to a docstring inside the slice broke 7 unrelated tests (measured).
+//     The blanket ban has therefore been REMOVED (not weakened further) in favor of an actual
+//     capability boundary: every harness that calls `exec(blk, ns)` now passes an explicit,
+//     minimal `ns["__builtins__"]` — Python only auto-injects the real, unrestricted
+//     `__builtins__` module when the exec namespace has no `__builtins__` key at all, so
+//     supplying our own dict containing ONLY the names the slice actually calls (confirmed
+//     sufficient, and confirmed to leave real output byte-for-byte unchanged, by diffing
+//     restricted vs. unrestricted execution of the real slice) pre-empts that injection. Bare
+//     names not in that dict — `open`, `__import__` (which `import pathlib` etc. compile down
+//     to), and everything reachable only through them — raise `NameError`/`ImportError` before a
+//     single byte moves. This is a property of the CODE PATH taken at exec time, not of the
+//     source text, so it is not defeated by a new I/O idiom nobody has thought of yet, and it
+//     cannot be tripped by an unrelated comment either.
+//     SCOPE, stated exactly rather than absolutely: this is a DRIFT guard, not an adversarial
+//     sandbox. Deliberate dunder traversal still reaches the filesystem — `len.__self__.open(...)`
+//     writes a real file (measured), as does `json.__builtins__['open']` in the harness that
+//     passes `json` as a namespace key. That is out of scope on purpose: the failure mode this
+//     defends against is a slice ACCIDENTALLY growing into ocp-connect's installer section, and
+//     all three real bypasses found in review were ordinary edits (`os.makedirs`, a bare
+//     `open()`, `pathlib.write_text`), not dunder walks. Nobody writes `len.__self__` by accident
+//     in an embedded python block. The standing constraint on this repo is that ocp-connect is
+//     never run end-to-end because it writes the user's OpenClaw registry; a harness that can
+//     silently begin exec'ing that writer is the one shape that must not exist here, and this
+//     closes that — for accidents, which is the whole threat model.
+
+// --- Harness 1: classify one or more model ids through ocp-connect's REAL model_meta table +
+// REAL get_model_meta() (verbatim exec — the exact slice given in #210's own harness sketch). ---
+const _OC_CLASSIFY_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
+# #218 round-3 review: a substring denylist (round 2's blanket 'open('/'os.' ban, which used to
+# be here) is NOT a capability boundary and was DROPPED, not just weakened: it scans the WHOLE
+# slice including comments, so a purely cosmetic docstring edit ("Deliberately does no os.path
+# work.") broke this test with an unreadable false positive (measured: 7 unrelated tests failed
+# from that one-line comment). Worse, it was bypassable anyway - pathlib.Path(...).write_text(
+# ...), shutil.rmtree, __import__('os').remove and others contain NEITHER 'open(' NOR 'os.' and
+# sailed straight past it, actually writing a file to disk (verified via mutation-proof).
+# Restricting __builtins__ to exactly what this block needs (sorted, len - confirmed sufficient
+# by diffing real output with/without the restriction) is the actual capability boundary:
+# pathlib/shutil/subprocess/__import__/open all NameError or ImportError before a single byte
+# moves, because Python only auto-injects the real __builtins__ module when the exec namespace
+# has no '__builtins__' key at all - supplying our own dict (with only the names this block
+# calls) pre-empts that injection, and it does so on CODE, not on the presence of a string
+# anywhere in the slice, so it cannot be fooled by an unrelated comment either way.
+ns = {"__builtins__": {"sorted": sorted, "len": len}}
+exec(blk, ns)
+ids = json.loads(sys.argv[2])
+out = {mid: ns['get_model_meta'](mid) for mid in ids}
+sys.stdout.write(json.dumps(out))
+`;
+
+function _ocClassify(ids) {
+  const raw = execFileSync(
+    "python3",
+    ["-c", _OC_CLASSIFY_PY, _ocConnectPath, JSON.stringify(ids)],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(raw);
+}
+
+// --- Harness 2: pull the REAL model_meta table itself (not a classification of a specific id)
+// out of ocp-connect, so it can be compared to a pinned snapshot BY EQUALITY (see the
+// "matches a pinned snapshot EXACTLY" test below, #218 review HIGH-2). ---
+const _OC_TABLE_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
+# #218 round-3 review: a substring denylist (round 2's blanket 'open('/'os.' ban, which used to
+# be here) is NOT a capability boundary and was DROPPED, not just weakened: it scans the WHOLE
+# slice including comments, so a purely cosmetic docstring edit ("Deliberately does no os.path
+# work.") broke this test with an unreadable false positive (measured: 7 unrelated tests failed
+# from that one-line comment). Worse, it was bypassable anyway - pathlib.Path(...).write_text(
+# ...), shutil.rmtree, __import__('os').remove and others contain NEITHER 'open(' NOR 'os.' and
+# sailed straight past it, actually writing a file to disk (verified via mutation-proof).
+# Restricting __builtins__ to exactly what this block needs (sorted, len - confirmed sufficient
+# by diffing real output with/without the restriction) is the actual capability boundary:
+# pathlib/shutil/subprocess/__import__/open all NameError or ImportError before a single byte
+# moves, because Python only auto-injects the real __builtins__ module when the exec namespace
+# has no '__builtins__' key at all - supplying our own dict (with only the names this block
+# calls) pre-empts that injection, and it does so on CODE, not on the presence of a string
+# anywhere in the slice, so it cannot be fooled by an unrelated comment either way.
+ns = {"__builtins__": {"sorted": sorted, "len": len}}
+exec(blk, ns)
+sys.stdout.write(json.dumps(ns['model_meta']))
+`;
+
+function _ocModelMetaTable() {
+  const raw = execFileSync("python3", ["-c", _OC_TABLE_PY, _ocConnectPath], { encoding: "utf8" });
+  return JSON.parse(raw);
+}
+
+// --- Harness 3: drive the REAL model_meta/get_model_meta block AND the REAL loop that maps
+// get_model_meta's output into provider.models entries (the code `_ocClassify` above never
+// reaches — #218 review MED-3). Still pure in-memory: the slice stops at "# Load or create
+// config", strictly before any file read/write. `provider` is seeded as an empty
+// {"models": []} rather than sliced from ocp-connect's own `provider = {...}` (which needs
+// `base_url`/`api_key` this harness deliberately doesn't supply) — the loop only ever appends
+// to provider["models"], so this is sufficient to observe its output. ---
+const _OC_PROVIDER_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+start_marker = 'model_meta = {'
+end_marker = '\\n\\n# Load or create config'
+si = src.index(start_marker)
+ei = src.index(end_marker, si)
+blk = src[si:ei]
+assert blk.strip(), "empty slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'for mid in model_ids' in blk, "slice missing the provider.models write loop - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 round-2 review MED-1: " \\
+    "this harness is the one pushed closest to file I/O, and is the one that must never reach it)"
+# #218 round-3 review: even the two-KNOWN-marker denylist above (added in round 2, itself a fix
+# for round 1 having NO guard here at all) was shown insufficient by mutation-proof:
+# open("<arbitrary path>", "w") contains neither 'os.makedirs' nor 'open(config_path' and wrote
+# a real file to disk, 473/0 green. A follow-up blanket 'open('/'os.' ban (still just a
+# denylist) was THEN shown insufficient too - pathlib.Path(...).write_text(...) contains
+# neither substring and also wrote a real file - AND it scanned comments, so it was DROPPED
+# rather than kept (a purely cosmetic docstring edit elsewhere in this slice broke 7 unrelated
+# tests with an unreadable false positive; measured). Three rounds, one shape: no substring
+# denylist can express "cannot touch the filesystem", because that is a property of what the
+# code may DO, not of what it SAYS. Restricting __builtins__ to exactly what this block needs
+# (sorted, len - confirmed sufficient by diffing real output with/without the restriction) is
+# THE capability boundary that actually matters here, since this is the harness pushed closest
+# to ocp-connect's real config writer and the standing constraint on this repo is that
+# ocp-connect is never run end-to-end: pathlib/shutil/subprocess/__import__/open all NameError
+# or ImportError before a single byte moves, because Python only auto-injects the real
+# __builtins__ module when the exec namespace has no '__builtins__' key at all - supplying our
+# own dict (with only the two names this block actually calls) pre-empts that injection, on
+# CODE rather than on text, so an unrelated comment cannot trip it either way.
+ids = json.loads(sys.argv[2])
+ns = {"model_ids": ids, "provider": {"models": []}, "__builtins__": {"sorted": sorted, "len": len}}
+exec(blk, ns)
+sys.stdout.write(json.dumps(ns["provider"]["models"]))
+`;
+
+function _ocBuildProviderModels(ids) {
+  const raw = execFileSync(
+    "python3",
+    ["-c", _OC_PROVIDER_PY, _ocConnectPath, JSON.stringify(ids)],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(raw);
+}
+
+// --- Harness 4: drive ocp-connect's REAL /v1/models-JSON-parse try/except verbatim, with a
+// caller-supplied `models_json_str`, and return the resulting `model_ids`. This is how the
+// hardcoded three-id fallback list (used when /v1/models JSON fails to parse) is obtained below
+// — by actually running the real except: branch with malformed input, not by reading the
+// literal off the page. ---
+const _OC_FALLBACK_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+start_marker = "try:\\n    models_data = json.loads(models_json_str)"
+end_marker = "\\n\\n# Build provider entry"
+si = src.index(start_marker)
+ei = src.index(end_marker, si)
+blk = src[si:ei]
+assert blk.strip(), "empty fallback slice - anchor drift (see #218 review MED-1a)"
+assert 'except:' in blk, "slice missing the except: branch - anchor drift"
+assert 'provider = {' not in blk, "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
+# #218 round-3 review: round 2's blanket 'open('/'os.' ban used to be here — dropped, not kept,
+# per the same reasoning as the other harnesses: bypassable (pathlib etc.) AND scans comments
+# (a false-positive risk, measured elsewhere in this file). Same capability-boundary fix
+# instead. This slice's try/except body needs zero bare builtin calls (json is passed in
+# explicitly as a namespace key, not looked up as a builtin), so the restricted __builtins__
+# set is empty — confirmed by diffing real output (both the well-formed and malformed-JSON
+# branches) with/without it.
+ns = {"json": json, "models_json_str": sys.argv[2], "__builtins__": {}}
+exec(blk, ns)
+sys.stdout.write(json.dumps(ns["model_ids"]))
+`;
+
+function _ocFallbackModelIds(modelsJsonStr) {
+  const raw = execFileSync(
+    "python3",
+    ["-c", _OC_FALLBACK_PY, _ocConnectPath, modelsJsonStr],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(raw);
+}
+
+// Registry ground truth for ids ocp-connect's classifier might be handed but that are NOT in
+// models.json (so absent from `_spotRegistryMaxTokens` above). Manually pinned from the CLI
+// 2.1.220 binary, id-anchored:
+//   grep -ao 'id:"<id>".\{0,700\}' <binary> | grep -o 'max_output_tokens:{default:[0-9]*'
+// (a 400-byte window silently truncates before reaching max_output_tokens for these particular
+// records — different window widths give different results, per the #210 extraction protocol;
+// 700 bytes was confirmed sufficient for every id below). All three are opus-family ids the CLI
+// registry caps at 32000 that ocp-connect's 64000 opus row would over-advertise 2x; ocp-connect's
+// own comment names only two of them (-4-0/-4-5) — claude-opus-4-1 is the same defect class and
+// was missing from that comment (#218 review MED-6: re-verified id-anchored, added here).
+//
+// On the CURRENT tree none of these three are actually reached by any passing assertion — the
+// hardcoded fallback list below resolves entirely via `_spotRegistryMaxTokens`/`legacyAliases`
+// — so this map's only current reader is the mutation-proof for the "hardcoded three-id ...
+// fallback" test (swap an id into that list and this is what gives the swapped-in id's ground
+// truth). It earns its place by making that test's coverage provable beyond models.json's own
+// members, not by being exercised on every green run (#218 review MED-5).
+const _ocKnownRegistryExtras = {
+  "claude-opus-4-0": 32000,
+  "claude-opus-4-1": 32000,
+  "claude-opus-4-5": 32000,
+};
+
+// Resolve the registry ground truth for an id ocp-connect might classify: directly (a
+// models.json id), via models.json's legacyAliases/aliases (e.g. the hardcoded fallback's bare
+// "claude-haiku-4" -> "claude-haiku-4-5-20251001"), or via the manually-pinned extras above.
+function _ocRegistryTruth(id) {
+  if (id in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[id];
+  const viaLegacy = (_spotModels.legacyAliases || {})[id];
+  if (viaLegacy && viaLegacy in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[viaLegacy];
+  const viaAlias = (_spotModels.aliases || {})[id];
+  if (viaAlias && viaAlias in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[viaAlias];
+  if (id in _ocKnownRegistryExtras) return _ocKnownRegistryExtras[id];
+  return undefined;
+}
+
+// #218 review HIGH-1: every harness above assumes bash hands python ocp-connect's python-block
+// source TEXT byte-for-byte — true only because the heredoc delimiter is QUOTED (<<'PYEOF').
+// An UNQUOTED heredoc (<<PYEOF) makes bash shell-expand $vars / $(...) / `...` in the body
+// BEFORE python ever sees it, so the running program would silently differ from the text this
+// harness reads — invisibly to every other test in this section. This is the test that actually
+// checks the premise the rest of the section depends on.
+test("ocp-connect: the model-metadata heredoc is QUOTED (<<'PYEOF') — the harness's fidelity premise", () => {
+  const ocSrc = spotReadFileSync(_ocConnectPath, "utf8");
+  // Anchor on the FULL opener line, not the bare `<<'PYEOF'` token: ocp-connect has a SECOND,
+  // unrelated heredoc later in the file (the shell-rc rewriter) that is ALSO `<<'PYEOF'`-quoted,
+  // so a bare substring check would stay true even if THIS heredoc — the one that actually feeds
+  // the model_meta/get_model_meta block every other test in this section reads — got unquoted.
+  // (Caught in review of this very test: mutating just this line to `<<PYEOF` left the naive
+  // `ocSrc.includes("<<'PYEOF'")` check trivially true because of that second heredoc.)
+  const openerLine =
+    'python3 - "$oc_config" "$base_url" "$key" "$provider_name" "$priority_choice" "$models_out" <<\'PYEOF\' && py_ok=1';
+  assert.ok(ocSrc.includes(openerLine),
+    "ocp-connect's model-metadata heredoc must stay quoted (<<'PYEOF'); an unquoted heredoc " +
+    "(<<PYEOF) lets bash shell-expand the python body before python sees it, silently " +
+    "invalidating the fidelity premise every other test in this section depends on — and note " +
+    "that ocp-connect's OTHER heredoc (the shell-rc rewriter) being quoted is not sufficient, " +
+    "this must check THIS specific opener line");
+});
+
+test("ocp-connect: `bash -n` reports no syntax errors", () => {
+  execFileSync("bash", ["-n", _ocConnectPath], { encoding: "utf8" });
+});
+
+test("ocp-connect: the embedded model_meta/get_model_meta python block compiles (py_compile)", () => {
+  const script = `
+import sys, py_compile, tempfile, os
+src = open(sys.argv[1]).read()
+blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
+# No __builtins__ capability boundary here (#218 round-3 review LOW): this script never
+# exec()s the slice, only py_compile.compile()s it - a syntax check, not a code path. The
+# slice's own file-write idioms (if any got in via anchor drift) would never run; only the
+# actual write calls below (os.write/os.remove on THIS script's own tempfiles, using ITS OWN
+# real builtins) do, and those are not slice content. The capability boundary in H1/H2/H3/H4/H5
+# exists because THEY exec(); this one is exempt for that reason, not by oversight.
+fd, path = tempfile.mkstemp(suffix='.py')
+os.write(fd, blk.encode())
+os.close(fd)
+# py_compile's default cfile writes a .pyc into a __pycache__/ dir next to \`path\` that nothing
+# then cleans up (#218 review LOW). Route it at an explicit second tempfile instead (newer
+# CPython's py_compile refuses non-regular-file targets like os.devnull with FileExistsError,
+# so that shortcut doesn't work here) and remove both, regardless of outcome.
+cfd, cpath = tempfile.mkstemp(suffix='.pyc')
+os.close(cfd)
+try:
+    py_compile.compile(path, cfile=cpath, doraise=True)
+finally:
+    os.remove(path)
+    os.remove(cpath)
+`;
+  execFileSync("python3", ["-c", script, _ocConnectPath], { encoding: "utf8" });
+});
+
+// Exact snapshot of ocp-connect's model_meta table — name + reasoning + maxTokens, checked by
+// EQUALITY, not just an upper bound. The <=-based tests below only forbid OVER-advertising
+// maxTokens; on their own they are blind to: a DELETED row (falls through to the unknown-id
+// 8192 fallback, which is <= every registry value, so passes silently); an UNDER-advertising
+// drift (also <= by definition — "safe" is exactly why <= alone lets it through); a wrong
+// `name` (never compared anywhere below, and it is the literal string written into the user's
+// ~/.openclaw/openclaw.json model picker); or maxTokens silently becoming a STRING (JS's `<=`
+// operator coerces `"32000" <= 32000` to `true`). This is the one assertion that catches all
+// four (#218 review HIGH-2 / MED-4).
+const _OC_EXPECTED_MODEL_META_TABLE = {
+  "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000 },
+  "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000 },
+  "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000 },
+};
+
+test("ocp-connect: model_meta table matches a pinned snapshot EXACTLY (name + reasoning + maxTokens, not just an upper bound)", () => {
+  const table = _ocModelMetaTable();
+  assert.deepEqual(table, _OC_EXPECTED_MODEL_META_TABLE,
+    "ocp-connect's model_meta table drifted from the pinned snapshot above — a deleted row, an " +
+    "under-advertising drift, a changed `name`, or a stringified maxTokens would all pass the " +
+    "<=-based tests below silently; this is the test that catches them");
+});
+
+test("ocp-connect: every models.json id classifies at or below its CLI-registry maxTokens (never over-advertises)", () => {
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  for (const m of _spotModels.models) {
+    const got = classified[m.id];
+    assert.ok(got, `ocp-connect get_model_meta returned nothing for ${m.id}`);
+    const want = _spotRegistryMaxTokens[m.id];
+    assert.ok(want !== undefined,
+      `${m.id} has no recorded registry value — see _spotRegistryMaxTokens above`);
+    assert.ok(got.maxTokens <= want,
+      `ocp-connect over-advertises ${m.id}: classifies maxTokens=${got.maxTokens}, but the CLI ` +
+      `registry caps it at ${want} — this is the #208 defect class (unknown-id fallback raised ` +
+      `8192->32000, over-advertising by 4x)`);
+  }
+});
+
+test("ocp-connect: reasoning classification matches models.json ground truth for every id", () => {
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  for (const m of _spotModels.models) {
+    assert.equal(classified[m.id].reasoning, m.reasoning,
+      `${m.id}: ocp-connect classifies reasoning=${classified[m.id].reasoning}, models.json says ${m.reasoning}`);
+  }
+});
+
+// ocp-connect's write loop emits THREE fields per entry that are LITERAL CONSTANTS, not derived
+// from get_model_meta() at all: `input`, `cost`, `contextWindow` (ocp-connect:173-175). The test
+// below ALSO diffs meta-derived fields (name/reasoning/maxTokens) against get_model_meta()'s own
+// return value — but that diff structurally cannot see these three, because get_model_meta()
+// never returns them; there is nothing on the "expected" side to compare against. #218 round-2
+// review MED-2: mutating any of the three (contextWindow 200000->2000000, cost.input 0->999,
+// input ["text"]->["text","image"]) passed 472/0 green. Pinned here as an exact snapshot, the
+// same way HIGH-2 pins the model_meta table — this is what closes that gap and is what makes the
+// "covers ... the loop" scope claim above actually true (previously only 4 of the 7 fields the
+// loop writes were checked).
+const _OC_EXPECTED_PROVIDER_MODEL_LITERALS = {
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 200000,
+};
+
+test("ocp-connect: the provider.models write loop produces the exact entry — meta-derived fields verbatim, plus the pinned literal constants", () => {
+  // #218 review MED-3: the classify-based tests above call get_model_meta() directly and never
+  // exercise the loop that actually maps its return value into the provider.models entries OCP
+  // hands OpenClaw (`"maxTokens": meta["maxTokens"]` etc. — ocp-connect:169-177). A mutation to
+  // THAT mapping (e.g. hardcoding maxTokens to 999999 regardless of what get_model_meta
+  // returned) was invisible to every test above, including the one literally named "never
+  // over-advertises". This drives the real loop (Harness 3, still pure in-memory) and diffs its
+  // output against the real classifier's output for the same ids.
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  const built = _ocBuildProviderModels(ids);
+  assert.equal(built.length, ids.length, "provider.models must have exactly one entry per requested id");
+  for (const entry of built) {
+    const meta = classified[entry.id];
+    assert.ok(meta, `provider.models has an entry for ${entry.id} that get_model_meta never classified`);
+    // JSON.stringify every operand below (#218 round-3 review: a bare template-literal
+    // interpolation renders a STRING "200000" and the NUMBER 200000 identically as `200000`,
+    // making a type-only mutation's failure message read as "200000, want 200000" — true but
+    // useless. JSON.stringify renders them as `"200000"` vs `200000`, so the type is visible.
+    assert.equal(entry.maxTokens, meta.maxTokens,
+      `${entry.id}: provider.models maxTokens=${JSON.stringify(entry.maxTokens)} does not match ` +
+      `get_model_meta's maxTokens=${JSON.stringify(meta.maxTokens)} — the write loop is not ` +
+      `copying the classifier's output verbatim`);
+    assert.equal(entry.reasoning, meta.reasoning,
+      `${entry.id}: provider.models.reasoning=${JSON.stringify(entry.reasoning)} does not match ` +
+      `get_model_meta's classification (${JSON.stringify(meta.reasoning)})`);
+    assert.equal(entry.name, meta.name,
+      `${entry.id}: provider.models.name=${JSON.stringify(entry.name)} does not match get_model_meta's classification`);
+    // MED-2: the three literal-constant fields — invisible to the meta-diff above by construction.
+    assert.deepEqual(entry.input, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.input,
+      `${entry.id}: provider.models.input=${JSON.stringify(entry.input)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.input)}`);
+    assert.deepEqual(entry.cost, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost,
+      `${entry.id}: provider.models.cost=${JSON.stringify(entry.cost)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost)}`);
+    assert.equal(entry.contextWindow, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow,
+      `${entry.id}: provider.models.contextWindow=${JSON.stringify(entry.contextWindow)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow)}`);
+  }
+});
+
+// 8192 is the GLOBAL MINIMUM max_output_tokens.default across all 17 records in the CLI 2.1.220
+// registry (distinct values: 8192 / 32000 / 64000 — confirmed via
+//   grep -ao 'max_output_tokens:{default:[0-9]*' <binary> | grep -oE '[0-9]+$' | sort -un
+// which counts VALUES, not id-paired records, per the #210 extraction protocol: a fixed-width
+// id-anchored window is silently incomplete, but a global "what are the distinct values" scan
+// needs no id pairing at all). Raising the unknown-id fallback above this is exactly the #208
+// defect: it over-advertised claude-3-5-haiku / claude-3-5-sonnet (both capped at 8192) by 4x.
+const _OC_REGISTRY_GLOBAL_MIN_MAX_TOKENS = 8192;
+
+test("ocp-connect: an id matching no family prefix falls back to the registry global minimum (8192)", () => {
+  const unknownId = "totally-unrecognized-model-id-zzz";
+  const classified = _ocClassify([unknownId]);
+  const got = classified[unknownId];
+  assert.equal(got.maxTokens, _OC_REGISTRY_GLOBAL_MIN_MAX_TOKENS,
+    `unknown-id fallback maxTokens=${got.maxTokens}, want the registry global minimum ${_OC_REGISTRY_GLOBAL_MIN_MAX_TOKENS}`);
+  assert.equal(got.reasoning, false, "unknown-id fallback must not claim reasoning support");
+  // #218 round-2 review LOW: unpinned before this — the model_meta snapshot test (HIGH-2) pins
+  // the TABLE, not this separate `return {"name": mid + " (OCP)", ...}` fallback path, and the
+  // write-loop test (MED-3) can't catch a mutation here either: both sides of that diff call the
+  // SAME (mutated) get_model_meta(), so a wrong name cancels out against itself. This is the one
+  // place with independent ground truth for it.
+  assert.equal(got.name, unknownId + " (OCP)",
+    `unknown-id fallback name=${JSON.stringify(got.name)}, want ${JSON.stringify(unknownId + " (OCP)")}`);
+});
+
+// --- Harness 5: verify get_model_meta()'s prefix-length sort (`sorted(model_meta.items(), key=
+// lambda x: -len(x[0]))`, ocp-connect:155) by feeding the REAL function a SYNTHETIC overlapping-
+// prefix table it never sees in production — ocp-connect's own three keys never overlap today —
+// and checking it walks longest-prefix-first. `exec(blk, ns)` makes `ns` the function's
+// `__globals__`, so overwriting `ns['model_meta']` AFTER exec is what the function sees on every
+// subsequent call: this drives the REAL sort/match loop against a case the current table can't
+// exercise, not a re-implementation of "longest prefix wins" in JS. ---
+const _OC_PREFIX_SORT_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
+# #218 round-3 review: same capability-boundary fix as the other harnesses that exec this slice
+# (H1/H2/H3) — restrict __builtins__ to exactly sorted+len rather than a bypassable, comment-
+# scanning substring denylist (round 2's blanket 'open('/'os.' ban used to be here; dropped for
+# the same reasoning documented at H1 above). Confirmed the override technique below
+# (ns['model_meta'] = ... after exec) still works identically under the restriction, since it
+# never touches __builtins__.
+ns = {"__builtins__": {"sorted": sorted, "len": len}}
+exec(blk, ns)
+ns['model_meta'] = {
+    "a": {"name": "SHORT", "reasoning": False, "maxTokens": 1},
+    "ab": {"name": "LONG", "reasoning": True, "maxTokens": 2},
+}
+result = ns['get_model_meta']("abc")
+sys.stdout.write(json.dumps(result))
+`;
+
+function _ocClassifyWithOverlappingPrefixTable() {
+  const raw = execFileSync("python3", ["-c", _OC_PREFIX_SORT_PY, _ocConnectPath], { encoding: "utf8" });
+  return JSON.parse(raw);
+}
+
+test("ocp-connect: get_model_meta matches the LONGEST (most specific) overlapping prefix, not table order", () => {
+  // #218 round-2 review LOW: the sort is a TRUE NO-OP today — none of "claude-opus" /
+  // "claude-sonnet" / "claude-haiku" is a prefix of another, so removing it is 472/0 green on
+  // the current table. Per the source comment (PR #152 review) it becomes load-bearing the
+  // instant a future key IS a prefix of another (a bare "claude" fallback key, or a more
+  // specific override). A dict in insertion order would match "a" (SHORT) first here; the sort
+  // must make "ab" (LONG) win instead.
+  const result = _ocClassifyWithOverlappingPrefixTable();
+  // Sentinel (#218 round-3 review R7): separates "the ns['model_meta'] override after exec()
+  // never took effect" (id "abc" fell through to the REAL, un-overridden model_meta, matched
+  // nothing, and hit the unknown-id fallback — {"name": "abc (OCP)", "maxTokens": 8192}) from
+  // "the sort picked the wrong prefix". Without this, a broken override and a broken sort would
+  // both fail the assertion below with superficially similar-looking output, and its message
+  // would misdiagnose the first as the second.
+  assert.notEqual(result.maxTokens, 8192,
+    `get_model_meta("abc") returned the unknown-id-fallback shape (maxTokens=8192, name=` +
+    `${JSON.stringify(result.name)}) instead of either synthetic table entry — the ` +
+    `ns['model_meta'] override after exec() did not take effect (get_model_meta may no longer ` +
+    `read model_meta as a module global), NOT a sort defect`);
+  assert.equal(result.name, "LONG",
+    `get_model_meta("abc") against {"a":SHORT,"ab":LONG} returned name=${JSON.stringify(result.name)}; ` +
+    `expected the longer/more-specific prefix "ab" (LONG) to win over "a" (SHORT) — the ` +
+    `descending-length sort in get_model_meta (ocp-connect:155) may have been removed or reordered`);
+});
+
+test("ocp-connect: the hardcoded three-id JSON-parse-failure fallback never over-advertises", () => {
+  // Control: well-formed /v1/models JSON must pass model ids through the try: branch UNCHANGED —
+  // proves this harness actually drives the real branch logic, not just a constant.
+  const controlIds = _ocFallbackModelIds(JSON.stringify({ data: [{ id: "claude-sonnet-5" }] }));
+  assert.deepEqual(controlIds, ["claude-sonnet-5"],
+    "well-formed JSON must pass model ids through the try: branch unchanged");
+
+  // The real except: branch, driven with deliberately-malformed JSON.
+  const fallbackIds = _ocFallbackModelIds("not valid json{{{");
+  assert.ok(Array.isArray(fallbackIds) && fallbackIds.length > 0,
+    "the except: branch must set a non-empty model_ids fallback");
+  // ocp-connect's comment and #210 both describe this as a THREE-id list — assert the count
+  // itself, not just that each id it happens to contain is safe (#218 review LOW).
+  assert.equal(fallbackIds.length, 3,
+    `the hardcoded fallback is documented as a three-id list, got ${fallbackIds.length}: ${JSON.stringify(fallbackIds)}`);
+
+  const classified = _ocClassify(fallbackIds);
+  for (const id of fallbackIds) {
+    const want = _ocRegistryTruth(id);
+    assert.ok(want !== undefined,
+      `${id}: no recorded registry ground truth (direct, via models.json legacyAliases/aliases, ` +
+      `or _ocKnownRegistryExtras) — add one`);
+    assert.ok(classified[id].maxTokens <= want,
+      `ocp-connect's JSON-parse-failure fallback over-advertises ${id}: classifies ` +
+      `maxTokens=${classified[id].maxTokens}, registry caps it at ${want}`);
+  }
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
