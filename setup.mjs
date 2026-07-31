@@ -3,8 +3,10 @@
  * OCP (Open Claude Proxy) setup
  *
  * Automatically configures OpenClaw to use Claude CLI as a model provider.
- * Run: node setup.mjs [--port N] [--default-model opus|sonnet|haiku] [--dry-run]
+ * Run: node setup.mjs [--port N] [--default-model opus|sonnet|haiku] [--dry-run] [--reconfigure-only]
  *      (default port = DEFAULT_PORT from lib/constants.mjs)
+ *      --reconfigure-only: write the service unit/plist but do not enable-at-boot or start it
+ *        now (used by `ocp update`'s reconfigure phase; see scripts/lib/service-mode.mjs)
  *
  * What it does:
  *   1. Verifies claude CLI is installed and authenticated
@@ -13,8 +15,9 @@
  *   4. Creates start.sh for easy launch
  *   5. Optionally starts the proxy
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, chmodSync } from "node:fs";
-import { mergePlistEnv, mergeSystemdEnv } from "./scripts/lib/plist-merge.mjs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { resolveServicePlan } from "./scripts/lib/service-mode.mjs";
+import { installAutoStart } from "./scripts/lib/install-autostart.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -38,6 +41,16 @@ const PORT = parseInt(opt("port", String(DEFAULT_PORT)), 10);
 const DEFAULT_MODEL = opt("default-model", "opus"); // opus | sonnet | haiku
 const DRY_RUN = flag("dry-run");
 const SKIP_START = flag("no-start");
+// --reconfigure-only (issue #226): write the service unit / plist, but never enable-at-boot
+// or start-now. For use by scripts/upgrade.mjs's phase 4 ("reconfigure"), so an upgrade's
+// installer step stops performing phase 5's job (starting the service) — see
+// scripts/lib/service-mode.mjs for the full reasoning. Not used on a first install: that path
+// (scripts/doctor.mjs's fresh_install ai_executable) invokes `node setup.mjs` bare, and must
+// keep enabling + starting — that IS a first install's job.
+// NOT parsed as a bare `flag()` const here like the others above: the parse itself is folded
+// into scripts/lib/service-mode.mjs's resolveServicePlan(args, platform) (called below, once
+// `platform` is known), so the argv-to-behavior path is one tested function rather than a
+// setup.mjs-local assignment that no test can reach.
 const PROVIDER_NAME = opt("provider-name", "claude-local");
 const BIND_ADDRESS = opt("bind", "127.0.0.1");
 const AUTH_MODE_CONFIG = opt("auth-mode", "none");
@@ -66,10 +79,6 @@ const OCP_ADMIN_KEY_INJECT = process.env.OCP_ADMIN_KEY || null;
 const PROXY_ANON_KEY_INJECT = process.env.PROXY_ANONYMOUS_KEY || null;
 
 // ── Inject-value helpers ─────────────────────────────────────────────────
-// Escape a value for safe inclusion in a plist <string>…</string> body.
-function xmlEscape(v) {
-  return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
-}
 // Validate an injected service value: no control chars (a newline would inject a
 // rogue systemd Environment= directive; other control chars corrupt the unit/plist).
 // Spaces are allowed — filesystem paths (CLAUDE_BIN) may legitimately contain them.
@@ -366,163 +375,33 @@ if (DRY_RUN) {
 }
 
 if (!DRY_RUN) {
-  console.log("\n🔄 Installing auto-start on login...\n");
-
   const platform = process.platform;
-  // Use stable symlink path instead of versioned Cellar path (e.g. /opt/homebrew/opt/node/bin/node
-  // instead of /opt/homebrew/Cellar/node/25.8.0/bin/node) so the plist survives node upgrades.
-  let nodeBin = process.execPath;
-  if (platform === "darwin" && nodeBin.includes("/Cellar/")) {
-    const stable = nodeBin.replace(/\/Cellar\/[^/]+\/[^/]+\//, "/opt/");
-    if (existsSync(stable)) {
-      nodeBin = stable;
-      log(`Using stable node path: ${nodeBin}`);
-    }
-  }
+  // Single tested seam bridging argv → behavior (see scripts/lib/service-mode.mjs). Computed
+  // once here (platform is now known) and used both by installAutoStart() below and by Step
+  // 8's verification gate.
+  const servicePlan = resolveServicePlan(args, platform);
 
-  // Ensure logs dir exists
-  const logsDir = join(OPENCLAW_DIR, "logs");
-  if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
-
-  // Use neutral service names to avoid OpenClaw gateway's extra-service detection.
-  // OpenClaw scans LaunchAgent plists and systemd units for "openclaw" / "clawdbot"
-  // markers and flags them as conflicting gateway-like services. Using "dev.ocp.*"
-  // and "ocp-proxy" keeps the proxy invisible to that heuristic.
-  const OCP_HOME = join(HOME, ".ocp");
-  const ocpLogsDir = join(OCP_HOME, "logs");
-  // mode 0700: with `recursive`, this call can create ~/.ocp ITSELF on a fresh install, and
-  // without an explicit mode that parent lands at the umask default (world-listable 0755).
-  if (!existsSync(ocpLogsDir)) mkdirSync(ocpLogsDir, { recursive: true, mode: 0o700 });
-
-  // Uninstall legacy service names if present (upgrade path)
-  if (platform === "darwin") {
-    const legacyPlist = join(HOME, "Library", "LaunchAgents", "ai.openclaw.proxy.plist");
-    if (existsSync(legacyPlist)) {
-      try { execSync(`launchctl bootout gui/$(id -u) "${legacyPlist}" 2>/dev/null`); } catch { /* ignore */ }
-      try { unlinkSync(legacyPlist); } catch { /* ignore */ }
-      log(`Removed legacy plist: ai.openclaw.proxy`);
-    }
-  } else if (platform === "linux") {
-    const legacyService = join(HOME, ".config", "systemd", "user", "openclaw-proxy.service");
-    if (existsSync(legacyService)) {
-      try { execSync(`systemctl --user stop openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
-      try { execSync(`systemctl --user disable openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
-      try { unlinkSync(legacyService); } catch { /* ignore */ }
-      try { execSync(`systemctl --user daemon-reload`); } catch { /* ignore */ }
-      log(`Removed legacy systemd service: openclaw-proxy`);
-    }
-  }
-
-  if (platform === "darwin") {
-    // macOS: launchd
-    const plistDir = join(HOME, "Library", "LaunchAgents");
-    if (!existsSync(plistDir)) mkdirSync(plistDir, { recursive: true });
-
-    const plistPath = join(plistDir, "dev.ocp.proxy.plist");
-    const logPath = join(ocpLogsDir, "proxy.log");
-
-    const plistXml = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>dev.ocp.proxy</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${nodeBin}</string>
-    <string>${serverPath}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>CLAUDE_PROXY_PORT</key>
-    <string>${xmlEscape(PORT)}</string>
-    <key>CLAUDE_BIND</key>
-    <string>${xmlEscape(BIND_ADDRESS)}</string>
-    <key>CLAUDE_AUTH_MODE</key>
-    <string>${xmlEscape(AUTH_MODE_CONFIG)}</string>${CLAUDE_BIN_INJECT ? `
-    <key>CLAUDE_BIN</key>
-    <string>${xmlEscape(CLAUDE_BIN_INJECT)}</string>` : ""}${OCP_ADMIN_KEY_INJECT ? `
-    <key>OCP_ADMIN_KEY</key>
-    <string>${xmlEscape(OCP_ADMIN_KEY_INJECT)}</string>` : ""}${PROXY_ANON_KEY_INJECT ? `
-    <key>PROXY_ANONYMOUS_KEY</key>
-    <string>${xmlEscape(PROXY_ANON_KEY_INJECT)}</string>` : ""}
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>${logPath}</string>
-  <key>StandardErrorPath</key>
-  <string>${logPath}</string>
-</dict>
-</plist>
-`;
-
-    const existingPlist = existsSync(plistPath) ? readFileSync(plistPath, "utf8") : null;
-    const finalPlistXml = mergePlistEnv(existingPlist, plistXml);
-    writeFileSync(plistPath, finalPlistXml);
-    chmodSync(plistPath, 0o600);
-    if (existingPlist && finalPlistXml !== plistXml) {
-      log(`Plist written: ${plistPath} (mode 600, preserved user env vars)`);
-    } else {
-      log(`Plist written: ${plistPath} (mode 600)`);
-    }
-
-    // Bootout first (in case it was already loaded) then bootstrap
-    try { execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
-    execSync(`launchctl bootstrap gui/$(id -u) "${plistPath}"`);
-    log(`launchctl loaded dev.ocp.proxy`);
-
-  } else if (platform === "linux") {
-    // Linux: systemd user service
-    const systemdDir = join(HOME, ".config", "systemd", "user");
-    if (!existsSync(systemdDir)) mkdirSync(systemdDir, { recursive: true });
-
-    const servicePath = join(systemdDir, "ocp-proxy.service");
-    const logPath = join(ocpLogsDir, "proxy.log");
-
-    const serviceUnit = `[Unit]
-Description=OCP — Open Claude Proxy
-After=network.target
-
-[Service]
-ExecStart=${nodeBin} ${serverPath}
-Environment=CLAUDE_PROXY_PORT=${PORT}
-Environment=CLAUDE_BIND=${BIND_ADDRESS}
-Environment=CLAUDE_AUTH_MODE=${AUTH_MODE_CONFIG}${CLAUDE_BIN_INJECT ? `\nEnvironment=CLAUDE_BIN=${CLAUDE_BIN_INJECT}` : ""}${OCP_ADMIN_KEY_INJECT ? `\nEnvironment=OCP_ADMIN_KEY=${OCP_ADMIN_KEY_INJECT}` : ""}${PROXY_ANON_KEY_INJECT ? `\nEnvironment=PROXY_ANONYMOUS_KEY=${PROXY_ANON_KEY_INJECT}` : ""}
-Restart=always
-RestartSec=5
-StandardOutput=append:${logPath}
-StandardError=append:${logPath}
-
-[Install]
-WantedBy=default.target
-`;
-
-    const existingService = existsSync(servicePath) ? readFileSync(servicePath, "utf8") : null;
-    const finalServiceUnit = mergeSystemdEnv(existingService, serviceUnit);
-    writeFileSync(servicePath, finalServiceUnit);
-    chmodSync(servicePath, 0o600);
-    if (existingService && finalServiceUnit !== serviceUnit) {
-      log(`Service file written: ${servicePath} (mode 600, preserved user env vars)`);
-    } else {
-      log(`Service file written: ${servicePath} (mode 600)`);
-    }
-
-    execSync(`systemctl --user daemon-reload`);
-    execSync(`systemctl --user enable ocp-proxy`);
-    execSync(`systemctl --user start ocp-proxy`);
-    log(`systemd user service enabled and started`);
-
-  } else {
-    warn(`Auto-start not supported on ${platform} — start manually with: bash ${startPath}`);
-  }
-
-  console.log("\n✅ Auto-start installed — proxy will start automatically on login\n");
+  // Step 7 (auto-start install: legacy-unit migration, plist/unit write, enable/start/
+  // bootstrap per servicePlan) lives in scripts/lib/install-autostart.mjs — extracted so it
+  // can be called with injected run/fs functions in tests. See that module's header comment
+  // for why (issue #226 review: a prior source-text-assertion approach here tested
+  // co-location, not containment, and a review mutation proved it — AGENTS.md's "Testing
+  // discipline: what counts as a test" section, not its server.mjs-specific section, is the
+  // one this had to answer to).
+  installAutoStart({
+    platform,
+    servicePlan,
+    paths: { HOME, OPENCLAW_DIR, serverPath, startPath },
+    config: { PORT, BIND_ADDRESS, AUTH_MODE_CONFIG, CLAUDE_BIN_INJECT, OCP_ADMIN_KEY_INJECT, PROXY_ANON_KEY_INJECT },
+    log,
+    warn,
+  });
 
   // ── Step 8: Post-install health verification ───────────────────────────
-  if (!SKIP_START) {
+  // Skipped under --reconfigure-only too: nothing was started above, so there is nothing
+  // yet to verify — the upgrade flow's own post-flight phase (phase 6) checks the real
+  // post-restart state after phase 5 actually restarts the service.
+  if (!SKIP_START && !servicePlan.reconfigureOnly) {
     console.log("⏳ Waiting for server to bind...\n");
     await new Promise(r => setTimeout(r, 3000));
 

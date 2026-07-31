@@ -21,8 +21,25 @@ What `ocp update` does:
 - **Patch bump** (e.g. `v3.21.0 → v3.21.1`):
   light path (git pull + npm install + restart).
 - **Cross-minor** (e.g. `v3.18 → v3.22`):
-  full path: pre-flight check, snapshot, `setup.mjs` (with plist env-merge),
-  service restart, post-flight `/health` and `/v1/models` verification.
+  full path: pre-flight check, snapshot, `setup.mjs --reconfigure-only` (with plist
+  env-merge), service restart, post-flight `/health` and `/v1/models` verification.
+  `--reconfigure-only` (issue #226) writes the service unit/plist but does not itself start
+  the service now — starting is the dedicated restart phase's job, which runs next. On
+  Linux it also leaves the unit's boot-enablement (`systemctl enable`) untouched rather than
+  re-asserting it, so a host where an operator has deliberately disabled the OCP-managed
+  unit (because a different unit already owns the port) stays disabled across an upgrade.
+  Running the installer's reconfigure step with a bare `setup.mjs` (no flag) would
+  start/enable the unit itself, before the restart phase gets a chance to run — on the host
+  that motivated issue #215, that reproduces the orphan process #215 describes and re-arms
+  its boot race. **This alone does not stop the #215 orphan**, though: the restart phase
+  that runs next is, as of this writing, still a hard-coded `systemctl --user restart
+  ocp-proxy.service` — it does not yet resolve which unit actually owns the port (that fix,
+  #221, is a separate PR). So on the #215 host specifically, the restart phase still starts
+  `ocp-proxy` unconditionally a few steps later; --reconfigure-only removes the boot-race
+  re-arm (`enable`) and phase 4 racing ahead of phase 5 (its premature `start`), which is
+  half of the #215/#226 defect family, not the orphan itself. A first install
+  (`node setup.mjs`, no flags) is unaffected and still enables + starts the service, which
+  is that path's actual job.
 - **Old version** (< v3.4.0):
   fresh-install. Pre-v3.4 lacked admin-key/usage-db, so there is nothing to
   migrate. Your OAuth token (managed by the Claude Code CLI, not OCP) is
