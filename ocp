@@ -797,16 +797,40 @@ cmd_update() {
   # doctor's WARN-level checks (e.g. "tree at X, service serving Y — restarting") never reached
   # the person running `ocp update`, even though doctor.mjs computed the exact message #214
   # asked for. Surface any WARN check here, generically, before dispatching on kind.
+  #
+  # #230 review finding (MED-5 recurrence): this filter was WARN-only, so doctor.mjs's
+  # multi_unit_boot_race INFO line (pushed when the boot-race check ran but couldn't reach a
+  # verdict — e.g. `sudo ocp update` on a host whose OCP is a system unit, where sudo's
+  # env_reset strips XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS and breaks `systemctl --user`)
+  # was visible on `ocp doctor` (which prints every check regardless of level) but silently
+  # absent from `ocp update` — the exact #214 discarded-check defect recurring one level up.
+  # INFO gets its own glyph (not reused WARN styling) so the two severities stay visually
+  # distinct to the operator.
+  #
+  # #230 review round 4 (LOW-2): under `set -euo pipefail` (see top of this file), a non-zero
+  # exit from this python pipeline kills `cmd_update` immediately, and `2>/dev/null` hides why.
+  # Verified directly: `env -i LC_ALL=C PYTHONUTF8=0 bash` on the pre-fix block exits 1 (a
+  # UnicodeEncodeError trying to print "⚠"/"ℹ" under the C locale's ASCII-only stdout encoding),
+  # silently aborting the whole update before it even reaches the kind dispatch below. Pre-
+  # existing since #214 (the WARN-only version had the same exposure), but this PR's own INFO
+  # addition makes the block fire far more often — it used to print nothing on most healthy
+  # hosts. sys.stdout.reconfigure(errors="replace") makes stdout tolerant of an unencodable
+  # glyph (degrades to "?" instead of raising) without changing 2>/dev/null's existing behavior
+  # for any OTHER failure mode. Verified fixed under the same env -i reproduction.
   if [[ -n "$doctor_json" ]]; then
     echo "$doctor_json" | python3 -c "
 import sys, json
+sys.stdout.reconfigure(errors=\"replace\")
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
 for c in d.get('checks', []):
-    if c.get('level') == 'WARN':
+    level = c.get('level')
+    if level == 'WARN':
         print(f\"⚠ {c.get('message', '')}\")
+    elif level == 'INFO':
+        print(f\"ℹ {c.get('message', '')}\")
 " 2>/dev/null
   fi
 
