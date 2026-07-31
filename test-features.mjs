@@ -8998,6 +8998,334 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
   assert.ok(r.stdout.includes("Already at latest"), `expected the noop-kind message, got: ${JSON.stringify(r.stdout)}`);
 });
 
+console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
+
+// Background: `lsof -nP -iTCP:<port> -sTCP:LISTEN` EXITS 1 with EMPTY stdout when nothing
+// matches (verified live: `/usr/sbin/lsof -nP -iTCP:59999 -sTCP:LISTEN; echo $?` -> exit 1, no
+// output). `execSync` throws on any nonzero exit, and the pre-fix `scripts/upgrade.mjs` had one
+// `catch { lsofOutput = null }` for every lsof failure — so that clean "not listening" result
+// and a genuinely missing/failing tool both became `null` -> `resolveOwningUnit`'s "unknown" ->
+// `planRestart`'s unconditional refusal, with the wrong diagnosis text ("lsof did not run") on
+// top. `opts.allowNotListeningFallback` (the rollback recovery path PR #221 added) was therefore
+// unreachable on macOS: a rollback against a down service hit "unknown" every time and stayed
+// stuck on re-run. These tests drive the REAL gather pipeline (`opts.run`, not `mockOwnerProbe`)
+// so the fix is exercised exactly where the bug lived — the impure catch in
+// `scripts/upgrade.mjs`, not `classifyLsofListener` (which already handled "" vs null correctly).
+//
+// A netstat fixture showing NO LISTEN row for the mocked port (below) is required in every test
+// here that expects the genuine not-listening outcome: HIGH-1 (an independent review of the PR
+// that shipped defect 1) found that (status===1, empty stdout) is ALSO exactly what a non-root
+// `lsof` produces against a ROOT-OWNED listener, so the fix now cross-checks with `netstat`
+// (which shows LISTEN rows regardless of owning uid) before accepting "nothing is listening".
+//
+// FOLD-IN 1 (independent re-review of PR #240, post-HIGH-1): `netstatHasListenerOnPort`'s own
+// parsing discipline — matching the port as an EXACT trailing `.<port>` segment, and requiring
+// the row's state to actually be `LISTEN` — had no fixture able to catch a regression in either
+// check, because the original fixtures never contained a row that could tell "parsed correctly"
+// apart from "parsed sloppily": no adjacent-port row shared any digits with the target port (so
+// a substring-match regression would coincidentally agree with the real suffix-match logic), and
+// no row on the target port was in a non-LISTEN state (so dropping the state filter changed
+// nothing observable). `NETSTAT_NO_LISTENER` below adds both:
+//   - `*.13456` / `*.34567` — different ports that each contain "3456" as a SUBSTRING but do NOT
+//     end in ".3456". `endsWith(".3456")` (the shipped code) correctly excludes both; `.includes
+//     ("3456")` (mutation) would incorrectly match either — verified directly against both
+//     candidates before use.
+//   - a `TIME_WAIT` row on the mocked port itself (127.0.0.1.3456) — its address suffix DOES
+//     match, but its state does not. The shipped `\bLISTEN\b` filter correctly excludes it;
+//     dropping that filter (mutation) would incorrectly count it as a live listener. A `TIME_WAIT`
+//     row here is also the realistic shape of the actual danger dropping the filter creates: a
+//     socket the just-restarted process left behind, which must NOT be read as "still listening"
+//     (that misreading is exactly what would leave a `--rollback` stuck refusing forever).
+// `NETSTAT_HAS_LISTENER_3456` adds an `::1.3456` (IPv6 loopback) row alongside the IPv4 one, so a
+// real dual-stack netstat listing is what these tests actually exercise, not a single-family
+// simplification.
+const NETSTAT_NO_LISTENER = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.22                   *.*                    LISTEN\ntcp46      0      0  *.5900                 *.*                    LISTEN\ntcp4       0      0  *.13456                *.*                    LISTEN\ntcp6       0      0  *.34567                *.*                    LISTEN\ntcp4       0      0  127.0.0.1.3456         127.0.0.1.54321        TIME_WAIT";
+const NETSTAT_HAS_LISTENER_3456 = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.3456                 *.*                    LISTEN\ntcp6       0      0  ::1.3456               *.*                    LISTEN";
+
+test("issue #233 defect 1: macOS lsof exit-1/empty-stdout ('nothing matched') maps to not-listening and refuses with the CORRECT message on `ocp update` (not the false 'lsof did not run') — netstat CONFIRMS no listener (HIGH-1)", async () => {
+  const lsofNotListeningErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr, "/usr/sbin/netstat": NETSTAT_NO_LISTENER });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "3456", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "upgrade must refuse when nothing is listening");
+  assert.ok(/nothing is currently listening/.test(caught.message), `expected the not-listening refusal; got: ${caught.message}`);
+  assert.ok(!/lsof did not run/.test(caught.message), `must not fall back to the false "lsof did not run" diagnosis; got: ${caught.message}`);
+});
+
+test("issue #233 defect 1: macOS rollback recovers via the not-listening fallback — previously unreachable (collapsed into 'unknown' forever) — netstat CONFIRMS no listener (HIGH-1)", async () => {
+  const lsofNotListeningErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr, "/usr/sbin/netstat": NETSTAT_NO_LISTENER });
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "darwin", mockPort: "3456", run,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.equal(restartCmds.length, 2);
+  assert.ok(restartCmds[0].includes("launchctl bootout"));
+  assert.ok(restartCmds[1].includes("launchctl bootstrap"));
+  assert.ok(result.phases.some(p => p.name === "restart-resolve" && p.note && p.note.includes("nothing was listening")),
+    "the fallback must surface loudly in phases, not silently");
+});
+
+console.log("\nRestart-unit resolution (issue #233 HIGH-1, independent review of PR #240) — netstat cross-check for the privilege-gap ambiguity:");
+
+// HIGH-1: a non-root `lsof` probing a ROOT-OWNED listener produces the byte-identical
+// (status===1, empty stdout, empty stderr) signature as a genuine no-match — verified live,
+// three independent instruments, against two real root-owned ports on this host. A root-owned
+// OCP deployment is a supported shape (scripts/doctor.mjs's multi-unit-risk check has a
+// dedicated branch for /Library/LaunchDaemons, scope:"system"), so this is not hypothetical:
+// pre-defect-1 this mapped to null -> refuse (safe); post-defect-1 (pre-this-fix) it mapped to
+// "" -> not-listening -> (on --rollback) allowNotListeningFallback -> bootout the user launchd
+// agent while the root daemon still held the port -> EADDRINUSE -> (KeepAlive=true) a respawn
+// loop. The failure direction inverted. These are the required acceptance tests for that gap.
+
+test("HIGH-1 acceptance: lsof's ambiguous exit-1/empty-stdout shape, WITH netstat confirming a LISTEN row, refuses on `ocp update` — NOT the not-listening fallback", async () => {
+  const lsofAmbiguousErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofAmbiguousErr, "/usr/sbin/netstat": NETSTAT_HAS_LISTENER_3456 });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "3456", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "a confirmed-but-unidentified listener must refuse, not proceed");
+  assert.ok(!/nothing is currently listening/.test(caught.message), `must NOT be mistaken for not-listening; got: ${caught.message}`);
+  assert.ok(/could not determine what.*owns the OCP port/s.test(caught.message), `expected the "could not determine" refusal; got: ${caught.message}`);
+  // NOTE: do not also assert on "elevated privileges" here — that phrase is boilerplate present
+  // in EVERY "unknown" refusal (planRestart's fixed closing sentence), not specific to this
+  // reason, so it would pass vacuously even if the reason regressed to the generic "lsof did not
+  // run" text. "could not identify ... owner" / "confirmed via netstat" appear ONLY in the
+  // netstatConfirmsListener reason (scripts/lib/restart-unit.mjs's classifyLsofListener) — that
+  // is the actual discriminator.
+  assert.ok(/could not identify its owner|confirmed via netstat/i.test(caught.message), `reason should say a listener exists (confirmed via netstat) but could not be identified; got: ${caught.message}`);
+});
+
+test("HIGH-1 acceptance (the headline regression): lsof's ambiguous shape, WITH netstat confirming a LISTEN row, REFUSES on --rollback too — this is exactly the bootout-against-a-live-listener case", async () => {
+  // Before this fix: this input mapped to "" (not-listening) -> allowNotListeningFallback ->
+  // PROCEEDED with launchctl bootout+bootstrap against the user agent, while a root-owned
+  // daemon (a supported OCP deployment shape) still held the port. This is the regression the
+  // independent review of PR #240 found and the reason HIGH-1 blocks that PR.
+  const lsofAmbiguousErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofAmbiguousErr, "/usr/sbin/netstat": NETSTAT_HAS_LISTENER_3456 });
+  let caught = null;
+  try {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "darwin", mockPort: "3456", run,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "rollback must refuse rather than bootout against an unidentified live listener");
+  assert.ok(!caught.phases?.some(p => p.name === "restart" && /launchctl bootout/.test(p.cmd || "")),
+    "no bootout/bootstrap command may appear in phases — the fallback must not have fired");
+  // Not "elevated privileges" — that's boilerplate on every "unknown" refusal (see the sibling
+  // upgrade-path test's note); "could not identify its owner" is unique to this reason.
+  assert.ok(/could not identify its owner|confirmed via netstat/i.test(caught.message), `expected the privilege-gap message; got: ${caught.message}`);
+});
+
+test("HIGH-1: netstat itself failing to run maps to unknown and refuses (fail closed) — distinct from lsof missing entirely", async () => {
+  const lsofAmbiguousErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  const netstatFailure = new Error("netstat: command not found");
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofAmbiguousErr, "/usr/sbin/netstat": netstatFailure });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "3456", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "a failed netstat cross-check must fail closed, never silently proceed");
+  assert.ok(!/nothing is currently listening/.test(caught.message), `must not be mistaken for not-listening; got: ${caught.message}`);
+  assert.ok(/could not determine what.*owns the OCP port/s.test(caught.message), `expected the "could not determine" refusal; got: ${caught.message}`);
+  assert.ok(/netstat.*failed to run|cross-check.*failed/i.test(caught.message), `reason should mention the netstat cross-check failing; got: ${caught.message}`);
+});
+
+test("HIGH-1 mutation guard: a non-empty lsof stderr must NOT bypass the netstat cross-check (stderr is empty in BOTH the privilege-gap and genuine-no-match cases, so it cannot discriminate them)", async () => {
+  // Acceptance test for the reviewer's own mutation (d): adding `&& stderr.trim()===""` to the
+  // ambiguous-shape guard left the pre-existing suite green (nothing pinned the stderr
+  // dimension). This test fails under that mutation: a benign non-empty stderr must still let
+  // the netstat cross-check run and confirm the listener, not short-circuit to a different
+  // (wrong) outcome just because stderr happened to be non-empty.
+  const lsofErrWithStderr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "lsof: WARNING: something benign\n" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofErrWithStderr, "/usr/sbin/netstat": NETSTAT_HAS_LISTENER_3456 });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "3456", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must still refuse");
+  // Not "elevated privileges" — boilerplate on every "unknown" refusal, so it would pass even if
+  // this regressed to the generic "lsof did not run" reason (which is exactly what mutation (d)
+  // — gating the ambiguous-shape guard on stderr emptiness too — produces for this input, since
+  // its stderr is deliberately non-empty above). "could not identify its owner" / "confirmed via
+  // netstat" appear only when netstat was actually consulted.
+  assert.ok(/could not identify its owner|confirmed via netstat/i.test(caught.message),
+    `netstat must still have been consulted (privilege-gap message expected) despite non-empty stderr; got: ${caught.message}`);
+});
+
+test("HIGH-1: netstat is invoked at its absolute path (/usr/sbin/netstat), not a bare 'netstat' a restricted PATH can fail to resolve", async () => {
+  const lsofAmbiguousErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  // Only the absolute-path form is registered; a bare "netstat" would match no handler, throw
+  // makeFakeRun's "no handler matched" error, and netstatHasListenerOnPort's catch would treat
+  // that as "netstat failed to run" -> null -> refuse with the wrong (fail-closed) message
+  // instead of the not-listening fallback this test expects.
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofAmbiguousErr, "/usr/sbin/netstat -an -p tcp": NETSTAT_NO_LISTENER });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "3456", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok(/nothing is currently listening/.test(caught.message),
+    `expected the not-listening refusal (proving the absolute-path netstat handler matched); got: ${caught.message}`);
+});
+
+test("FOLD-IN 1 (independent re-review of PR #240): netstat parser rejects an adjacent port that merely CONTAINS the target port's digits — mutation guard for `.includes()` replacing `.endsWith('.' + port)`", async () => {
+  // "*.13456" and "*.34567" each contain "3456" as a substring without being port 3456 itself —
+  // verified directly: "*.13456".endsWith(".3456") is false, "*.13456".includes("3456") is true.
+  // Isolated from the TIME_WAIT/state-filter concern below: every row here IS in LISTEN state, so
+  // this fixture cannot be satisfied by dropping the state filter — only a substring-match
+  // regression in the address-suffix check would misread it.
+  const netstatAdjacentPortsOnly = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.13456                *.*                    LISTEN\ntcp6       0      0  *.34567                *.*                    LISTEN";
+  const lsofNotListeningErr = Object.assign(new Error("Command failed"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr, "/usr/sbin/netstat": netstatAdjacentPortsOnly });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "3456", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "upgrade must refuse when nothing is listening on the mocked port");
+  assert.ok(/nothing is currently listening/.test(caught.message),
+    `an adjacent port containing the same digits must not be mistaken for the mocked port; got: ${caught.message}`);
+});
+
+test("FOLD-IN 1 (independent re-review of PR #240): netstat parser rejects a non-LISTEN row (TIME_WAIT) on the exact target port — mutation guard for dropping the \\bLISTEN\\b state filter", async () => {
+  // 127.0.0.1.3456 IS an exact address-suffix match for the mocked port — but its state is
+  // TIME_WAIT, the realistic shape of a socket the just-restarted process left behind. Isolated
+  // from the substring-match concern above: this fixture has no adjacent-port row at all, so a
+  // regression in the address-suffix check specifically would not be what makes this fail — only
+  // dropping the LISTEN state filter would. This is also the actual danger dropping the filter
+  // creates: a TIME_WAIT leftover misread as "still listening" would leave a --rollback's
+  // not-listening fallback permanently unreachable, re-running into the identical state forever.
+  const netstatTimeWaitOnly = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  127.0.0.1.3456         127.0.0.1.54321        TIME_WAIT";
+  const lsofNotListeningErr = Object.assign(new Error("Command failed"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr, "/usr/sbin/netstat": netstatTimeWaitOnly });
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "darwin", mockPort: "3456", run,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.equal(restartCmds.length, 2, "a TIME_WAIT socket on the target port must not block the not-listening fallback from firing");
+  assert.ok(restartCmds[0].includes("launchctl bootout"));
+});
+
+test("FOLD-IN 2 (independent re-review of PR #240): a whitespace-padded CLAUDE_PROXY_PORT with a REAL listener must refuse on --rollback, not silently proceed", async () => {
+  // Number(" 3456 ") === 3456 (ToNumber tolerates leading/trailing whitespace per the spec), so
+  // port VALIDATION passes for a padded value — but the raw, still-padded string used to reach
+  // both the lsof shell command and the netstat suffix computation unmodified. Before this fix:
+  // lsof ran as `-iTCP: 3456  -sTCP:LISTEN` (malformed — shell-split, embedded spaces) and the
+  // netstat suffix became ". 3456 ", matching no real address in netstat's output — a REAL
+  // listener was read as "nothing is listening", and on --rollback that PROCEEDED with the
+  // launchctl bootout/bootstrap pair against a port a real process still held. Verified live
+  // against this host. `server.mjs:348` uses `parseInt`, which tolerates the same padding and
+  // binds correctly, so this misconfiguration was invisible everywhere except here.
+  const lsofAmbiguousErr = Object.assign(new Error("Command failed"), { status: 1, stdout: "", stderr: "" });
+  // Keyed on the STATIC prefix only — matches both the pre-fix malformed command (raw padded
+  // port interpolated) and the post-fix clean one (portNum interpolated), so this test is driven
+  // by what `port` value reaches netstatHasListenerOnPort, not by which lsof command string ran.
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP -iTCP:": lsofAmbiguousErr, "/usr/sbin/netstat": NETSTAT_HAS_LISTENER_3456 });
+  let caught = null;
+  try {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "darwin", mockPort: " 3456 ", run,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "a padded port with a live listener must refuse, not silently proceed");
+  assert.ok(!caught.phases?.some(p => p.name === "restart" && /launchctl bootout/.test(p.cmd || "")),
+    "no bootout/bootstrap command may appear in phases — the fallback must not have fired for a port that is actually live");
+});
+
+test("HIGH-1: an invalid CLAUDE_PROXY_PORT is rejected as unknown BEFORE ever probing lsof or netstat", async () => {
+  // A non-numeric or non-positive port would otherwise reach `-iTCP:<port>` and produce the same
+  // ambiguous shape as a privilege gap or genuine non-listener; refuse to probe it at all. The
+  // fake run below has NO handlers registered — either command being invoked throws "no handler
+  // matched", which would surface as a DIFFERENT (still-refusing, but wrongly-worded) failure,
+  // so this also proves neither lsof nor netstat is ever shelled out to for a bad port.
+  const run = makeFakeRun({});
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "not-a-port", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "an invalid port must refuse");
+  assert.ok(/could not determine what.*owns the OCP port/s.test(caught.message), `expected the "could not determine" refusal; got: ${caught.message}`);
+  assert.ok(!/no handler matched/.test(caught.message), "lsof/netstat must never actually be invoked for an invalid port");
+});
+
+test("issue #233 defect 1 control: a genuine lsof failure (missing binary, exit 127) still maps to unknown and refuses — the fix is not overly permissive", async () => {
+  const lsofMissingErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 127, stdout: "", stderr: "/bin/sh: /usr/sbin/lsof: No such file or directory" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofMissingErr });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "upgrade must refuse when it genuinely cannot tell what owns the port");
+  assert.ok(/could not determine what.*owns the OCP port/s.test(caught.message), `expected the "could not determine" refusal; got: ${caught.message}`);
+  assert.ok(!/nothing is currently listening/.test(caught.message), `must not be mistaken for not-listening; got: ${caught.message}`);
+});
+
+test("issue #233 defect 1: lsof is invoked at its absolute path (/usr/sbin/lsof), not a bare 'lsof' a restricted PATH can fail to resolve", async () => {
+  // Live-verified on this host: `which lsof` (a restricted, sbin-less PATH) fails, while
+  // `/usr/sbin/lsof` runs cleanly — this is the exact gap the fix closes. The fake run below
+  // registers ONLY the absolute-path form; a bare "lsof" command would match no handler, throw
+  // makeFakeRun's own "no handler matched" error (no `.status`), map to null/"unknown", and this
+  // test would fail with a refusal instead of a successful restart plan.
+  const run = makeFakeRun({
+    "/usr/sbin/lsof -nP -iTCP:": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    12345 opc   23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "darwin", run,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.equal(restartCmds.length, 2);
+  assert.ok(restartCmds[0].includes("launchctl bootout"));
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
