@@ -17,7 +17,140 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, copyFileSync } from "node:fs";
 import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
+import { resolveOwningUnit, planRestart, classifySsListener } from "./lib/restart-unit.mjs";
 import { DEFAULT_PORT } from "../lib/constants.mjs";
+
+// Default command runner for restart-unit gathering/probing: real execSync, string in,
+// string out, thrown on nonzero exit. Exists as a named function (not an inline arrow)
+// so both the default-parameter position below and any explicit `opts.run ||` fallback
+// refer to the exact same implementation.
+function execRun(cmd) {
+  return execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+}
+
+// Resolve which unit actually owns the OCP port and build a restart plan for it, instead
+// of blindly restarting a hard-coded name (issue #215). The resolution logic itself
+// (resolveOwningUnit / planRestart, in scripts/lib/restart-unit.mjs) is pure and unit-
+// tested directly against injected command OUTPUT. This function is the impure layer
+// that decides which command runs, with which flags, and how a failure maps to a state —
+// independent review of the first version of this fix (PR #221, findings MED-6) found
+// that layer had ZERO coverage, and that is exactly where the real defects lived (a
+// platform-branch swap and an unreadable-cgroup mismapping both survived mutation
+// undetected). opts.run (default: real execSync via execRun above) is the fix: tests pass
+// a fake runner that pattern-matches on the command string, driving this function
+// end-to-end — see test-features.mjs "Restart-unit resolution".
+//
+// Three ways to reach a restart plan, all exercised by test-features.mjs:
+//   - opts.mockOwnerProbe: skip gathering entirely, resolve from an already-classified
+//     probe object (fast path for wiring-level tests: mismatch/refusal behavior)
+//   - opts.run given (with or without opts.mockExec): gather via the injected runner —
+//     drives the REAL ss/lsof/cgroup-classification pipeline with fake command output
+//   - opts.mockExec, no run, no probe: skip gathering, assume the expected unit owns the
+//     port (preserves the pre-#215 command; kept for pre-existing tests that only care
+//     about phase bookkeeping, not restart resolution)
+// isRollback (review finding MED-8): rollback (scripts/lib/snapshot.mjs) only restores the
+// launchd plist and the USER-scope systemd unit file — never a SYSTEM unit's config, and
+// issues no daemon-reload for one either. If resolution finds the port owned by a system
+// unit, rollback must refuse rather than restart config it never touched.
+function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null }) {
+  const platform = opts.mockPlatform || process.platform;
+  const expectedUnit = platform === "darwin" ? "dev.ocp.proxy" : "ocp-proxy.service";
+  const run = opts.run || execRun;
+
+  let owner;
+  if (opts.mockOwnerProbe) {
+    owner = resolveOwningUnit({ ...opts.mockOwnerProbe, platform: opts.mockOwnerProbe.platform || platform, expectedUnit });
+  } else if (opts.mockExec && !opts.run) {
+    owner = platform === "darwin"
+      ? { kind: "launchd", platform, pid: null, unit: expectedUnit, mismatched: false }
+      : { kind: "user-unit", platform, pid: null, unit: expectedUnit, mismatched: false };
+  } else {
+    // Gather via `run` (real execSync in production, injected in tests). Every catch sets
+    // the field to null (never ""): resolveOwningUnit treats null as "couldn't verify"
+    // (kind "unknown") and "" as "ran cleanly, found nothing" (kind "not-listening") — those
+    // are different facts and collapsing them into one was HIGH-1 on PR #221.
+    const probe = { platform, expectedUnit };
+    if (platform === "darwin") {
+      try { probe.lsofOutput = run(`lsof -nP -iTCP:${port} -sTCP:LISTEN`); } catch { probe.lsofOutput = null; }
+    } else {
+      try { probe.ssOutput = run(`ss -lptn "sport = :${port}"`); } catch { probe.ssOutput = null; }
+      const listener = classifySsListener(probe.ssOutput);
+      if (listener.state === "listening") {
+        try { probe.cgroupContent = run(`cat /proc/${listener.pid}/cgroup`); } catch { probe.cgroupContent = null; }
+      }
+    }
+    owner = resolveOwningUnit(probe);
+  }
+
+  // uid===0 short-circuits sudo entirely (MED-4): a process already running as root needs
+  // no sudo prefix, and telling it to run `sudo` is actively wrong on a minimal image that
+  // doesn't have sudo installed at all.
+  let isRoot = opts.mockIsRoot;
+  if (isRoot === undefined) {
+    isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  }
+
+  // sudoAuthorized answers "is THIS SPECIFIC restart command authorized non-interactively",
+  // not "is sudo generically passwordless" (MED-4) — NOPASSWD sudoers entries are per-command,
+  // so `sudo -n true` both false-negatives on a correctly least-privilege-scoped rule and
+  // false-positives on a broad rule that doesn't actually cover systemctl. Only probed when
+  // it matters (system-unit, not already root) and only for the resolved unit.
+  let sudoAuthorized = opts.mockSudoAuthorized;
+  if (sudoAuthorized === undefined && owner.kind === "system-unit" && !isRoot) {
+    const isBareProduction = !opts.run && !opts.mockExec && !opts.mockOwnerProbe;
+    if (opts.run || isBareProduction) {
+      // MED-C (PR #221 round-2 review): "--" matches the actual restart command's shape
+      // (scripts/lib/restart-unit.mjs's planRestart) — a sudoers rule authorizing one must
+      // authorize the other, and a leading-dash unit name must not be read as another sudo/
+      // systemctl option here either.
+      try { run(`sudo -n -l systemctl restart -- ${owner.unit}`); sudoAuthorized = true; }
+      catch { sudoAuthorized = false; }
+    } else {
+      // Mocked/test context with no injected runner and no explicit answer — never shell
+      // out to a real sudo here; an unset expectation must be explicit (fail loud).
+      sudoAuthorized = false;
+    }
+  }
+
+  if (isRollback && owner.kind === "system-unit") {
+    // MED-F (PR #221 round-2 review): this refusal is still correct — rollback never restored
+    // this unit's OWN config (bind address, environment; see scripts/lib/snapshot.mjs), so
+    // restarting it would not, by itself, prove the rollback landed. But the original message
+    // stopped short of telling the operator what it DOES know: the `git-checkout` phase (which
+    // ran before this check, unconditionally) already moved the working tree to fromCommit, and
+    // on a host shaped like issue #215's own — both units pointing at that SAME working tree —
+    // that IS the code this unit runs; only its own config was left untouched. Naming the exact
+    // manual command matches the posture the upgrade-path refusals already take (see planRestart's
+    // "requires sudo systemctl restart" message) instead of leaving the operator to derive it.
+    const manualCmd = isRoot ? `systemctl restart -- ${owner.unit}` : `sudo systemctl restart -- ${owner.unit}`;
+    throw new Error(
+      `rollback aborted: the OCP port is owned by a SYSTEM unit ("${owner.unit}"), but rollback only ` +
+      `restores the launchd plist and the USER-scope systemd unit file ` +
+      `(~/.config/systemd/user/ocp-proxy.service — see scripts/lib/snapshot.mjs). It never touched ` +
+      `this unit's OWN config, so this refusal stands for that config. However: the working tree ` +
+      `has ALREADY been rolled back to ${fromCommit || "the snapshot's from-commit"} (the ` +
+      `git-checkout phase, which ran before this check) — if "${owner.unit}" runs from that same ` +
+      `tree (the common shape: one working tree, two units differing only in bind/env — see issue ` +
+      `#215's own host), the rollback is otherwise complete and only a restart is outstanding. Run ` +
+      `\`${manualCmd}\` manually to pick that up; separately revert "${owner.unit}"'s own config by ` +
+      `hand if it also needs to change.`
+    );
+  }
+
+  const plan = planRestart(owner, {
+    expectedUnit,
+    isRoot,
+    sudoAuthorized,
+    plistPath: join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist"),
+    // HIGH-A (PR #221 round-2 review): scope the "not-listening" refusal to the upgrade path.
+    // Rollback's whole point is restoring a down service, it has no doctor health gate to
+    // protect (see runUpgrade: "no doctor needed; snapshot is authoritative"), and refusing here
+    // left rollback permanently stuck — re-running hits this identical state forever. See
+    // scripts/lib/restart-unit.mjs's planRestart for the fallback itself.
+    allowNotListeningFallback: isRollback,
+  });
+  return { owner, plan };
+}
 
 // Post-flight acceptance predicate (issue #173). A health probe passes ONLY when the server
 // is authed AND actually serving the TARGET version. auth.ok alone is not enough: a stale
@@ -159,6 +292,7 @@ async function runFullUpgrade({ doctor, opts }) {
     }
   };
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
 
   try {
     // phase 1: pre-flight (doctor already passed; just record)
@@ -199,16 +333,21 @@ async function runFullUpgrade({ doctor, opts }) {
       console.error(`[heads-up] restarting OCP service in 3s — expect ~5–10s blip on requests in flight.`);
       await new Promise(r => setTimeout(r, 3000));
     }
-    if (process.platform === "darwin") {
-      exec(`launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`, "restart");
-      exec(`launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`, "restart");
-    } else {
-      exec(`systemctl --user restart ocp-proxy.service`, "restart");
+    let restartPlan;
+    try {
+      restartPlan = resolveRestartPlan({ opts, port });
+    } catch (err) {
+      phases.push({ name: "restart", status: "fail", stderr: err.message });
+      throw err;
     }
+    for (const w of restartPlan.plan.warnings) {
+      console.error(w);
+      phases.push({ name: "restart-resolve", status: "warn", note: w });
+    }
+    for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label);
 
     // phase 6: post-flight (10s budget; skipped under mockExec)
     if (!opts.mockExec) {
-      const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
       let ok = false;
       let lastSeen = null;
       for (let i = 0; i < 10; i++) {
@@ -365,12 +504,63 @@ async function runRollback(opts) {
     console.error(`[heads-up] restarting OCP service in 3s — expect ~5–10s blip on requests in flight.`);
     await new Promise(r => setTimeout(r, 3000));
   }
-  if (process.platform === "darwin") {
-    exec(`launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`, "restart");
-    exec(`launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`, "restart");
-  } else {
-    exec(`systemctl --user restart ocp-proxy.service`, "restart");
+  const rollbackPlatform = opts.mockPlatform || process.platform;
+  const rollbackPort = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
+  let restartPlan;
+  try {
+    restartPlan = resolveRestartPlan({ opts, port: rollbackPort, isRollback: true, fromCommit: meta.fromCommit });
+  } catch (err) {
+    phases.push({ name: "restart", status: "fail", stderr: err.message });
+    throw Object.assign(
+      new Error(`rollback phase restart failed: ${err.message}`),
+      { phases, target: target.path }
+    );
   }
+
+  // MED-8 (PR #221 review): the just-restored ~/.config/systemd/user/ocp-proxy.service is a
+  // unit-FILE change, not just an EnvironmentFile edit — systemd caches the parsed unit
+  // definition and does not pick up file content changes on `restart` alone. This exact
+  // requirement is documented at docs/runbooks/tui-flip-rollback.md:13 and already followed
+  // by setup.mjs (which calls the same command right after writing this same file).
+  //
+  // MED-E (PR #221 round-2 review): this used to run UNCONDITIONALLY on every non-darwin
+  // rollback, BEFORE resolution — even when the resolved owner turned out to be a system unit
+  // (whose config this daemon-reload has nothing to do with, and where the very next step
+  // refuses anyway) and even as a hard failure that could abort the whole rollback. `systemctl
+  // --user` needs a running user manager + XDG_RUNTIME_DIR, which a root or non-login-session
+  // rollback (the #215 host's own shape) may not have — it died here with "rollback phase
+  // daemon-reload failed" before ever reaching the informative refusal the operator actually
+  // needed to see. Now: gated on actually being about to restart the USER-scope unit rollback
+  // restores (the only case this command is even relevant to), computed AFTER resolution so it
+  // never runs ahead of a refusal, and best-effort (a failure here is logged and the restart
+  // attempt still proceeds — losing the "picks up the freshly-restored unit file" guarantee is
+  // strictly better than aborting a rollback over it).
+  if (restartPlan.plan.action === "user-unit" && rollbackPlatform !== "darwin") {
+    // Same opts.run seam as resolveRestartPlan's own gathering code (mockExec-without-run is
+    // "skip everything, this is a bookkeeping-only test"; an explicit opts.run means a test
+    // wants to drive THIS specific command end to end without touching git/npm/the real
+    // restart too — matching the convention MED-6 established rather than adding a third,
+    // narrower mock flag).
+    if (opts.mockExec && !opts.run) {
+      phases.push({ name: "daemon-reload", cmd: "systemctl --user daemon-reload", status: "skipped-mock" });
+    } else {
+      const run = opts.run || execRun;
+      try {
+        run(`systemctl --user daemon-reload`);
+        phases.push({ name: "daemon-reload", cmd: "systemctl --user daemon-reload", status: "ok" });
+      } catch (err) {
+        const detail = err.stderr?.toString().trim() || err.message;
+        phases.push({ name: "daemon-reload", cmd: "systemctl --user daemon-reload", status: "warn", stderr: detail });
+        console.error(`[rollback] warn: daemon-reload failed (best-effort, continuing): ${detail}`);
+      }
+    }
+  }
+
+  for (const w of restartPlan.plan.warnings) {
+    console.error(w);
+    phases.push({ name: "restart-resolve", status: "warn", note: w });
+  }
+  for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label);
 
   return { path: "rollback", executed: true, changed: true, target: target.path, phases };
 }

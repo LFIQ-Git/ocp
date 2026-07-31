@@ -74,6 +74,65 @@ ocp doctor
 If `ocp doctor` still reports problems after rollback, open a GitHub issue
 with the snapshot path and the doctor JSON output (`ocp doctor --json`).
 
+## Restart target resolution
+
+The full-upgrade and `--rollback` restart phases resolve which unit actually
+owns the OCP port (`ss`/`lsof` + `/proc/<pid>/cgroup` on Linux, launchd on
+macOS) instead of restarting a hard-coded name — see
+[`scripts/lib/restart-unit.mjs`](../scripts/lib/restart-unit.mjs). If it
+can't tell what owns the port, or what it can tell makes restarting unsafe,
+**it refuses rather than guesses**:
+
+**On `--rollback` these refusals differ in one place**: "nothing is currently
+listening" is a refusal on `ocp update`, but a warning-then-proceed on
+`--rollback` — see the note in the table below. The other four are refusals
+on both paths.
+
+| Message contains | Meaning | What to do |
+|---|---|---|
+| `could not determine what ... owns the OCP port` | The listener's owning PID isn't attributable (e.g. `ocp update` run by a different user than a `User=`-less system unit), a tool is missing, or multiple PIDs answer the same port — across separate rows (dual-stack) or within one row (`SO_REUSEPORT`). | Re-run with elevated privileges, or check `ss -lptn` / `lsof -iTCP` / `cat /proc/<pid>/cgroup` manually. |
+| `not managed by any systemd unit` | A PID holds the port but isn't in any systemd cgroup (a bare `node server.mjs`). | Stop that PID manually, or bring it under systemd, then re-run. |
+| `nothing is currently listening` | Nothing is bound to the port at all. On `ocp update`, deliberately **not** auto-started: if the real production unit is a SYSTEM unit that happens to be down, silently starting the default (often loopback-only) unit would pass post-flight — which only checks `127.0.0.1` — while the host loses LAN reachability. **On `--rollback`, this is NOT a refusal** — restoring a down service is the point of a rollback, there's no post-flight check to protect, and refusing would leave the rollback stuck forever on a re-run. Rollback proceeds to start the default unit (the one its own snapshot restores) with a loud `[restart] WARNING` instead. | On `ocp update`: start the intended unit manually, confirm it's the one you expect, then re-run. On `--rollback`: nothing to do — it already proceeded; check the warning names the right unit. |
+| `requires "sudo systemctl restart -- <unit>"` | The port is owned by a SYSTEM unit and non-interactive sudo isn't authorized for that specific command. | Run the printed `sudo systemctl restart -- <unit>` manually, or grant it explicitly (e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart -- <unit>`), then re-run. |
+| `rollback only restores the launchd plist and the USER-scope systemd unit file` | `--rollback` resolved the port to a SYSTEM unit. Rollback (see `scripts/lib/snapshot.mjs`) never captured or restores that unit's OWN config, so that part of the refusal stands — but the message also names the exact commit the working tree was already rolled back to and the exact manual restart command, since on a host where that unit runs from the same working tree (common — see issue #215), the code-level rollback is otherwise complete. | Run the printed manual restart command; separately roll back the system unit's own config by hand if that also needs it. |
+
+> **Upgrading with an existing `NOPASSWD` sudoers rule — read this if you granted one before v3.27.0.**
+> The probe now sends `systemctl restart -- <unit>`; it previously sent `systemctl restart <unit>`.
+> `sudoers(5)`: *"If a Cmnd has associated command line arguments, the arguments in the Cmnd must
+> match those given by the user on the command line."* So a rule written as
+> `deploy ALL=(root) NOPASSWD: /bin/systemctl restart ocp.service` **no longer matches**, and a host
+> where the restart previously succeeded will now hit the `requires "sudo systemctl restart -- <unit>"`
+> refusal instead. Nothing is broken and nothing is started — the upgrade refuses and prints the
+> command — but it needs a one-character-class edit to the rule:
+>
+> ```
+> -deploy ALL=(root) NOPASSWD: /bin/systemctl restart ocp.service
+> +deploy ALL=(root) NOPASSWD: /bin/systemctl restart -- ocp.service
+> ```
+>
+> This affects **only argument-scoped rules**. A rule with no arguments
+> (`NOPASSWD: /bin/systemctl`) authorizes any arguments and is unaffected — so the operators who
+> scoped their grant most tightly are the ones who need the edit.
+
+If the resolved unit differs from the expected default, that's surfaced
+loudly (both on stderr and in the `restart-resolve` phase entry) rather than
+restarted silently — this is the fix for
+[issue #215](https://github.com/dtzp555-max/ocp/issues/215): a hard-coded
+restart target left an orphan `server.mjs` running when the real owner
+differed.
+
+**On safety of re-running**: none of the cases above leave an orphan process
+behind — nothing new starts until a plan gets past every check above. The
+working tree, however, has typically already moved by the time any of these
+fire: `ocp update`'s full-upgrade path has already done the git checkout,
+`npm install`, and `setup.mjs --reconfigure-only` (which, since
+[#226](https://github.com/dtzp555-max/ocp/issues/226), only writes the
+service unit/plist and never enables-at-boot or starts anything, so it can't
+create an orphan either); `--rollback` has already done the git checkout to
+the snapshot's from-commit, the config-file restore, and `npm install`. So
+re-running is safe from a corruption standpoint, but you're re-running
+against the tree these phases already produced, not your original one.
+
 ## OpenClaw Auto-Sync (v3.11.0+)
 
 Whenever the model list in [`models.json`](../models.json) changes, `ocp update` automatically reconciles your OpenClaw config so the model dropdown stays in sync — no more "I upgraded OCP but my Telegram bot still shows the old models" surprises.
