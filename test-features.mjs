@@ -1660,6 +1660,269 @@ test("upgrade full path executes 5 phases", async () => {
   }
 });
 
+// ── --target on the FULL (cross-minor) upgrade path (issue #257) ───────────────────────────────
+// `--target` was parsed from argv and threaded into runUpgrade(opts), but opts.target was never
+// actually READ anywhere in runUpgrade / runFullUpgrade / runFreshInstall / runRollback — the
+// full path always checked out doctor.latest_version regardless of any pin. Fixed narrowly: this
+// does NOT let --target bypass doctor's own kind selection (current-vs-latest, decided before
+// runFullUpgrade is ever called) — it only decides WHICH tag gets checked out once doctor has
+// ALREADY chosen the "upgrade" kind. See scripts/upgrade.mjs's own comment above
+// resolveUpgradeTarget() for the full scope reasoning and the (deliberate) divergence from
+// PR #255's light-path no-op.
+//
+// Coverage note (stated explicitly, not left implicit): every test below uses mockExec:true or
+// the --dry-run path, matching EVERY existing runFullUpgrade test in this file (see "upgrade
+// full path executes 5 phases" right above, and the entire "Restart-unit resolution ... upgrade
+// wiring" section later in this file) — none of them ever drive the REAL (non-mockExec) git
+// checkout / npm install / curl post-flight branches, because doing so would mean real git/npm
+// mutation and a real network probe against whatever happens to be at ~/ocp on the host running
+// this suite. The wiring for --target inside those specific real branches (the post-flight
+// curl-check target and writeSnapshot's toVersion field) shares the exact same `upgradeTarget`
+// local variable as the checkout command and the returned `result.target` field, both of which
+// ARE exercised below — but is not independently exercised by an automated test, for the same
+// reason nothing else in this function's real branches is.
+console.log("\n--target on the full upgrade path (issue #257):");
+
+test("#257 (the money test): --target on a cross-minor upgrade is honored -- checkout uses the pinned tag, not doctor.latest_version", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "v3.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  const fetchInstallCmds = result.phases.filter(p => p.name === "fetch+install").map(p => p.cmd);
+  assert.ok(fetchInstallCmds.some(c => c.includes("checkout v3.12.0")),
+    `expected checkout of the PINNED target v3.12.0, got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.ok(!fetchInstallCmds.some(c => c.includes("checkout v3.14.0")),
+    `must NOT silently checkout doctor.latest_version (v3.14.0) when --target was given; got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.equal(result.target, "v3.12.0", `result.target must record the actual pinned target used; got ${JSON.stringify(result.target)}`);
+});
+
+test("#257 control: without --target, the full upgrade path still checks out doctor.latest_version (unchanged default)", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  const fetchInstallCmds = result.phases.filter(p => p.name === "fetch+install").map(p => p.cmd);
+  assert.ok(fetchInstallCmds.some(c => c.includes("checkout v3.14.0")),
+    `expected the unchanged default (checkout latest_version); got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.equal(result.target, "v3.14.0", `result.target must fall back to doctor.latest_version; got ${JSON.stringify(result.target)}`);
+});
+
+test("#257: --target without a leading 'v' is normalized before checkout (matches the vX.Y.Z tag convention)", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "3.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  const fetchInstallCmds = result.phases.filter(p => p.name === "fetch+install").map(p => p.cmd);
+  assert.ok(fetchInstallCmds.some(c => c.includes("checkout v3.12.0")),
+    `expected the normalized 'v3.12.0', got cmds=${JSON.stringify(fetchInstallCmds)}`);
+});
+
+test("#257: a --target that is not a known release tag is refused BEFORE any mutation (no snapshot taken)", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.12.0", mockTargetExists: false,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject a --target that is not a known release tag");
+  assert.ok(/not a known release tag/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+  assert.equal(caught.snapshotPath, undefined,
+    `must refuse BEFORE ever taking a snapshot (no partial mutation); got snapshotPath=${JSON.stringify(caught.snapshotPath)}`);
+  assert.equal(caught.phases, undefined,
+    `must refuse before phase bookkeeping even starts; got phases=${JSON.stringify(caught.phases)}`);
+});
+
+test("#257: a --target that IS a known release tag (mockTargetExists:true) proceeds normally", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "v3.12.0", mockTargetExists: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.equal(result.target, "v3.12.0");
+});
+
+test("#257: --target older than current_version is refused -- the full upgrade path only moves forward", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.9.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject a --target older than current_version");
+  assert.ok(/not newer than the current version/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+test("#257: --target equal to current_version is refused (not a forward upgrade)", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.10.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject a --target equal to current_version");
+  assert.ok(/not newer than the current version/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+test("#257: an unparseable --target is refused with a clear message rather than reaching git with a bad ref", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "banana",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject an unparseable --target");
+  assert.ok(/not a parseable/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+// ── #257 SECURITY (independent review finding, HIGH) ────────────────────────────────────────────
+// A shell-metacharacter --target payload used to be accepted by the OLD unanchored regex (it
+// matched only a PREFIX of the string, silently discarding the rest), and the raw string --
+// metacharacters included -- was then interpolated into an `execSync` template string, which
+// runs through /bin/sh. The injected command executed DURING VALIDATION, before the tag was
+// ultimately (and separately) refused -- so a test that only asserts "the pin was refused" would
+// have passed against the vulnerable code; the refusal was never protection, it just happened to
+// also occur. This test asserts BOTH: the pin is refused, AND the payload's injected command
+// never ran (a marker file inside a disposable scratch directory -- never touching the real ~/ocp
+// tree or any real credential -- must not exist afterward).
+//
+// mockExec:false is deliberate and required here: mockExec:true would skip the real git call
+// entirely (tagExists defaults to true), which means the vulnerable shell-interpolation line
+// would never even run under mockExec -- the vulnerability could only ever be demonstrated (or
+// ruled out) with real execution. Safe to run for real: this specific payload's own trailing
+// `; false` guarantees the compound shell command's exit status is non-zero, so validation
+// refuses (throws) immediately after -- BEFORE runFullUpgrade's `try` block / phase 1 is ever
+// reached -- meaning no snapshot, no npm install, no setup.mjs, no restart ever runs, regardless
+// of whether the code being tested is the vulnerable version or the fixed one. `ocpDir` points at
+// a throwaway temp directory created fresh for this test and removed in `finally` -- it does not
+// need to be a real git repository (the injected command runs via the shell's `;` separator
+// regardless of whether the preceding `git` invocation succeeds).
+//
+// Belt-and-braces note, verified directly (mutation-tested, not assumed): even if the
+// tag-existence guard itself were ever neutered by a future regression, this specific test setup
+// has a SECOND, independent safety net -- `ocpDir` is a plain empty directory, not a real git
+// repository, so `runFullUpgrade`'s very next real command (phase 2's `git -C ${ocpDir}
+// rev-parse HEAD`, to compute the snapshot's fromCommit) fails immediately with "not a git
+// repository", aborting before `writeSnapshot()` -- which targets the REAL homedir(), not
+// ocpDir -- is ever reached. Confirmed empirically: neutering the tag-existence throw and
+// re-running this test does NOT create any file under the real ~/.ocp/upgrade-snapshot-*/.
+test("#257 SECURITY: a --target shell-metacharacter payload is refused AND never reaches a shell (marker file must not exist)", async () => {
+  const scratchDir = _ltMkdtemp(join(_ltTmp(), "ocp-257-injection-"));
+  try {
+    const markerPath = join(scratchDir, "PWNED");
+    const payload = `v3.99.0 ; touch ${markerPath} ; false`;
+    let caught = null;
+    try {
+      await runUpgrade({
+        yes: true, dryRun: false, mockExec: false, ocpDir: scratchDir,
+        target: payload,
+        mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                      current_version: "v3.10.0", latest_version: "v3.14.0" },
+      });
+    } catch (e) { caught = e; }
+    assert.ok(caught, "a shell-metacharacter --target payload must be refused, not silently accepted");
+    assert.ok(!_ltExists(markerPath),
+      `SECURITY: the payload's injected command must NEVER execute -- a marker file at ` +
+      `${markerPath} would prove --target reached a real shell. A refusal message alone does ` +
+      `NOT prove this: the vulnerable code also refused this exact payload, AFTER the injected ` +
+      `command had already run (verified independently before this fix).`);
+  } finally {
+    _ltRm(scratchDir, { recursive: true, force: true });
+  }
+});
+
+// Isolates the ANCHORED-REGEX layer specifically (the OLD unanchored `/^(\d+)\.(\d+)\.(\d+)/`,
+// with no trailing `$`, matched only a PREFIX and silently discarded everything after it). This
+// is deliberately a DIFFERENT test from the SECURITY test above: a metacharacter payload is
+// caught by rebuild-from-parts (below) even if the anchor alone regresses, so a test built
+// around a metacharacter payload cannot, by itself, prove the anchor is doing anything. This
+// payload carries no metacharacters at all -- just a valid vX.Y.Z prefix followed by ordinary
+// trailing text -- so it isolates: does the validator REJECT malformed input, or does it
+// silently truncate and accept a truthy-looking prefix?
+test("#257: trailing garbage after a valid-looking vX.Y.Z prefix is refused, not silently truncated and accepted", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.12.0-drift-extra-text",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "a --target with trailing garbage after a valid-looking prefix must be refused, not silently truncated and accepted as the prefix alone");
+  assert.ok(/not a parseable/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+// Isolates the REBUILD-FROM-PARSED-INTEGERS layer specifically. A leading zero is the cleanest
+// input that distinguishes "return the raw string unchanged (only prefixing 'v' if missing)"
+// (the pre-review-fix approach) from "rebuild v${major}.${minor}.${patch} from the PARSED
+// integers" (this fix): both accept "v03.12.0" as parseable and both agree it's newer than
+// v3.10.0, but only the rebuilt form produces the CANONICAL "v3.12.0" a real release tag would
+// actually be named -- the raw/prefix-only form would silently carry "v03.12.0" through to
+// `git checkout`/`rev-parse --verify refs/tags/v03.12.0`, which does not match any real tag
+// (`v3.12.0`), on a real repository. This is a correctness property distinct from the injection
+// fix above, but is exactly what the review's "return a NORMALIZED string" requirement covers.
+test("#257: --target with a leading zero (v03.12.0) is normalized to the canonical v3.12.0, not passed through with the zero preserved", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "v03.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.equal(result.target, "v3.12.0", `expected the canonical, zero-stripped form; got ${JSON.stringify(result.target)}`);
+  const fetchInstallCmds = result.phases.filter((p) => p.name === "fetch+install").map((p) => p.cmd);
+  assert.ok(fetchInstallCmds.some((c) => c.includes("checkout v3.12.0")),
+    `expected checkout of the CANONICAL v3.12.0, not the raw v03.12.0; got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.ok(!fetchInstallCmds.some((c) => c.includes("v03.12.0")),
+    `must not carry the raw, non-canonical 'v03.12.0' through to git; got cmds=${JSON.stringify(fetchInstallCmds)}`);
+});
+
+test("#257: --dry-run preview for the full path shows the PINNED target, not doctor.latest_version", async () => {
+  const result = await runUpgrade({
+    dryRun: true, target: "v3.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.ok(result.plan.some((l) => l.includes("checkout v3.12.0")), `expected preview to show the pinned target; plan=${JSON.stringify(result.plan)}`);
+  assert.ok(!result.plan.some((l) => l.includes("checkout v3.14.0")), `preview must not show latest_version when --target pins elsewhere; plan=${JSON.stringify(result.plan)}`);
+});
+
+test("#257 control: --dry-run preview without --target still shows doctor.latest_version (unchanged default)", async () => {
+  const result = await runUpgrade({
+    dryRun: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.ok(result.plan.some((l) => l.includes("checkout v3.14.0")), `expected the unchanged default preview; plan=${JSON.stringify(result.plan)}`);
+});
+
+test("#257: --dry-run with an invalid --target still throws (dry-run skips MUTATION, not validation)", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      dryRun: true, target: "v3.9.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  }, /not newer than the current version/);
+});
+
 // ── Reconfigure-only service mode (#226) ──────────────────────────────────
 // #215: on a host where a competing systemd/launchd unit already owns the OCP port, an
 // upgrade's reconfigure step (setup.mjs) must not enable-at-boot or start the service it
