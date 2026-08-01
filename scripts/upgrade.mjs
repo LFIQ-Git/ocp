@@ -579,6 +579,23 @@ export async function runUpgrade(opts = {}) {
 
   // --- rollback path (no doctor needed; snapshot is authoritative) ---
   if (opts.rollback) {
+    // Independent review of #260/#272 (round 2): --target has NO meaning on --rollback --
+    // rollback restores a STORED SNAPSHOT (selected by path, or the most recent one), never
+    // an arbitrary requested version, and runRollback() below never reads opts.target at
+    // all -- it silently ignores it, the same "accepted and dropped with no signal" shape
+    // #260 exists to close everywhere else. This combination became genuinely reachable in
+    // practice only after this same file's own noop/restart/fresh_install refusal messages
+    // (below) started pointing refused users at `ocp update --rollback` for downgrade
+    // intent -- following that advice with --target still attached would otherwise restore
+    // the newest snapshot while reporting success, believing the requested version was
+    // honored, on the one path that actually mutates disk (git checkout, npm install,
+    // restore plist/db, restart). Refuse rather than silently drop it, matching every other
+    // guard this issue added.
+    if (opts.target) {
+      throw new Error(
+        `--target ${opts.target} has no effect on --rollback -- rollback restores a stored snapshot (selected by path, or the most recent one), not a requested version. Use \`ocp update --rollback --list\` to see available snapshots, then \`ocp update --rollback <path>\` to restore a specific one.`
+      );
+    }
     return await runRollback(opts);
   }
 
@@ -590,6 +607,44 @@ export async function runUpgrade(opts = {}) {
 
   const kind = doctor.next_action.kind;
   plan.push(`[doctor] from=${doctor.current_version} to=${doctor.latest_version} kind=${kind}`);
+
+  // Issue #260: --target is a PIN ("do not put me on anything else"), not a preference. noop,
+  // restart, and fresh_install have no mechanism to redirect what they do onto a specific
+  // version: noop does nothing, restart re-serves the CURRENT tree exactly as-is, and
+  // fresh_install replays doctor's own ai_executable[] -- a fixed, unparameterized script, not
+  // a tag checkout. Refuse (throw -- matching resolveUpgradeTarget's own refusal shape below,
+  // and mirroring bash's identical noop/restart refusal in `ocp`'s cmd_update) rather than
+  // silently proceeding -- including proceeding to do NOTHING -- when the caller asserted a
+  // pin. Checked here, before both the noop early-return and the --dry-run early-exit below,
+  // so previewing an impossible pin also refuses rather than previewing a plan that quietly
+  // drops it.
+  //
+  // "restart" is reachable here only when something calls runUpgrade() programmatically with a
+  // mockDoctor/live doctor reporting kind="restart" -- the real CLI path (`ocp`'s cmd_update)
+  // handles "restart" entirely in bash (_cmd_update_restart, which never execs into this file
+  // at all) and refuses it there directly, for the identical reason -- see that refusal's own
+  // comment in `ocp`. Included here anyway as defense in depth for any other caller of this
+  // exported function.
+  //
+  // "fresh_install" IS reached for real through the CLI: `ocp`'s cmd_update dispatches BOTH
+  // "upgrade" and "fresh_install" through the same `exec node scripts/upgrade.mjs "$@"` arm
+  // (only "upgrade" honors --target, per #259), so this is the only layer that can refuse it.
+  //
+  // Consistency with the light/patch-bump path ("update" kind, #241/#255): that path stays a
+  // WARNING, not a refusal, here and in `ocp` -- out of this issue's own stated scope (its own
+  // table lists only noop/restart/fresh_install as "no signal at all"; the light path already
+  // gives an observable, if non-blocking, stderr signal). See this PR's description for the
+  // full reasoning either way.
+  if (opts.target && (kind === "noop" || kind === "restart" || kind === "fresh_install")) {
+    const why = kind === "noop"
+      ? "the tree is already at the latest release -- there is nothing to check out"
+      : kind === "restart"
+        ? "the tree already matches the latest release and only the running service is stale -- this path restarts the current tree as-is and never runs git"
+        : "fresh_install replays doctor's own fixed install steps, not a checkout of a specific tag";
+    throw new Error(
+      `--target ${opts.target} was requested, but doctor selected the "${kind}" path, which cannot honor a version pin (${why}). Re-run \`ocp update\` without --target, or once a cross-minor release makes the full upgrade path available -- that is currently the ONLY path that honors --target (the light/patch-bump path warns and ignores it, per #241/#255). To move to an OLDER version instead, run \`ocp update --rollback --list\` to pick a snapshot, then \`ocp update --rollback <path>\` to restore it -- --target is NOT accepted on --rollback.`
+    );
+  }
 
   // --- noop ---
   if (kind === "noop") {
