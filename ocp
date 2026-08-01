@@ -71,6 +71,77 @@ _pyfail() {
   return 1
 }
 
+# Issue #261 (the pattern #256/#258 partially addressed): a call site that folds curl's own
+# stderr into the captured response body via `2>&1` — `data=$(_curl ... 2>&1) || { echo "proxy
+# unreachable"; exit 1; }` — cannot tell "curl itself never ran" (a local shell/exec fault —
+# curl missing from $PATH, or a bash builtin error firing before curl was ever invoked, e.g. the
+# `set -u` "unbound variable" that used to fire inside `_curl` itself, per #256) apart from
+# "curl ran and the request genuinely failed" (network down, proxy not listening, non-2xx).
+# Both produce a nonzero exit from the `$(...)`, so both got the SAME "proxy unreachable" text —
+# exactly how #256 hid: the shell died three lines before curl would have run, and the reader
+# was pointed at a healthy service instead of the actual fault.
+#
+# `_curl_or_die` never merges the two streams: the wrapped command's own stderr is captured to a
+# private temp file (never /dev/null — discarding it would just trade one misdiagnosis for a
+# silent one), and the exit status plus that captured text decide which message fires. Exit 127
+# is bash's own reserved "command not found" code (curl itself never produces it); exit 126 is
+# bash's own "found, but not executable" code (permission denied, ENOEXEC, a broken interpreter
+# line — this repo has its own history of exactly that shape, a corrupted `claude` native
+# binary). Independent review round 1: curl present but `chmod 000` reproduced exit 126 landing
+# in the "proxy unreachable" branch — the exact headline this issue exists to kill. Both codes,
+# plus "Permission denied"/"bad interpreter" in the captured stderr, now route to the could-not-
+# run branch. (The original text match for "command not found" alongside the 127 check was
+# dropped per the same review: bash's exit 127 already carries the full signal unconditionally,
+# and unlike this issue's own #263 sibling — which inspects a subcommand DISPATCHER's combined
+# stdout+stderr and genuinely needed the text arm removed to avoid a false positive — curl's own
+# stderr can't organically contain that phrase, so the arm was redundant, not merely benign.)
+#
+# Independent review round 1 (security, LOW-MEDIUM): the original mktemp fallback
+# (`errfile="${TMPDIR:-/tmp}/.ocp-curlerr.$$"`, used only if `mktemp` itself failed) created its
+# file via plain shell redirection, not `mktemp` — world-readable (0644 under a standard 022
+# umask, vs. `mktemp`'s 0600) at a PID-predictable path under a typically-shared `/tmp`, and a
+# plain `>` redirect FOLLOWS a pre-existing symlink at that path rather than refusing, so a
+# symlink planted in advance at the predictable name gets its target truncated. The content
+# curl's own stderr carries is normally harmless ("command not found" never echoes the request's
+# own arguments), but under `bash -x` tracing an expanded `Authorization: Bearer <admin key>`
+# would reach stderr and could land in that 0644 file. Fixed by making a `mktemp` failure fatal
+# instead of falling back to a predictable path at all: `mktemp` is a POSIX utility present on
+# every host this repo targets, so losing the ability to run `_curl_or_die` on a hypothetical
+# host without it is an acceptable trade for removing the vulnerable fallback outright. mktemp's
+# own stderr is left unredirected (never `2>/dev/null` — see this file's own #261 lesson) so a
+# genuine `mktemp` failure (e.g. a full or unwritable $TMPDIR) is visible, not swallowed.
+#
+# Usage: `data=$(_curl_or_die "<network-failure label>" _curl -sf ... "$url") || exit 1` — the
+# first argument after the label is the command to run (`_curl` for authenticated call sites,
+# plain `curl` for the one unauthenticated one), so this stays a drop-in replacement for the old
+# `<cmd> ... 2>&1) || { echo "Error: <label>"; exit 1; }` shape at each site, byte-identical on
+# the success path and on a genuine network failure (same label text), and message text goes to
+# stderr (matching the sibling display commands' own stderr convention, PR #252 round 1 fix 3 —
+# these three call sites were the ones that review explicitly left untouched).
+_curl_or_die() {
+  local network_label="$1"; shift
+  local errfile out status err
+  errfile=$(mktemp "${TMPDIR:-/tmp}/ocp-curlerr.XXXXXX") || {
+    echo "Error: could not create a secure temp file to capture curl's diagnostic output (mktemp failed, see error above) — cannot safely determine why the request failed" >&2
+    return 1
+  }
+  out=$("$@" 2>"$errfile")
+  status=$?
+  err=$(cat "$errfile" 2>/dev/null)
+  rm -f "$errfile"
+  if [[ $status -ne 0 ]]; then
+    if [[ $status -eq 127 ]] || [[ $status -eq 126 ]] || [[ "$err" == *"Permission denied"* ]] || [[ "$err" == *"bad interpreter"* ]]; then
+      echo "Error: could not run curl (${err:-exit status $status}) — this is a local shell/environment fault, not a proxy problem" >&2
+    else
+      echo "Error: $network_label" >&2
+      [[ -n "$err" ]] && echo "$err" >&2
+    fi
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
 _bar() {
   local pct=$1 width=20
   local filled=$(( pct * width / 100 ))
@@ -100,7 +171,7 @@ EOF
 cmd_usage() {
   if [[ "${1:-}" == "--by-key" ]]; then
     local data
-    data=$(_curl -sf --max-time 15 "$PROXY/api/usage" 2>&1) || { echo "Error: proxy unreachable or usage API not available"; exit 1; }
+    data=$(_curl_or_die "proxy unreachable or usage API not available" _curl -sf --max-time 15 "$PROXY/api/usage") || exit 1
     echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -121,7 +192,7 @@ else:
   fi
 
   local data
-  data=$(curl -sf --max-time 15 "$PROXY/usage" 2>&1) || { echo "Error: proxy unreachable"; exit 1; }
+  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 15 "$PROXY/usage") || exit 1
 
   echo "$data" | python3 -c "
 import sys, json
@@ -337,9 +408,9 @@ cmd_keys() {
     add)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys add <name>"; return 1; fi
       local result
-      result=$(_curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
+      result=$(_curl_or_die "proxy unreachable or unauthorized" _curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$2\"}" 2>&1) || { echo "Error: proxy unreachable or unauthorized"; exit 1; }
+        -d "{\"name\": \"$2\"}") || exit 1
       # Issue #242: this is the highest-stakes of the nine `_pyfail` sites — the formatted view
       # below is the ONLY place the newly created key is ever shown ("you won't see it again").
       # A silent death here (python3 missing/broken) would mean the key was created (the POST
