@@ -445,15 +445,60 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
 }
 
 // Post-flight acceptance predicate (issue #173). A health probe passes ONLY when the server
-// is authed AND actually serving the TARGET version. auth.ok alone is not enough: a stale
-// process holding the port answers auth.ok=true while still running the OLD code — exactly
+// can serve AND is actually serving the TARGET version. The serving check alone is not enough:
+// a stale process holding the port answers healthy while still running the OLD code — exactly
 // what a nohup-fallback orphan did on 2026-07-17 (upgrade "succeeded", /health kept serving
 // 3.21.1). Comparing /health.version to the checkout target catches orphan-holds-port,
 // restart-didn't-take, and wrong-unit-restarted alike. `target` tolerates a leading "v"
 // (doctor reports "v3.22.1"; /health reports "3.22.1"); an empty/unknown target degrades to
-// the old auth-only check rather than blocking an otherwise-good upgrade.
+// the serving check alone rather than blocking an otherwise-good upgrade.
+//
+// The serving check reads `status`, NOT `auth.ok` (issue #289). ADR 0010 built `status` to
+// answer exactly one question — "can this proxy serve?" — and that is precisely the question
+// post-flight asks about the process now holding the port.
+//
+// Why `auth.ok === true` (the pre-#289 predicate) was wrong here. ADR 0010 classifies a probe
+// that dies on a signal (its own timeout) or fails to spawn as INCONCLUSIVE, and an
+// inconclusive probe preserves the last CONCLUSIVE verdict rather than recording one. But
+// post-flight only ever runs against a process that was JUST restarted (ADR 0010 § "Downstream:
+// `ocp update`'s post-flight check"), which has no last conclusive verdict — so on the loaded
+// host ADR 0010 was written about, the first probe times out and `auth.ok` sits at `null` for a
+// full CLAUDE_AUTH_CHECK_INTERVAL_MS (default 10 minutes) with no accelerated re-probe, while
+// this predicate's retry budget is 10 × 1s. `null !== true`, so a SUCCESSFUL restart, update or
+// rollback reported failure, and `runRollback` threw "restored tree may not be what's running"
+// about a rollback that had worked. `status` has no such gap: it is recomputed on every request,
+// and ADR 0010 deliberately does not let an inconclusive probe move it.
+//
+// This is not simply a weaker check. It is stronger in one direction and weaker in another,
+// both deliberately:
+//   - STRONGER: `status` is `degraded` when the `claude` binary is not executable, a real
+//     serving precondition that `auth.ok` misses entirely (an unusable binary makes the probe
+//     fail to spawn, which is INCONCLUSIVE, so a stale `auth.ok: true` survives it).
+//   - WEAKER: a single conclusive rejection leaves `status` at "ok" (ADR 0010 degrades after
+//     AUTH_DEGRADE_AFTER = 2). That is intended. ADR 0010 § "Why the threshold is 2" holds that
+//     one rejection is a token-rotation race, not a condition — and post-flight, running against
+//     a fresh process, sees exactly that first probe. On the UPDATE paths a genuine credential
+//     outage is also caught before this point twice over: `runDoctor`'s FAIL on a conclusive
+//     `auth.ok === false` clears `ready_to_upgrade` (the pre-flight guard below at "doctor
+//     pre-flight"), and bash refuses `kind=fix_oauth` ahead of dispatch (`ocp` cmd_update).
+//     Both key off `auth.ok`, which this change deliberately leaves FAILing, so neither gate
+//     depends on the field being relaxed here.
+//
+//     ROLLBACK IS THE EXCEPTION, and it is deliberate rather than an oversight: `--rollback`
+//     `exec`s straight past the doctor dispatch in `ocp` and returns from `runUpgrade`'s rollback
+//     branch before the pre-flight guard ("no doctor needed; snapshot is authoritative"), because
+//     rollback exists to restore a service that is already down — gating it on a health check it
+//     is trying to repair would deadlock it. So on rollback, post-flight is the only check, and
+//     what it must establish is that the RESTORED TREE is the one now serving: the version arm,
+//     which this change does not touch. Credentials are out of scope there by construction.
+//     Post-flight is not the layer that adjudicates credentials; it verifies a restart.
+//
+// Fail-closed by construction: a body with no `status` yields `undefined !== "ok"` → false, and
+// an unreachable server never produces a body at all (the caller's try/catch retries). Verified
+// present on /health continuously from v3.4.0 — doctor's `from_version_supported` floor — so
+// rollback targets across the whole supported range still answer it.
 export function postFlightOk(body, target) {
-  if (body?.auth?.ok !== true) return false;
+  if (body?.status !== "ok") return false;
   const want = String(target || "").replace(/^v/, "");
   return !want || body?.version === want;
 }
@@ -883,7 +928,7 @@ async function runFullUpgrade({ doctor, opts }) {
       if (!ok) {
         phases.push({
           name: "post-flight", status: "fail",
-          message: `health did not return auth.ok=true AND version=${upgradeTarget} within 10s`
+          message: `health did not return status=ok AND version=${upgradeTarget} within 10s`
             + (lastSeen ? ` (last saw version=${lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : ""),
         });
         throw new Error("post-flight failed");
@@ -1192,7 +1237,7 @@ async function runRollback(opts) {
       name: "post-flight",
       status: postFlight.ok ? "ok" : "fail",
       ...(postFlight.ok ? {} : {
-        message: `health did not return auth.ok=true AND version=${postFlight.target} within the post-flight budget`
+        message: `health did not return status=ok AND version=${postFlight.target} within the post-flight budget`
           + (postFlight.lastSeen
             ? ` (last saw version=${postFlight.lastSeen} — the restored tree may not be what's running; check \`ss -ltnp\` / \`lsof -i\`)`
             : " (unreachable)"),
