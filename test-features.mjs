@@ -3286,6 +3286,364 @@ test("gcSnapshots --dry-run reports plan without deleting", () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+// ── scripts/lib/start-sh.mjs: issue #246 (setup.mjs's bare lsof call sites) ──────────────────
+// setup.mjs itself can never be executed by this suite (it is the real installer -- see
+// AGENTS.md's "NEVER run setup.mjs" constraint and scripts/lib/install-autostart.mjs's own
+// header for the identical rationale), so this drives the extracted buildStartSh()/
+// resolveBinaryPath() behaviorally: build the real bash text, write REAL fake lsof/netstat
+// stubs to disk, and execute the generated script as a real `bash` subprocess with a
+// deliberately RESTRICTED $PATH (never includes the stub directory) -- proving resolution
+// happens via the injected absolute path, not via PATH lookup, exactly matching this
+// session's own live-verified defect (`which lsof` / `which netstat` both fail under this
+// agent's own PATH; `/usr/sbin/lsof` succeeds).
+import { buildStartSh, resolveBinaryPath } from "./scripts/lib/start-sh.mjs";
+
+console.log("\nscripts/lib/start-sh.mjs (issue #246):");
+
+// The pre-#246 setup.mjs:293 body, copied verbatim from this repo's history so the exact
+// regression this issue fixes stays provable even after setup.mjs's own source moved on.
+// Bare `lsof`, both stdout+stderr to /dev/null, no netstat cross-check at all.
+function _preFix246StartSh({ port, serverPath, logDir }) {
+  return `#!/bin/bash
+# Start OCP (Open Claude Proxy) if not already running
+PORT=\${CLAUDE_PROXY_PORT:-${port}}
+if ! lsof -i :\$PORT -sTCP:LISTEN &>/dev/null; then
+  unset CLAUDECODE
+  nohup node "${serverPath}" \\
+    >> "${logDir}/claude-proxy.log" \\
+    2>> "${logDir}/claude-proxy.err.log" &
+  echo "claude-proxy started on port \$PORT (pid $!)"
+else
+  echo "claude-proxy already running on port \$PORT"
+fi
+`;
+}
+
+// Writes real fake lsof/netstat stubs at freshly-allocated absolute paths (inside a
+// directory NEVER added to the child's $PATH below), lets `buildScript` construct the
+// actual script text using those exact paths, then runs it as a real subprocess and
+// reports whether the fake `node` (also stubbed, ON $PATH under its bare name -- matching
+// how a real install would resolve `node`) was ever invoked.
+// A real blocking sleep (Atomics.wait on a throwaway SharedArrayBuffer), not a busy-spin --
+// used by _runStartShScenario's poll loop below so waiting for a backgrounded process under
+// real host load doesn't itself burn CPU competing with the thing being waited on.
+const _startShSleepBuf = new Int32Array(new SharedArrayBuffer(4));
+function _sleepStartShPollMs(ms) {
+  Atomics.wait(_startShSleepBuf, 0, 0, ms);
+}
+
+// Independent review of PR #269 (this section) found this harness's own $PATH was NOT
+// actually isolated: `${binDir}:/bin:/usr/bin` includes real system directories, and on a
+// host where a REAL `lsof`/`netstat`/`awk` happens to live in `/bin` or `/usr/bin` (e.g.
+// Ubuntu's `/usr/bin/lsof` -- exactly `ubuntu-latest`, this repo's own CI runner), the
+// pre-#246 "control" body's BARE `lsof` call could resolve to that REAL binary and query
+// REAL system state for the test's port instead of reliably failing as "command not
+// found" -- making the control's own proof environment-dependent (passes only because the
+// port happened to be free on that host, not because the intended defect mechanism fired)
+// instead of deterministic. Reproduced by the reviewer: a real listener on the chosen port
+// flipped the control's assertion from pass to hard-fail. Fixed by making $PATH resolve
+// to NOTHING but this test's own scratch `binDir` -- no `/bin`, no `/usr/bin`, no real
+// system directory at all -- which requires stubbing `nohup` too (the one external,
+// bare-name command the generated script itself calls; `node` was already stubbed here).
+// `spawnSync` is pointed at bash's own absolute path so launching bash ITSELF never
+// depends on this deliberately-gutted $PATH either.
+function _runStartShScenario({ lsofScript, netstatScript, buildScript, port, lsofMissing = false }) {
+  const root = mkdtempSync(testJoin(tmpdir(), "start-sh-test-"));
+  try {
+    const stubDir = testJoin(root, "stubs"); // deliberately NOT on PATH below
+    tMkdirSync(stubDir, { recursive: true });
+    // lsofMissing (review round 2, finding 2): the absolute lsofAbsPath is never written a
+    // stub file at all -- combined with the fully-isolated $PATH below (no bare `lsof`
+    // reachable either), this reproduces lsof being GENUINELY ABSENT from the host, not
+    // just returning a nonzero exit -- `[ -x "$LSOF" ]` fails, falls back to the bare name,
+    // which ALSO fails to resolve, so the invocation itself is bash's own "command not
+    // found" (exit 127), never reaching the fake stub's own exit code at all.
+    const lsofAbsPath = testJoin(stubDir, "fake-lsof");
+    if (!lsofMissing) {
+      testWriteFile(lsofAbsPath, `#!/bin/bash\n${lsofScript}\n`);
+      _ltChmod(lsofAbsPath, 0o755);
+    }
+    const netstatAbsPath = testJoin(stubDir, "fake-netstat");
+    testWriteFile(netstatAbsPath, `#!/bin/bash\n${netstatScript}\n`);
+    _ltChmod(netstatAbsPath, 0o755);
+
+    const logDir = testJoin(root, "logs");
+    tMkdirSync(logDir, { recursive: true });
+    const serverPath = testJoin(root, "server.mjs");
+    testWriteFile(serverPath, "");
+
+    // ONLY directory on $PATH below. Contains fake `node` AND fake `nohup` -- the generated
+    // script's only two bare-name external commands once lsof/netstat are absolute-pathed
+    // (issue #246) and the netstat column parse no longer shells out to `awk` (this same
+    // review round, see scripts/lib/start-sh.mjs). `nohup` here just execs straight through
+    // (this test never needs real SIGHUP-immunity, only "did the given command run").
+    const binDir = testJoin(root, "bin");
+    tMkdirSync(binDir, { recursive: true });
+    const nodeLogPath = testJoin(root, "node-called.log");
+    const fakeNode = testJoin(binDir, "node");
+    testWriteFile(fakeNode, `#!/bin/bash\necho "NODE-CALLED $*" >> ${JSON.stringify(nodeLogPath)}\n`);
+    _ltChmod(fakeNode, 0o755);
+    // `trap '' HUP` is load-bearing, not decorative: real `nohup`'s entire purpose is making
+    // its child immune to SIGHUP so it outlives the shell that spawned it. Without this, the
+    // backgrounded fake `node` call was observed dying before it could write its own log line
+    // once the OUTER bash script (spawnSync's own child) exited and something in that
+    // teardown sent SIGHUP to the still-running background job -- non-deterministically
+    // reproducing exactly the "started, per stdout, but never actually ran" gap a plain
+    // `exec "$@"` stub left open. Discovered live while fixing this PR's own review round
+    // (an earlier revision of this stub omitted the trap and every MONEY TEST here failed
+    // with "expected to start" even though stdout said "claude-proxy started").
+    const fakeNohup = testJoin(binDir, "nohup");
+    testWriteFile(fakeNohup, `#!/bin/bash\ntrap '' HUP\nexec "$@"\n`);
+    _ltChmod(fakeNohup, 0o755);
+
+    const scriptText = buildScript({ port, serverPath, logDir, lsofAbsPath, netstatAbsPath });
+    const scriptPath = testJoin(root, "start.sh");
+    testWriteFile(scriptPath, scriptText);
+    _ltChmod(scriptPath, 0o755);
+
+    // Restricted PATH: ONLY binDir -- excludes stubDir (proves absolute-path invocation,
+    // not a PATH-based lookup for lsof/netstat) AND excludes every real system directory
+    // (proves the same for the harness's OWN isolation -- see this function's header).
+    const env = { PATH: binDir, HOME: root };
+    const res = spawnSync("/bin/bash", [scriptPath], { cwd: root, env, encoding: "utf8" });
+
+    // `nohup node ... &` backgrounds the fake-node call -- the script returns before it
+    // necessarily finishes writing its log line, so poll rather than checking once (AGENTS.md:
+    // "wait for the thing you are about to assert, not a proxy for it"). A fixed short
+    // deadline (2000ms, this section's original value) was observed flaking on this shared
+    // dev host under real concurrent-agent CPU load (`uptime` load average 6-8 with a dozen+
+    // other agent sessions active) -- the backgrounded process legitimately hadn't been
+    // scheduled yet, not a real defect, and a TIGHT BUSY-SPIN poll (checking existsSync in a
+    // no-sleep while loop) makes this WORSE: it burns a full core competing for the same CPU
+    // time the thing it's waiting on needs. `_sleepStartShPollMs` uses Atomics.wait for a real
+    // blocking sleep between checks instead, and the deadline is generous (10s) precisely
+    // because the fast path (process already ran) exits the loop immediately regardless --
+    // this only costs real wall-clock time on a genuinely slow/contended host, which is
+    // exactly when the generous budget is needed.
+    const deadline = Date.now() + 10000;
+    let started = testExistsSync(nodeLogPath);
+    while (!started && Date.now() < deadline) {
+      _sleepStartShPollMs(50);
+      started = testExistsSync(nodeLogPath);
+    }
+
+    return { stdout: res.stdout, stderr: res.stderr, status: res.status, started };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const _fixedDarwinBuild = ({ port, serverPath, logDir, lsofAbsPath, netstatAbsPath }) =>
+  buildStartSh({ port, serverPath, logDir, platform: "darwin", lsofPath: lsofAbsPath, netstatPath: netstatAbsPath });
+
+// A single ltFreePort() call, reused across every scenario below (issue #246 review): none
+// of these scenarios ever actually binds this port -- lsof/netstat are fully faked -- so
+// reuse is safe and deliberate, not an oversight. Using a REAL momentarily-free port
+// (rather than a hardcoded literal like 9999) removes any remaining doubt that a scenario's
+// result could depend on real host state, matching this repo's own ltFreePort() convention.
+const _startShTestPort = await ltFreePort();
+
+test("resolveBinaryPath: prefers the absolute path when it exists on this host", () => {
+  const result = resolveBinaryPath("/usr/sbin/lsof", "lsof", () => true);
+  assert.equal(result, "/usr/sbin/lsof");
+});
+
+test("resolveBinaryPath: falls back to the bare name when the absolute path does not exist", () => {
+  const result = resolveBinaryPath("/usr/sbin/lsof", "lsof", () => false);
+  assert.equal(result, "lsof");
+});
+
+test("resolveBinaryPath: existsSyncFn is called with the absolute path being checked", () => {
+  let seen = null;
+  resolveBinaryPath("/usr/sbin/lsof", "lsof", (p) => { seen = p; return true; });
+  assert.equal(seen, "/usr/sbin/lsof");
+});
+
+test("buildStartSh darwin: lsof cleanly matches -- already running, does not start a duplicate", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `echo "node 1 u 4u IPv4 0x0 0t0 TCP *:${_startShTestPort} (LISTEN)"; exit 0`,
+    netstatScript: `exit 1`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `expected NOT to start; stdout=${JSON.stringify(r.stdout)}`);
+  assert.match(r.stdout, /already running/);
+});
+
+test("buildStartSh darwin: lsof + netstat both cleanly report nothing -- starts the server", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.1 *.* LISTEN"; exit 0`, // a LISTEN row, but NOT on our port (port 1 is never our ephemeral test port)
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true, `expected to start; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stdout, /claude-proxy started/);
+});
+
+test("buildStartSh darwin (headline fix): lsof ambiguous + netstat CONFIRMS a privilege-gap listener -- refuses to start a duplicate", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`, // exit 1, empty stdout -- lsof's own "nothing matched" signature,
+                           // indistinguishable from "can't see a root-owned listener"
+    netstatScript: `echo "tcp4 0 0 *.${_startShTestPort} *.* LISTEN"; exit 0`, // netstat CAN see it
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `must NOT start a duplicate; stdout=${JSON.stringify(r.stdout)}`);
+  assert.match(r.stdout, /already running/);
+});
+
+test("buildStartSh darwin: netstat itself fails to run -- fails closed, does not start", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`,
+    netstatScript: `exit 127`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `netstat failure must fail closed; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// Independent review of PR #269 (round 2) found the fail-closed DEFAULT itself (start-sh.mjs's
+// `listening=1` before either explicit branch runs) had ZERO test coverage: mutating that
+// literal from 1 to 0 left the suite fully green, because every existing scenario above drove
+// lsof into one of the two EXPLICIT branches (status===0 with output, or status===1 with empty
+// output) -- none exercised the THIRD, unenumerated case the default exists for: lsof failing
+// in some way that is neither of those two shapes. That is exactly what a genuinely missing
+// binary, a permission error, or a malformed invocation looks like on a real restricted-PATH
+// host -- the precise condition this whole fix exists to handle safely. Three shapes below,
+// each asserting the SAME safe outcome (does not start) via a DIFFERENT route into the default.
+console.log("\nbuildStartSh darwin: fail-closed DEFAULT coverage (review round 2, finding 2):");
+
+test("buildStartSh darwin: lsof genuinely missing (not just failing) -- command-not-found falls to the fail-closed default, does not start", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofMissing: true, // no stub file at all; bare fallback ALSO unreachable on this PATH
+    netstatScript: `exit 1`, // never reached -- lsof_status won't be 1 (bash's own 127, not lsof's own exit code)
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("buildStartSh darwin: lsof exits 0 (success) but with EMPTY stdout -- matches neither explicit branch, falls to the fail-closed default", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 0`, // status===0 but stdout is empty -- fails "status===0 && -n lsof_out"
+    netstatScript: `exit 1`, // never reached -- lsof_status isn't 1 either
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("buildStartSh darwin: lsof hard error (neither 0 nor 1, e.g. a malformed invocation) -- falls to the fail-closed default", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `echo "lsof: illegal option -- z" >&2; exit 2`, // status===2 -- matches neither explicit branch
+    netstatScript: `exit 1`, // never reached
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// Independent review finding 6 (LOW): the netstat LISTEN-row match's suffix anchoring
+// (`*".$PORT"`, requiring the literal dot immediately before the port digits) was never
+// actually driven by a decoy that WOULD collide under a naive unanchored substring match --
+// mirrors scripts/upgrade.mjs's own established "FOLD-IN 1" test class for its JS netstat
+// parser (netstatHasListenerOnPort), applied here to this file's bash-native equivalent.
+console.log("\nbuildStartSh darwin: netstat suffix-anchoring guards (review round 2, finding 6):");
+
+test("buildStartSh darwin: netstat parser rejects an adjacent port that merely CONTAINS the target port's digits as a substring", () => {
+  const decoyPort = `9${_startShTestPort}`; // e.g. our port 54321 -> decoy "954321": contains
+                                             // "54321" as a raw substring, but does NOT end in
+                                             // ".54321" (the character before it is "9", not ".")
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.${decoyPort} *.* LISTEN"; exit 0`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true,
+    `an adjacent port containing our port's digits must NOT be read as a match; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("buildStartSh darwin: netstat parser rejects a non-LISTEN row on the exact target port", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.${_startShTestPort} *.* TIME_WAIT"; exit 0`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true,
+    `a TIME_WAIT (non-LISTEN) row on our own port must not block the not-listening conclusion; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("MONEY TEST (money A): restricted PATH + genuinely free port -- FIXED code starts the server via the absolute lsof/netstat paths", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.1 *.* CLOSED"; exit 0`, // no LISTEN row at all
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true, `expected the FIXED script to start; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("MONEY TEST (money B, the actual #246 regression): restricted PATH + a REAL listener -- pre-fix bare lsof cannot see it and starts a DUPLICATE; fixed absolute-path code correctly refuses", () => {
+  // Both runs use the IDENTICAL restricted $PATH (stubDir never on PATH, and -- per this
+  // PR's own review round -- no real system directory reachable at all, see
+  // _runStartShScenario's own header) and the IDENTICAL fake lsof/netstat behavior (both
+  // would report "something is listening" -- lsof exit 0 with output -- if only they could
+  // be reached). The only variable is which script body runs: the pre-#246 bare-lsof body,
+  // or buildStartSh()'s fixed absolute-path body.
+  const lsofScript = `echo "node 1 u 4u IPv4 0x0 0t0 TCP *:${_startShTestPort} (LISTEN)"; exit 0`;
+  const netstatScript = `exit 1`; // never reached by either body in this scenario
+
+  const preFix = _runStartShScenario({
+    port: _startShTestPort, lsofScript, netstatScript,
+    buildScript: ({ port, serverPath, logDir }) => _preFix246StartSh({ port, serverPath, logDir }),
+  });
+  // THE DEFECT: bare `lsof` under a restricted PATH is "command not found" (bash exit 127),
+  // which the pre-#246 `if ! lsof ...` treats identically to "nothing is listening" --
+  // starts a SECOND server.mjs on top of a real listener. This can ONLY be observed
+  // reliably because _runStartShScenario's own $PATH now resolves to nothing but its own
+  // scratch binDir -- with a leaky PATH (this PR's own review finding), a REAL `lsof` on
+  // the test host could resolve instead and this assertion would depend on real host state.
+  assert.equal(preFix.started, true,
+    `control must reproduce the #246 defect (bare lsof unreachable -> false "not listening" -> duplicate spawn); stdout=${JSON.stringify(preFix.stdout)}`);
+
+  const fixed = _runStartShScenario({
+    port: _startShTestPort, lsofScript, netstatScript,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(fixed.started, false,
+    `fixed script must find the SAME listener via the absolute path and refuse to start a duplicate; stdout=${JSON.stringify(fixed.stdout)}`);
+});
+
+test("buildStartSh non-darwin: bare lsof resolves fine via PATH (unchanged pre-#246 behavior) -- lsof match means already running", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `echo "irrelevant -- never called on non-darwin"; exit 1`,
+    netstatScript: `exit 1`,
+    buildScript: ({ port, serverPath, logDir }) => buildStartSh({ port, serverPath, logDir, platform: "linux" }),
+  });
+  // non-darwin's bare `lsof` isn't stubbed at all here (buildStartSh's non-darwin branch
+  // never references lsofAbsPath/netstatAbsPath) -- with no real `lsof` reachable on this
+  // fully-isolated PATH either, resolution fails as "command not found", which the
+  // (unchanged, matching the original pre-#246 semantics) non-darwin branch treats as "not
+  // listening" -> starts.
+  assert.equal(r.started, true, `stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// Wiring/premise check (AGENTS.md's carve-out: legitimate for a harness's own boundary, not
+// for the decision logic itself -- the decision logic above is tested behaviorally). Confirms
+// setup.mjs actually calls the real buildStartSh()/resolveBinaryPath() rather than an inline
+// reimplementation drifting back in unnoticed.
+test("setup.mjs wiring: imports buildStartSh/resolveBinaryPath from scripts/lib/start-sh.mjs and no longer inlines a bare lsof call", () => {
+  const src = _ltRead(testJoin(import.meta.dirname, "setup.mjs"), "utf8");
+  assert.match(src, /from ["']\.\/scripts\/lib\/start-sh\.mjs["']/, "setup.mjs must import from scripts/lib/start-sh.mjs");
+  assert.match(src, /buildStartSh\(/, "setup.mjs must call buildStartSh()");
+  assert.match(src, /resolveBinaryPath\(/, "setup.mjs must call resolveBinaryPath()");
+  assert.ok(!/\n\s*lsof -i :/.test(src), "setup.mjs must not re-inline the old bare `lsof -i :` check");
+});
+
 // ── Doctor --check oauth fast path tests ──
 console.log("\nDoctor --check oauth:");
 
