@@ -12191,6 +12191,160 @@ test("#261 fold-in A (independent review round 1, security): a mktemp failure is
     `redirect its stderr into; log=${JSON.stringify(r.log)}`);
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Issue #273 (found during independent review of #267): two more sites in the same "the command
+// could not run" vs "the request failed" family that #261's own sweep did not name.
+//
+// `cmd_status` (a BARE pipeline, `curl -sf ... "$PROXY/status" | _json`, no failure handling at
+// all) is a WORSE case than the three #261 sites: those at least printed something (the wrong
+// diagnosis, on a genuine network failure, per #256/#261's own history) — `cmd_status` printed
+// NOTHING on EITHER stream, in EITHER scenario. Verified directly (not assumed) against the
+// unmodified script before writing these tests: a real curl against a closed port (proxy
+// genuinely down) exits 7 with empty stdout AND empty stderr, because `-sf` (silent + fail)
+// suppresses curl's own connection-error text too, not merely HTTP error bodies; a shadow-stubbed
+// curl exiting 127 (curl absent from $PATH) is exactly as silent. This is the command an operator
+// runs FIRST when something looks wrong, and it used to answer by saying nothing at all.
+//
+// `cmd_settings` PATCH is a fourth `2>&1`-into-capture site, literally the shape `_curl_or_die`'s
+// own comment describes: `result=$(curl -s ... 2>&1)`. Unlike a `local result=$(...)` (which
+// masks the exit status from `set -e` — see this file's own #261-era `_pyfail`/`cmd_restart`
+// exit-vs-return lesson), this is a PLAIN assignment, so a curl-exec failure (127, curl missing
+// from $PATH) trips `errexit` immediately and the whole `ocp settings <key> <value>` invocation
+// dies right there — before the `if echo "$result" | python3 ...` line is ever reached — taking
+// the `2>&1`-captured diagnostic down with it: status=127, stdout=[], stderr=[].
+//
+// Both route through the existing `_curl_or_die` helper (#261/#267) rather than inventing a
+// second mechanism. `cmd_status` needed a different shape than a plain captured assignment,
+// though: it still pipes the verified-successful body onward into `_json` (the
+// `python3 -m json.tool 2>/dev/null || cat` formatter) afterward — none of the three #261 sites
+// needed a second stage, they fed the captured value straight into their own `python3 -c "..."`
+// heredoc.
+console.log("\nocp cmd_status / cmd_settings PATCH: two more silent-failure sites (#273):");
+
+test("#273 cmd_status: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
+  // exit:7, body:"" reproduces curl's own real silent-connection-failure shape under `-sf` —
+  // verified directly against a real closed port before writing this fixture (see block comment
+  // above) — rather than the harness's default-refusal arm, which (being a stub script, not a
+  // real curl under `-s`) always prints its own "FAKE-CURL: refusing..." line regardless of `-s`/
+  // `-f` and would therefore NOT reproduce the true silence this issue is about.
+  const r = _bwHarnessRun({ args: ["status"], curlResponses: [{ match: "/status", body: "", exit: 7 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""),
+    `must not reproduce the silent status=7/stdout=[]/stderr=[] signature this issue exists to kill; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("proxy unreachable"), `expected a diagnostic naming the proxy, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `the diagnostic belongs on stderr, not stdout (a consumer piping 'ocp status' output must not read it as data); got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#273 cmd_status: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence", () => {
+  const r = _bwHarnessRun({ args: ["status"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""), `must not be silent; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 control: cmd_status with curl present and the proxy genuinely reachable still prints the (pretty-printed) status body (proves the fix does not just replace one silence with another)", () => {
+  const r = _bwHarnessRun({ args: ["status"], curlResponses: [{ match: "/status", body: JSON.stringify({ ok: true, uptime: "1h" }) }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes('"ok"') && r.stdout.includes("true"), `expected the status JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+  assert.equal(r.stderr, "", `a successful run must not print anything to stderr; got: ${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 cmd_settings PATCH: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
+  const r = _bwHarnessRun({ args: ["settings", "maxPromptChars", "200000"], curlResponses: [{ match: "/settings", body: "", exit: 7 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""),
+    `must not reproduce the silent signature this issue exists to kill; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("proxy unreachable"), `expected a diagnostic naming the proxy, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `the diagnostic belongs on stderr, not stdout; got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#273 cmd_settings PATCH: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence (reproduces the exact status=127/stdout=[]/stderr=[] signature)", () => {
+  const r = _bwHarnessRun({ args: ["settings", "maxPromptChars", "200000"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""), `must not be silent; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 control: cmd_settings PATCH with curl present and the proxy genuinely reachable still reports the result (proves the fix does not just replace one silence with another)", () => {
+  const r = _bwHarnessRun({
+    args: ["settings", "maxPromptChars", "200000"],
+    curlResponses: [{ match: "/settings", body: JSON.stringify({ maxPromptChars: { value: 200000 } }) }],
+  });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("maxPromptChars = 200000"), `expected the success line, got: ${JSON.stringify(r.stdout)}`);
+  assert.equal(r.stderr, "", `a successful run must not print anything to stderr; got: ${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 non-regression: cmd_settings PATCH still surfaces server-side VALIDATION errors from a 2xx-or-not JSON body (the reason this call site deliberately omits curl's -f)", () => {
+  // A validation failure is NOT a network fault -- the server answered, just with an `errors`
+  // array instead of an accepted value. `_curl_or_die` must not be handed `-f` here, or curl
+  // would swallow this body on a non-2xx response and this path would misreport a validation
+  // failure as "proxy unreachable" -- a DIFFERENT misdiagnosis in the same family this issue is
+  // about, and one the fix could easily introduce by reflexively copying `-sf` from other sites.
+  const r = _bwHarnessRun({
+    args: ["settings", "maxPromptChars", "999999999"],
+    curlResponses: [{ match: "/settings", body: JSON.stringify({ errors: ["maxPromptChars must be <= 1000000"] }), exit: 0 }],
+  });
+  assert.equal(r.status, 0, `a validation rejection is not a crash; expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("maxPromptChars must be <= 1000000"), `expected the server's validation message, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#273 stream parity: cmd_status / cmd_settings PATCH 'proxy unreachable' guards write to stderr, stdout stays empty (matches the #242/#261 sibling sites)", () => {
+  const status = _bwHarnessRun({ args: ["status"] });
+  assert.notEqual(status.status, 0, `expected a nonzero exit; status=${status.status}`);
+  assert.equal(status.stdout, "", `cmd_status: stdout must stay clean of the error text; got: ${JSON.stringify(status.stdout)}`);
+  const settings = _bwHarnessRun({ args: ["settings", "maxPromptChars", "200000"] });
+  assert.notEqual(settings.status, 0, `expected a nonzero exit; status=${settings.status}`);
+  assert.equal(settings.stdout, "", `cmd_settings PATCH: stdout must stay clean; got: ${JSON.stringify(settings.stdout)}`);
+});
+
+// ── cmd_health: found during this PR's own independent review (Iron Rule 10), not in #273's own
+// text — the reviewer noticed `cmd_health` (ocp:284-286 at the time) is BYTE-FOR-BYTE the same
+// bare-pipeline shape `cmd_status` had pre-fix (`curl -sf ... | _json`, zero failure handling),
+// 14 lines below the function this PR already fixes. It is the SAME severity as #273's own two
+// sites (total silence on both streams, in both fault modes — verified with the harness itself,
+// using the exact fixtures the cmd_status tests above already established), not the lower
+// severity of the seven sites deferred to #278 (those still let bash's own message through
+// unredirected). Fixed here rather than deferred, per the reviewer's own Iron Rule 11 reasoning:
+// deferring same-severity work to a lower-severity follow-up is the one split that rule does not
+// license. Tests mirror the cmd_status set exactly (same helper, same fixtures, same shape).
+console.log("\nocp cmd_health: the same silent-failure shape as cmd_status, found during PR #279's own independent review (#273):");
+
+test("#273 cmd_health: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
+  const r = _bwHarnessRun({ args: ["health"], curlResponses: [{ match: "/health", body: "", exit: 7 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""),
+    `must not reproduce the silent status=7/stdout=[]/stderr=[] signature this issue exists to kill; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("proxy unreachable"), `expected a diagnostic naming the proxy, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `the diagnostic belongs on stderr, not stdout; got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#273 cmd_health: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence", () => {
+  const r = _bwHarnessRun({ args: ["health"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""), `must not be silent; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 control: cmd_health with curl present and the proxy genuinely reachable still prints the (pretty-printed) health body", () => {
+  const r = _bwHarnessRun({ args: ["health"], curlResponses: [{ match: "/health", body: JSON.stringify({ status: "ok", version: "3.26.0" }) }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes('"status"') && r.stdout.includes("ok"), `expected the health JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+  assert.equal(r.stderr, "", `a successful run must not print anything to stderr; got: ${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 stream parity: cmd_health 'proxy unreachable' guard writes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["health"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.equal(r.stdout, "", `cmd_health: stdout must stay clean of the error text; got: ${JSON.stringify(r.stdout)}`);
+});
+
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
 
 // Background: `lsof -nP -iTCP:<port> -sTCP:LISTEN` EXITS 1 with EMPTY stdout when nothing
