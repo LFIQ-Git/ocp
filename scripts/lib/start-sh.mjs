@@ -61,8 +61,23 @@
 // scenario -- the same scenario :293 fixes), but does NOT get the netstat cross-check:
 // that would add real complexity for a text-only line whose failure mode is already
 // non-functional, and the issue's own text agrees ("its own blast radius is smaller").
+//
+// Second half of issue #246 (this fix): the ABSOLUTE-PATH half of :426 was fixed alongside
+// :293 above, but two things stayed broken there, matching the issue's own text verbatim:
+// (1) BOTH branches of the bind-check command redirected the underlying tool's own stderr to
+// /dev/null, and (2) the surrounding `catch {}` was completely empty, discarding a genuinely-
+// nothing-there empty match and "lsof/ss itself could not run at all" identically. Verified
+// independently (not just taken on the issue's word) by tracing every assignment to `verified`
+// in setup.mjs's Step 8 block: it is set `true` unconditionally immediately after the bind-
+// check's try/catch, regardless of what happened inside it -- nothing downstream ever branches
+// on this block's outcome, confirming it stays a purely cosmetic diagnostic. Sized accordingly:
+// buildBindCheckCommand()/classifyBindCheck() below turn "any failure -> total silence" into "a
+// real tool-execution fault gets ONE honest diagnostic line, a genuine empty match stays exactly
+// as silent as before" -- no netstat cross-check, no privilege-gap classifier, nothing that
+// would only earn its complexity if something downstream actually acted on the distinction.
 
 import { existsSync as realExistsSync } from "node:fs";
+import { execSync as realExecSync } from "node:child_process";
 
 // Prefers `absolutePath` when it exists on this host, falling back to the bare
 // `fallbackName` (relying on $PATH, exactly the pre-#246 behavior) otherwise -- so a host
@@ -184,4 +199,111 @@ else
   echo "claude-proxy already running on port $PORT"
 fi
 `;
+}
+
+// Pure command-string builder for setup.mjs's Step 8 post-install bind-check (issue #246,
+// second half). No execution happens here -- classifyBindCheck() below is the only caller
+// that actually runs the returned string -- so this is testable with a plain return-value
+// assertion, no subprocess needed. Never appends `2>/dev/null` (or any other stderr redirect)
+// on EITHER platform branch: that redirect is the literal remaining defect the issue
+// describes for the old setup.mjs:426 body -- it threw the underlying tool's own stderr away,
+// which is exactly what made "lsof/ss itself is broken" indistinguishable from "ran fine,
+// found nothing" at the call site. `existsSyncFn` threads through to resolveBinaryPath() so
+// tests can pick either branch deterministically regardless of what is actually installed on
+// the host running the suite.
+//
+// Independent review round 1 (MED-2): the linux branch used to be `ss -tlnp | grep ':${port}'`.
+// A `| grep` pipe reports GREP's own exit status, not `ss`'s -- verified live: `ssnotreal -tlnp
+// | grep :N` under both bash and dash exits 1 (grep's own "no match" status), never 127, even
+// though `ss` itself never ran. That made classifyBindCheck()'s exit-127/126 check dead code on
+// Linux, and the port-match filtering is now done in JS (ssLineMatchesPort, below) against the
+// UNFILTERED `ss -tlnp` output instead, so the real exit status of `ss` itself survives.
+// (Rejected alternative, verified live and NOT viable: `sh -o pipefail` -- dash, which is
+// `/bin/sh` on this project's own documented Linux hosts -- Debian/Ubuntu/Raspberry Pi OS --
+// rejects `-o pipefail` outright ("Illegal option"), which would break the bind-check on every
+// single run there, not just the missing-binary case.)
+export function buildBindCheckCommand({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", existsSyncFn = realExistsSync }) {
+  return platform === "linux"
+    ? `ss -tlnp`
+    : `${resolveBinaryPath(lsofPath, "lsof", existsSyncFn)} -nP -iTCP:${port} -sTCP:LISTEN`;
+}
+
+// Matches one line of `ss -tlnp` output against a target port (issue #246, second half, MED-2).
+// `ss`'s "Local Address:Port" column format varies (IPv4 `0.0.0.0:PORT` / `*:PORT`, IPv6
+// `[::]:PORT` / `*:PORT`), so this splits on the LAST ':' rather than assuming a fixed prefix
+// shape -- correctly handles IPv6's own embedded colons. Anchored on the FULL numeric suffix
+// (not a substring/`.includes(':PORT')` check), so an adjacent port that merely contains our
+// port's digits (e.g. target port 8080 vs an unrelated real listener on 18080) is never misread
+// as a match -- mirrors darwinListeningCheck()'s own netstat suffix-anchoring guard (the bash
+// `case *".$PORT")` above) in JS form, applied to `ss`'s different column layout.
+function ssLineMatchesPort(line, port) {
+  const cols = line.trim().split(/\s+/);
+  if (cols[0] !== "LISTEN") return false;
+  const localAddr = cols[3];
+  if (!localAddr) return false;
+  const idx = localAddr.lastIndexOf(":");
+  if (idx === -1) return false;
+  return localAddr.slice(idx + 1) === String(port);
+}
+
+// Runs buildBindCheckCommand()'s command via an injectable execFn (defaulting to the real
+// execSync) and classifies the outcome into exactly three kinds (issue #246, second half).
+// setup.mjs's Step 8 bind-check used to collapse every failure -- a genuine empty match AND
+// lsof/ss itself failing to execute -- into the same silent blank line, via a bare `catch {}`
+// sitting on top of a command that had already thrown its own stderr away with
+// `2>/dev/null`. This restores the distinction the operator needs WITHOUT changing anything
+// downstream: see this function's call site in setup.mjs, where `verified` is set true
+// unconditionally right after this block runs regardless of its outcome (traced end-to-end
+// for this fix -- nothing reads this function's return value except the one console.log/
+// warn() line at that call site), which is why this intentionally does NOT get
+// darwinListeningCheck()'s netstat privilege-gap cross-check above: that earns its complexity
+// only when something downstream actually acts on the distinction, and here nothing does.
+//
+//   - "found":         the tool ran and matched something -- print `line`.
+//   - "empty":         the tool ran fine and found nothing -- unchanged from today's silence.
+//   - "could-not-run": the tool itself never produced a real "no match" -- surface `detail`.
+//
+// `stdio: ["ignore", "pipe", "pipe"]` is REQUIRED here, not decorative (independent review
+// round 1, MED-1): Node's execSync, given no `stdio` option at all, inherits the child's
+// stderr to THIS process's own real stderr in addition to (on the throw path) capturing it
+// into `e.stderr` -- verified live, on BOTH the success and throw paths, with plain
+// `execSync(cmd, { encoding: "utf-8" })`. Left as the default, that silently broke the
+// "empty" contract documented two paragraphs up: an "empty" or even "found" classification is
+// NOT actually silent if the underlying tool wrote anything to its own stderr along the way
+// (a permission warning, a deprecation notice, anything) -- it leaks straight to the
+// installer's console, unprefixed, indistinguishable from real program output. Explicit
+// `stdio: ["pipe","pipe","pipe"]`-equivalent options fully suppress the inherit path while
+// leaving `e.stderr` capture on the throw path and the stdout return value on success both
+// intact (verified live, same script).
+//
+// The empty/could-not-run boundary is inherently heuristic: Node's execSync collapses "tool
+// ran, exited nonzero with nothing to say" (lsof/grep's own plain "no match" exit) and "the
+// shell could not even start the tool" into the same thrown-error shape. Classified here by
+// exit status 127/126 (POSIX "command not found" / "found but not executable") or a small set
+// of shell-level phrases in the surfaced text -- the same style scripts/upgrade.mjs's
+// mapLsofFailureToProbeValue already uses for this repo's other lsof-failure classifiers.
+// The phrase list matches bare `\bnot found\b`, not only `"command not found"` (independent
+// review round 1, MED-2): dash -- `/bin/sh` on this project's own documented Linux hosts --
+// phrases a missing command as `sh: 1: ssnotreal: not found`, WITHOUT the word "command" at
+// all, verified live against a real `/bin/dash`; the narrower phrase silently missed exactly
+// the single most realistic could-not-run case on Linux (`ss` not installed).
+// Anything else (including no status at all, e.g. lsof/grep's own plain "no match" exit)
+// stays "empty" -- the unchanged, pre-#246(second-half) silent case.
+export function classifyBindCheck({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", existsSyncFn = realExistsSync, execFn = realExecSync }) {
+  const cmd = buildBindCheckCommand({ port, platform, lsofPath, existsSyncFn });
+  try {
+    const out = execFn(cmd, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    if (platform === "linux") {
+      const match = out.split("\n").find((line) => ssLineMatchesPort(line, port));
+      return match ? { kind: "found", line: match.trim() } : { kind: "empty" };
+    }
+    return out ? { kind: "found", line: out.split("\n")[0] } : { kind: "empty" };
+  } catch (e) {
+    const text = String(e.stderr || e.message || "").trim();
+    const couldNotRun = e.status === 127 || e.status === 126
+      || /\bnot found\b|no such file or directory|permission denied|enoent/i.test(text);
+    return couldNotRun
+      ? { kind: "could-not-run", detail: text.split("\n")[0] || (e.status != null ? `exit ${e.status}` : "unknown error") }
+      : { kind: "empty" };
+  }
 }

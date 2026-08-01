@@ -18,7 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { resolveServicePlan } from "./scripts/lib/service-mode.mjs";
 import { installAutoStart } from "./scripts/lib/install-autostart.mjs";
-import { buildStartSh, resolveBinaryPath } from "./scripts/lib/start-sh.mjs";
+import { buildStartSh, classifyBindCheck } from "./scripts/lib/start-sh.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -412,19 +412,32 @@ if (!DRY_RUN) {
         console.log(`    version:  ${body.version ?? "unknown"}`);
         console.log(`    authMode: ${body.authMode ?? "unknown"}`);
 
-        // Verify bind socket
+        // Verify bind socket. issue #246 (second half): classifyBindCheck() builds the same
+        // absolute-path-preferred lsof/ss command as before (see scripts/lib/start-sh.mjs's
+        // header for why this call site stays absolute-path-only, no netstat cross-check),
+        // but never redirects the underlying command's own stderr to /dev/null, and
+        // distinguishes "could not run" (a real tool-execution fault) from "ran, found
+        // nothing" (unchanged -- stays silent). The pre-fix body's bare `catch {}` discarded
+        // both identically. Cosmetic only: `verified` below is set true unconditionally
+        // regardless of this block's outcome -- the HTTP health check above already
+        // confirmed the server is up. See classifyBindCheck()'s own header for the full
+        // trace of why this stays a diagnostic line, not a gate.
+        //
+        // Independent review round 1 (LOW-1): classifyBindCheck() itself funnels every
+        // expected failure into a returned `kind` rather than throwing, so this inner
+        // try/catch is provably unreachable under normal use today -- but it costs nothing to
+        // keep, and it means an unforeseen future exception here can never silently skip
+        // `verified = true` below, which would misreport a genuinely healthy server as
+        // "did not respond" and exit 1. Insurance against this cosmetic diagnostic ever
+        // becoming load-bearing by accident, not a response to a live defect.
         try {
-          // issue #246: absolute path (falls back to bare `lsof` only if /usr/sbin/lsof
-          // genuinely does not exist on this host) -- see scripts/lib/start-sh.mjs's header
-          // for why this call site gets absolute-path-only rather than the full netstat
-          // cross-check buildStartSh()'s darwin branch uses.
-          const bindCheck = process.platform === "linux"
-            ? execSync(`ss -tlnp 2>/dev/null | grep ':${PORT}'`, { encoding: "utf-8" }).trim()
-            : execSync(`${resolveBinaryPath("/usr/sbin/lsof", "lsof")} -nP -iTCP:${PORT} -sTCP:LISTEN 2>/dev/null`, { encoding: "utf-8" }).trim();
-          if (bindCheck) {
-            console.log(`    bind:     ${bindCheck.split("\n")[0]}`);
+          const bindCheck = classifyBindCheck({ port: PORT, platform: process.platform });
+          if (bindCheck.kind === "found") {
+            console.log(`    bind:     ${bindCheck.line}`);
+          } else if (bindCheck.kind === "could-not-run") {
+            warn(`bind check could not run (${bindCheck.detail}) — cosmetic only, the health check above already confirmed the server is up`);
           }
-        } catch { /* bind check is best-effort */ }
+        } catch { /* insurance only -- see comment above; classifyBindCheck() should never reach here */ }
 
         verified = true;
       } else {
