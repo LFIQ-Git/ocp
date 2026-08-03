@@ -7,6 +7,7 @@
 import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
+import { classifyToolRequest } from "./lib/tool-support.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
@@ -1744,6 +1745,117 @@ ltTest("integration (#310): a body over the cap in characters is still rejected,
       `payload by byte count is optimising against the wrong number; got ${r.text.slice(0, 200)}`);
     assert.ok(!/\dMB\b/.test(r.text),
       `the 413 must not carry a byte-flavoured unit on a character count; got ${r.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── Issue #311: forced tool_choice is refused; permissive tool_choice is not ──
+// OCP emits no tool_calls at all (before this change `grep -c tool_calls server.mjs` -> 0; it is 2
+// now, both inside the comment this change added) and never reads the request
+// fields. Whether that is a defect depends entirely on tool_choice, and the OpenAI spec draws the
+// line: absent/"auto"/"none" all permit a text answer, so OCP is conformant there; "required" and
+// {type:"function"} require finish_reason "tool_calls", so prose with "stop" is a WRONG answer —
+// and a silent one, since "stop" means the turn ended normally and the client has nothing to
+// branch on.
+//
+// The narrowness is the safety property, not a compromise: refusing on `tools` alone would have
+// broken every OpenClaw agent on this project's own fleet the day it shipped, because every
+// OpenClaw turn carries a tool list and accepts a text answer. That case is pinned below.
+console.log("\nForced tool_choice is refused, permissive tool_choice is untouched (#311, ADR 0013):");
+
+test("#311: tool_choice \"required\" is refused — the spec demands finish_reason tool_calls and OCP cannot produce one", () => {
+  const r = classifyToolRequest({ tool_choice: "required" });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "tool_choice");
+  assert.match(r.message, /cannot return tool_calls/);
+});
+
+test("#311: a forced named function is refused, and the message names it", () => {
+  const r = classifyToolRequest({ tool_choice: { type: "function", function: { name: "get_weather" } } });
+  assert.equal(r.supported, false);
+  assert.match(r.message, /get_weather/, `the client must be able to see which call was refused; got ${r.message}`);
+});
+
+test("#311 (the safety property): `tools` WITHOUT a forcing tool_choice must NOT be refused", () => {
+  // This is the OpenClaw shape — every turn carries a tool list and is perfectly happy with text.
+  // Refusing here would trade a silent wrongness for a loud outage across the whole fleet.
+  const r = classifyToolRequest({ tools: [{ type: "function", function: { name: "message" } }] });
+  assert.equal(r.supported, true,
+    "a permissive tool list plus a text answer is a spec-conformant exchange; refusing it breaks working clients");
+});
+
+test("#311: \"auto\" and \"none\" are both satisfiable by a text answer, so neither is refused", () => {
+  assert.equal(classifyToolRequest({ tool_choice: "auto" }).supported, true);
+  assert.equal(classifyToolRequest({ tool_choice: "none" }).supported, true);
+  assert.equal(classifyToolRequest({}).supported, true);
+});
+
+// Cross-vendor review (codex) reading the INSTALLED OpenAI SDK types found the first draft
+// refused only two of the four doors. `ChatCompletionToolChoiceOption` is
+// `'none' | 'auto' | 'required' | AllowedToolChoice | NamedToolChoice | NamedToolChoiceCustom`,
+// and `function_call?: 'none' | 'auto' | FunctionCallOption` is a separate, still-accepted field
+// whose object form the SDK documents as "forces the model to call that function". Missing any of
+// them leaves that request on the original silently-wrong success path — the same defect, a
+// different door, which is the failure mode this repo has hit repeatedly.
+test("#311: tool_choice {type:'custom'} forces a named custom tool → refused", () => {
+  const r = classifyToolRequest({ tool_choice: { type: "custom", custom: { name: "my_tool" } } });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "tool_choice");
+  assert.match(r.message, /my_tool/, `the client must see which call was refused; got ${r.message}`);
+});
+
+test("#311: allowed_tools mode 'required' forces a call → refused; mode 'auto' only narrows the set → allowed", () => {
+  const req = classifyToolRequest({ tool_choice: { type: "allowed_tools", allowed_tools: { mode: "required", tools: [] } } });
+  assert.equal(req.supported, false, "mode 'required' requires a call to one of the allowed tools");
+  const auto = classifyToolRequest({ tool_choice: { type: "allowed_tools", allowed_tools: { mode: "auto", tools: [] } } });
+  assert.equal(auto.supported, true,
+    "mode 'auto' merely CONSTRAINS the set the model may pick from and still permits a text answer — " +
+    "refusing it would break a client that is only narrowing its tool list");
+});
+
+test("#311: the legacy function_call:{name} forcing form is refused, and blames function_call — not tool_choice", () => {
+  const r = classifyToolRequest({ functions: [{ name: "legacy" }], function_call: { name: "legacy" } });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "function_call",
+    `error.param must name the field the client actually sent, or the 400 sends them to fix the wrong one; got ${r.parameter}`);
+  assert.match(r.message, /legacy/);
+});
+
+test("#311: legacy function_call 'auto' and 'none' are permissive and must NOT be refused", () => {
+  assert.equal(classifyToolRequest({ functions: [{ name: "f" }], function_call: "auto" }).supported, true);
+  assert.equal(classifyToolRequest({ function_call: "none" }).supported, true);
+  assert.equal(classifyToolRequest({ functions: [{ name: "f" }] }).supported, true,
+    "a legacy `functions` list without a forcing function_call is the same permissive shape as `tools`");
+});
+
+test("#311: a malformed tool_choice is left alone rather than newly rejected", () => {
+  // Policing malformed input is not this classifier's job, and inventing a rejection would change
+  // behaviour for requests that work today.
+  for (const bad of [42, "banana", { type: "nonsense" }, [], null]) {
+    assert.equal(classifyToolRequest({ tool_choice: bad }).supported, true, `tool_choice=${JSON.stringify(bad)}`);
+  }
+});
+
+ltTest("integration (#311): a forced tool_choice gets a 400 with the spec's error shape; a permissive one still gets a completion", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    const tools = [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: {} } } }];
+    const base = { model: "haiku", messages: [{ role: "user", content: "hi" }], max_tokens: 16 };
+
+    const forced = await ltPostStatus(port, { ...base, tools, tool_choice: "required" });
+    assert.equal(forced.status, 400, `a forced call must be refused, not answered with prose; got ${forced.status}: ${forced.text.slice(0, 200)}`);
+    const body = JSON.parse(forced.text);
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.equal(body.error.param, "tool_choice", "the spec's error object carries which parameter failed");
+    assert.equal(body.error.code, "unsupported_parameter");
+
+    // The half that protects the fleet: same tools, no forcing choice, must still serve.
+    const permissive = await ltPostStatus(port, { ...base, tools });
+    assert.equal(permissive.status, 200,
+      `a permissive tool list must still get a completion — this is the OpenClaw shape, and a 400 ` +
+      `here would take down every agent on the fleet; got ${permissive.status}: ${permissive.text.slice(0, 200)}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
