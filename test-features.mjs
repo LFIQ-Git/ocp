@@ -2235,6 +2235,14 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
   # The first N probes take the success branch whatever the mode: lets a test establish a
   # CONCLUSIVE ok:true first, then drive the branch it actually wants to observe.
   if [ -n "$AUTH_PROBE_FIRST_OK" ] && [ "$n" -le "$AUTH_PROBE_FIRST_OK" ]; then mode=ok; fi
+  # #324: the mirror knob. Lets a test establish a CONCLUSIVE ok:false first and then drive
+  # inconclusive probes — the sequence that produces the latch this issue is about. Additive:
+  # unset (every pre-#324 call site) leaves behaviour byte-identical.
+  if [ -n "$AUTH_PROBE_FIRST_REJECT" ] && [ "$n" -le "$AUTH_PROBE_FIRST_REJECT" ]; then mode=reject; fi
+  # #324: the third knob, same shape. Lets a test drive INCONCLUSIVE probes first and then a
+  # conclusive rejection — the order that pins the producer's counter RESET, which the other two
+  # orders cannot reach. Additive; unset leaves every existing call site byte-identical.
+  if [ -n "$AUTH_PROBE_FIRST_SIGNAL" ] && [ "$n" -le "$AUTH_PROBE_FIRST_SIGNAL" ]; then mode=signal; fi
   # Written AFTER the sleep: its existence means "this probe could have completed by now".
   if [ -n "$AUTH_PROBE_DONE" ]; then echo done > "$AUTH_PROBE_DONE"; fi
   case "$mode" in
@@ -2428,6 +2436,76 @@ ltTest("integration: TWO consecutive conclusive auth rejections DO flip /health 
 // SAME branch a real AUTH_CHECK_TIMEOUT_MS expiry takes (Node reports killed:true,
 // signal:"SIGTERM" there). Exercising the branch this way costs milliseconds instead of 10s.
 // On the pre-fix build the second probe sets ok:false and status goes degraded.
+ltTest("integration (#324, the money test): a latched ok:false with only inconclusive probes since becomes OBSERVABLE as stale", async () => {
+  if (!LT_POSIX) return;
+  // The wedge, reproduced end to end: probe 1 rejects conclusively (ok -> false), and every probe
+  // after it dies on a signal — inconclusive, which deliberately preserves ok. Before this change
+  // that state was indistinguishable from a fresh rejection, so `ocp update` refused forever with
+  // nothing reporting "stuck": /health said ok and the proxy served normally.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "signal",
+    AUTH_PROBE_FIRST_REJECT: "1", CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const rejected = await ltWaitHealth(port, b => b.auth && b.auth.ok === false, 15000);
+    assert.ok(rejected, `the first probe never produced a conclusive rejection — ${ltDiag(buf)}`);
+    // These two fields stop being true the moment probe 2 lands (~300ms at this interval), so
+    // they are only meaningful if probe 2 has NOT landed. Asserting them unconditionally is
+    // "waiting on a proxy for the thing asserted" — the rule this PR quotes elsewhere. Reset
+    // coverage does not depend on winning that race: the dedicated test below pins it directly.
+    if (ltProbeCount(probeLog) === 1) {
+      assert.equal(rejected.auth.lastOutcome, "rejected", "probe 1 must take the CONCLUSIVE arm");
+      assert.equal(rejected.auth.consecutiveInconclusive, 0, "a conclusive outcome starts the tally at 0");
+    }
+
+    // Now the inconclusive ones accumulate. Waiting on the COUNT, not on a delay: this is the
+    // thing being asserted, so waiting on anything else would be waiting on a proxy for it.
+    const stale = await ltWaitHealth(port, b => (b.auth?.consecutiveInconclusive ?? 0) >= 3, 20000);
+    assert.ok(stale, `the inconclusive tally never reached 3 — ${ltDiag(buf)}`);
+    assert.equal(stale.auth.ok, false,
+      "ok must NOT be rewritten — the last conclusive verdict really was false, and changing the " +
+      "rule that determines a grandfathered B.2 field's value would be a contract change (ADR 0010)");
+    assert.equal(stale.auth.lastOutcome, "timeout", "the recent probes are the inconclusive kind");
+    assert.equal(stale.auth.consecutiveFailures, 1,
+      "inconclusive probes must not inflate the CONCLUSIVE-rejection tally — that tally drives " +
+      "the degraded verdict (ADR 0010) and this must not move it");
+    assert.equal(stale.status, "ok",
+      "and the health verdict is unchanged by any of this — proxyHealthStatus reads " +
+      "consecutiveFailures, never ok, so this change cannot flip a host to degraded");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#324, P1 from review): a conclusive rejection RESETS a counter that has already climbed", async () => {
+  if (!LT_POSIX) return;
+  // The producer half of the P1. A reviewer mutated the rejection branch to PRESERVE the counter
+  // instead of resetting it and the entire suite stayed green — the money test could not see it,
+  // because its rejection lands when the counter is already 0. This drives the other order:
+  // inconclusive probes first, counter climbs, THEN a conclusive rejection.
+  //
+  // The decider is independently hardened against the resulting state, so this is defence in
+  // depth rather than the only guard — but a producer regression should be visible AT the producer.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "reject",
+    AUTH_PROBE_FIRST_SIGNAL: "3", CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const climbed = await ltWaitHealth(port, b => (b.auth?.consecutiveInconclusive ?? 0) >= 3, 20000);
+    assert.ok(climbed, `the inconclusive tally never climbed — ${ltDiag(buf)}`);
+    assert.equal(climbed.auth.ok, null, "no conclusive probe has happened yet, so ok is still null");
+    const reset = await ltWaitHealth(port, b => b.auth?.lastOutcome === "rejected", 20000);
+    assert.ok(reset, `the conclusive rejection never landed — ${ltDiag(buf)}`);
+    assert.equal(reset.auth.consecutiveInconclusive, 0,
+      "a conclusive rejection must RESET the tally. Preserving it produces {ok:false, " +
+      "lastOutcome:'rejected', consecutiveInconclusive:>=3} — a rejection seconds old that the " +
+      "decider would otherwise have to treat as stale evidence");
+    assert.equal(reset.auth.ok, false, "and it is a conclusive rejection");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 ltTest("integration: an INCONCLUSIVE auth probe (signal death, as a timeout arrives) preserves ok and the verdict (#232 defect B)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltAuthFake(dir);
@@ -15811,6 +15889,74 @@ test("replay control → a CONCLUSIVE rejection still DECIDES FAIL + fix_oauth o
 // makes the whole suite fail to LOAD against a tree that lacks the export (SyntaxError before a
 // single test runs), which reports as "everything failed" and destroys the ability to name the
 // tests that actually invert. Dynamic import keeps this one test's failure local and named.
+test("#324: a latched ok:false with enough inconclusive probes since is WARN, not FAIL", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "timeout", message: "Command failed",
+                                     consecutiveInconclusive: AUTH_STALE_AFTER_INCONCLUSIVE } });
+  assert.equal(r.level, "WARN", "stale evidence must not be a FAIL — FAIL sets kind=fix_oauth and ocp update refuses outright");
+  assert.equal(r.oauthOk, true, "and it must not mark oauth as not-ok, which is what blocks the upgrade");
+  assert.match(r.message, /stale/i, "the operator has to be told WHY it is not a rejection");
+});
+
+test("#324 (P1, found by mutation in review): a FRESH rejection is never stale, whatever the counter says", async () => {
+  // The gap the counter alone left open. If a server ever emitted lastOutcome="rejected" together
+  // with a non-zero inconclusive counter — which a correct one cannot, but a regression in the
+  // reset would — the decider used to call that stale and unlock the gate SECONDS after a
+  // conclusive rejection. An independent reviewer produced exactly that state by mutation and the
+  // whole suite stayed green.
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  for (const n of [AUTH_STALE_AFTER_INCONCLUSIVE, AUTH_STALE_AFTER_INCONCLUSIVE + 5, 999]) {
+    const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", message: "denied", consecutiveInconclusive: n } });
+    assert.equal(r.level, "FAIL", `counter=${n} with a REJECTED last outcome must never read as stale`);
+    assert.equal(r.oauthOk, false);
+  }
+});
+
+test("#324: only the two INCONCLUSIVE outcomes can make a latched rejection stale", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  const n = AUTH_STALE_AFTER_INCONCLUSIVE;
+  for (const outcome of ["timeout", "unavailable"]) {
+    assert.equal(classifyAuthOk({ auth: { ok: false, lastOutcome: outcome, consecutiveInconclusive: n } }).level,
+      "WARN", `${outcome} is inconclusive, so a latched rejection behind it is stale evidence`);
+  }
+  // Anything else — including an older server that omits the field entirely — stays FAIL.
+  for (const outcome of ["rejected", "authenticated", "none", undefined, null, "TIMEOUT"]) {
+    assert.equal(classifyAuthOk({ auth: { ok: false, lastOutcome: outcome, consecutiveInconclusive: n } }).level,
+      "FAIL", `lastOutcome=${JSON.stringify(outcome)} must not unlock the gate`);
+  }
+});
+
+test("#324 control: a latched ok:false with FEWER inconclusive probes is still a FAIL", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", message: "denied",
+                                     consecutiveInconclusive: AUTH_STALE_AFTER_INCONCLUSIVE - 1 } });
+  assert.equal(r.level, "FAIL",
+    "a genuine, current rejection must still block the upgrade — this proves the fix does not " +
+    "simply delete the FAIL branch, which would be a much worse bug than the one being fixed");
+  assert.equal(r.oauthOk, false);
+});
+
+test("#324 (backward compatibility): an OLDER server that does not emit the field still FAILs", async () => {
+  // The upgrade path reads /health from whatever version is RUNNING, which during an upgrade is
+  // the old one. If an absent field defaulted to "stale", every pre-#324 server would silently
+  // stop reporting real credential rejections to the gate — turning a fix into a new hole.
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", message: "denied" } });
+  assert.equal(r.level, "FAIL", "absent counter must read as 0, never as 'stale'");
+});
+
+test("#324: a non-numeric counter is treated as 0, not as stale", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  for (const bad of ["lots", null, {}, [], NaN, -1]) {
+    const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", consecutiveInconclusive: bad } });
+    assert.equal(r.level, "FAIL", `junk counter ${JSON.stringify(bad)} must not unlock the gate`);
+  }
+});
+
 test("replay control → classifyAuthOk maps the three-valued domain to three distinct decisions", async () => {
   const { classifyAuthOk: _rpClassifyAuthOk } = await import("./scripts/doctor.mjs");
   assert.equal(typeof _rpClassifyAuthOk, "function",
