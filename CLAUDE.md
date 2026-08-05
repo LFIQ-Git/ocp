@@ -149,14 +149,104 @@ release_kit:
     # path; it does not detect silent growth. Detecting that needs a per-release
     # record of each B.2 endpoint's actual response key set, diffed across
     # releases, which is real machinery and is deliberately not built here.
+    # Both defects below were found on the sweep's FIRST real run (v3.29.0, #337)
+    # and pushed the count in OPPOSITE directions, which is why the how: below is
+    # this specific and not just "grep for the marker":
+    #
+    #   case-sensitive grep   UNDER-count   a real field vanished from the audit
+    #   counts its own prose  OVER-count    total permanently +1
+    #
+    # The under-count is the dangerous one and it fires on the COMPLIANT path: the
+    # author wrote the marker exactly as condition 5 requires, opened a sentence
+    # with it, and a literal `grep` missed the capital A. It was caught only
+    # because a reviewer happened to re-run the grep with different flags. That is
+    # not a control. See #338.
     - name: ADR 0012 additive-field sweep
       when: every release, during the release_kit walk
-      how: grep the CHANGELOG section being dated for "additive under ADR 0012";
-        also grep the WHOLE CHANGELOG for it and report the running total
+      how: |
+        Count ENTRIES carrying the marker, not raw occurrences:
+
+          grep -inE 'additive under \[?ADR[^0-9]{0,10}0012' CHANGELOG.md
+
+        Then subtract by inspection any hit that is META-TEXT — a line describing
+        the sweep mechanism necessarily quotes the marker it greps for. A field
+        entry names an endpoint and a field; meta-text does not. Read every hit;
+        do not report the raw number.
+
+        Do the same over the section being dated (this cycle) and over the whole
+        file (cumulative).
+
+        Why the pattern is shaped like that, since a plain substring was tried
+        first and failed twice on the SAME axis: condition 5 requires the marker,
+        not a spelling. The literal `additive under ADR 0012` finds only 2 of the
+        5 spellings that comply with it. Missed, and not hypothetically — the
+        markdown-link form is already used 10 times elsewhere in this repo:
+
+          additive under [ADR 0012](docs/adr/0012-….md)     <- link form
+          **Additive under [ADR 0012](….md).**              <- link + bold + capital
+          additive under ADR&nbsp;0012                      <- non-breaking space
+
+        Case-insensitivity covers the sentence-initial capital; `\[?` covers the
+        link form; `[^0-9]{0,10}` covers whatever separates "ADR" from "0012".
+
+        HONEST LIMIT, because this is the second narrowing of the same grep and
+        that pattern usually means the mechanism is wrong: a substring or regex
+        match CANNOT be complete over the space of ways to write a reference in
+        prose. What makes it acceptable here rather than in a security control is
+        that there is no adversary — the author is complying — and the variation
+        space is bounded by markdown conventions rather than open.
+
+        >> THE STOPPING RULE BELOW HAS ALREADY FIRED. Read this before touching
+        >> the pattern. <<
+
+        The rule was: if a THIRD compliant spelling is found to be missed, stop
+        widening. Within one review round of writing it, a reviewer constructed
+        twelve spellings and this pattern got 7. The third miss is bold wrapped
+        AROUND the reference:
+
+          additive under **[ADR 0012](docs/adr/0012-….md)**
+
+        `\[?` handles bold outside the whole phrase but not this, and the repo
+        already contains `authorized by **[ADR 0010](…)**` — an authorization
+        sentence about a grandfathered B.2 change, which is the exact slot an
+        ADR 0012 marker occupies. Census of reference forms in CHANGELOG+README:
+        bare link 12, bold-wrapped 1. A real minority risk, not the house style.
+
+        So: capital (round 1) -> link (round 2) -> bold-wrapped (round 3).
+        DO NOT WIDEN THE PATTERN AGAIN. Three rounds of "one spelling over" is
+        the mechanism telling you it is the wrong mechanism, and widening a
+        fourth time is how a guard becomes theatre. The pattern above is
+        deliberately left MISSING a known spelling rather than patched, so the
+        gap stays visible instead of appearing closed.
+
+        The two real fixes, both tracked in #346, both too large to land on a
+        release eve: make the marker's canonical form part of ADR 0012's
+        condition 5 (a sign-off cycle), or diff each B.2 endpoint's real response
+        key set per release and stop reading prose altogether (real machinery,
+        and the only one that also closes the original no-marker blind spot).
+
+        Until one of those lands, a releaser who finds ZERO field entries should
+        treat that as unproven rather than clean, and grep for `ADR 0012` alone
+        as a cross-check.
       report: list the field names and their endpoints in the release PR body,
         plus the cumulative count to date; write "none this cycle" when there are
-        none, so silence is a result rather than an omission. The cumulative
+        none, so silence is a result rather than an omission. If the raw grep count
+        and the reported count differ, say so and say why — a corrected number
+        without its correction is indistinguishable from a miscount. The cumulative
         number is the point — the failure mode ADR 0012 accepts is per-release
         increments each of which looks fine, so a monotonically rising integer is
         what makes the accumulation visible at all.
+      baseline: |
+        As of v3.29.0 the cumulative count is 2, both on /health:
+          instanceName                  (#327)
+          auth.consecutiveInconclusive  (#324)
+        Anchored here so future releasers INCREMENT a known-good number rather
+        than recompute it with whichever grep flags they happen to use — the
+        recomputation is exactly what produced both defects above.
+
+        Not counted, correctly: /health's okSource and okAt also landed in
+        v3.29.0, but under ADR 0014 as part of a contract change rather than as
+        additive fields. They carry no marker by design. Noted because anyone
+        diffing /health's key set against this number will find two extra keys
+        and should not read that as a miss.
 ```

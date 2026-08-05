@@ -4,7 +4,7 @@
 **Status:** Accepted (maintainer sign-off 2026-08-05), **materially amended after sign-off — see below**
 
 > **Ratification provenance.** Sign-off was recorded on the commit titled *"docs(adr): record
-> maintainer sign-off of ADR 0014"*. This ADR has been amended **twice since**, and both
+> maintainer sign-off of ADR 0014"*. This ADR has been amended **three times since**, and all three
 > amendments are material:
 >
 > 1. *"fix(auth): the freshness window was a fiction…"* **rewrote the Decision's mechanism.** An
@@ -16,11 +16,43 @@
 > 2. *"fix(auth): a rejected verdict lost its provenance…"* — the commit carrying **this note** —
 >    additionally rewrote the `status`/tally consequence bullet (text that *was* part of what was
 >    signed) and corrected "a new `lastOutcome` value" to "two".
+> 3. *"docs(auth): the auth state table was keyed on the wrong field…"* corrected § C bullet 1,
+>    which promised `lastOutcome = "verified-by-request"`. **The server has never emitted that
+>    value and by design never will** — `noteAuthVerifiedByRequest` leaves `lastOutcome` to the
+>    probe, because overwriting it would make `/health` claim a probe ran when none did. So bullet 1
+>    contradicted bullet 3 of the same section, and the promise was unimplementable rather than
+>    unimplemented. This is a correction *toward* what was ratified, not a change to it: the
+>    direction signed off was "a completed request is conclusive evidence", and `okSource:
+>    "request"` is how the code has always expressed it. See #342.
+>
+>    It **additionally** corrected § Consequences from "two new `lastOutcome` values" to one — and
+>    that sentence *was* part of the signed text. Disclosed on the standard item 2 sets. The second
+>    value it counted was the same phantom; provenance note 2 records that sentence being
+>    "corrected" from one to two, and **that earlier correction went the wrong way**.
 >
 > An earlier version of this note said "two consequence bullets" and attributed all amendment to
 > the first commit, omitting the second. In the one paragraph whose only job is exact provenance,
 > that under-enumeration is itself the defect — corrected here, and stated because it must be
 > right before anyone re-signs against it.
+>
+> **It happened again.** The commit adding item 3 above left the opening sentence reading "amended
+> **twice since**, and **both** amendments are material" — directly above a three-item list, and
+> directly above the paragraph you are reading, which exists to warn about exactly that. An
+> independent reviewer caught it. Recorded rather than silently corrected, because a provenance
+> note that has under-enumerated twice is evidence about how this paragraph fails — on **two** axes,
+> and the same reviewer had to point out the second one after the first was written down:
+>
+> - **The count is written once and the list grows underneath it.** Anyone adding item 4 must change
+>   the opening sentence in the same edit.
+> - **An item's own description grows underneath it too.** Item 3 first described one correction and
+>   was later extended with a second, to signed text — exactly the shape item 2 discloses with its
+>   "*additionally* rewrote…". Amending an existing item counts as amending this note; re-read the
+>   item you are extending, not just the list you are appending to.
+>
+> The first axis was diagnosed here and the diagnosis was itself one axis short. That is the third
+> consecutive round of findings on this one paragraph, which is worth more as a signal than any of
+> the individual corrections: **a hand-maintained provenance list drifts in every direction it can
+> be edited from.**
 >
 > Commits are cited by subject rather than by hash: the hashes changed under a rebase and dangling
 > ones are worse than none. ADR 0010's precedent note uses descriptive anchors for the same reason.
@@ -83,7 +115,7 @@ When the spawned `claude` resolves its credential from **the environment**, `cla
 
 A request that reaches the model and succeeds proves the credential is valid. A request that fails proves something, and OCP already counts those (`stats.errors`, `recentErrors`, populated by `trackError`).
 
-- **A successful completion sets `auth.ok = true`, `lastOutcome = "verified-by-request"`.** This is stronger evidence than any probe and costs nothing — the request was happening anyway.
+- **A successful completion sets `auth.ok = true`, `okSource = "request"`, and leaves `lastOutcome` alone.** This is stronger evidence than any probe and costs nothing — the request was happening anyway.
 - **That verdict EXPIRES.** Past `AUTH_REQUEST_VERDICT_TTL_MS` (15 min) with no new success it decays to `null`, and `okSource` becomes `expired` so the reason is legible. Not a refinement — without it the design has a defect worse than the one it fixes. See below.
 - **The verdict's provenance is separate from the probe's outcome.** `okSource` (`none` / `probe` / `request` / `expired`) and `okAt` record *how and when* `ok` was established; `lastOutcome` and `lastCheck` stay the probe's business. **This separation is not tidiness — it is the fix for two defects found in review**, both of which made the window above a fiction.
 - **Request failures do not set `auth.ok = false`.** See the open question below.
@@ -144,7 +176,7 @@ This is deliberately asymmetric and the asymmetry is safe in the right direction
 
 - `/health`'s `auth.ok` starts meaning "the credential worked, or we do not know" instead of "a token is set".
 - **`/health`'s `status` cannot be moved by any of this.** `proxyHealthStatus` reads `consecutiveFailures` and never `ok`, so no verdict change here can flip a host to `degraded`. It does **not** follow that the tally is untouched — an exit-0 probe resets it on both branches and a successful request clears it, which is a deliberate restoration of ADR 0010's self-heal. An earlier revision of this line said "nothing here writes that tally"; that was false, and it survived one round after the commit message that introduced the fix had already named it as concealment.
-- Two contract changes on a grandfathered B.2 endpoint: the rule determining `auth.ok`, and two new `lastOutcome` values. Both are why this needs its own ADR rather than ADR 0012's additive-field authorization — ADR 0012 condition 1 excludes exactly this.
+- Two contract changes on a grandfathered B.2 endpoint: the rule determining `auth.ok`, and **one** new `lastOutcome` value (`token-present`). Both are why this needs its own ADR rather than ADR 0012's additive-field authorization — ADR 0012 condition 1 excludes exactly this. *(This line said "two new `lastOutcome` values" until #342. The second value it counted was `verified-by-request`, which was never implemented — see amendment 3. Provenance note 2 records this same sentence being "corrected" from one to two; **that correction went the wrong way**, and #342 fixed § C bullet 1 while leaving this one standing. The bullet's conclusion is unaffected: two contract changes, one of which is a new value.)*
 - The fleet's three env-token hosts will report `auth.ok: null` until their first successful request, then `true` — in practice one request — and back to `null` after 15 minutes of no successful traffic. An idle proxy therefore reports "not established" rather than a stale "works", which is the correct answer to a question nobody has evidence for.
 - **An exit-0 probe resets the rejection tally on both branches.** The first implementation preserved it on the token-present branch, which silently removed ADR 0010's self-healing on exactly the hosts that use the env-token mechanism: once the tally reached the degrade threshold nothing could lower it again, because a successful probe was the only thing that did. Restored, and a successful request clears it too.
 - **A probe never overwrites a fresher request verdict.** The token-present branch measured *less* than a recent completed request; letting it clobber that would contradict this ADR's own evidence hierarchy.
