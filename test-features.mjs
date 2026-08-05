@@ -2566,6 +2566,31 @@ ltTest("integration (#308): a completed REQUEST raises the verdict the probe cou
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+ltTest("integration (#327): a declared instance reports its name on /health", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_INSTANCE_NAME: "wifibot" }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.instanceName !== undefined, 15000);
+    assert.ok(h, `/health never reported instanceName — ${ltDiag(buf)}`);
+    assert.equal(h.instanceName, "wifibot",
+      "a second instance must be discoverable from OUTSIDE — a fleet sweep that can only read unit files silently misses it");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#327): the primary reports an EMPTY name, not a missing field", async () => {
+  if (!LT_POSIX) return;
+  // Empty rather than absent, so a consumer can distinguish "this is the primary" from "this
+  // build predates the field" — the same distinction #324's backward-compatibility test turns on.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.instanceName !== undefined, 15000);
+    assert.ok(h, `/health must always carry the field — ${ltDiag(buf)}`);
+    assert.equal(h.instanceName, "", "the primary declares itself by reporting an empty name");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 ltTest("integration: an INCONCLUSIVE auth probe (signal death, as a timeout arrives) preserves ok and the verdict (#232 defect B)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltAuthFake(dir);
