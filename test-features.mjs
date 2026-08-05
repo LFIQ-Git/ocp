@@ -8,7 +8,8 @@ import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { randomBytes } from "node:crypto";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
@@ -1163,7 +1164,19 @@ const LT_POS_MARK = "you may use your available local tools";
 // REQUEST spawn. Exiting early keeps SP_COUNTER meaning "request spawns", which is what those
 // tests assert on. Exit 0 preserves the previous outcome for the probe itself (authenticated).
 const LT_FAKE = `#!/bin/sh
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
+# #328: dump this child's own environment so a test can assert what it did NOT inherit.
+# Two separate files because the two scrub sites are different code paths: the auth probe
+# (which exits below) and the request spawn. A single file would let one path's result stand
+# in for the other's and hide a half-fix.
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  if [ -n "$ENV_CAPTURE_PROBE" ]; then env > "$ENV_CAPTURE_PROBE.tmp" && mv "$ENV_CAPTURE_PROBE.tmp" "$ENV_CAPTURE_PROBE"; fi
+  exit 0
+fi
+# Write-then-rename: a plain redirect writes in 4096-byte chunks, so a reader that unblocks on
+# "non-empty" can read a TRUNCATED dump — which makes the security assertions pass VACUOUSLY
+# (secrets "absent" because cut off). Measured by an independent reviewer: 4/25 partial reads at a
+# 4794-byte environment, 18/40 at 10938. rename(2) is atomic, so the reader sees all or nothing.
+if [ -n "$ENV_CAPTURE" ]; then env > "$ENV_CAPTURE.tmp" && mv "$ENV_CAPTURE.tmp" "$ENV_CAPTURE"; fi
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
@@ -1483,6 +1496,88 @@ ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wr
     const sp = _ltRead(cap, "utf8");
     assert.ok(sp.includes(LT_POS_MARK), `expected POSITIVE wrapper in --system-prompt, got: ${sp.slice(0,90)}`);
     assert.ok(!sp.includes(LT_NEG_MARK), "positive wrapper must REPLACE the negative one, not append");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── OCP's own inbound credentials never reach a spawned claude (#328) ────────
+// The child reads attacker-controlled text; PROXY_API_KEY authenticates callers TO the proxy and
+// is useless to the child, so leaking it there only hands an injected child a working client
+// credential. Live-proven, not theoretical: on a two-instance host sharing one key, a child on
+// the unprivileged instance read the key from its own env, called the privileged instance, and
+// got a child under the sudo-capable account — bypassing the Unix identity boundary rather than
+// attacking it.
+//
+// Both tests assert a CONTROL variable is present. Without it, a broken capture (empty file,
+// wrong env var name, fake never spawned) would satisfy "no secret found" vacuously — the exact
+// anchor-drift failure this suite already guards against elsewhere.
+
+// Values are >= MIN_ALIASED_VALUE_LEN so the by-VALUE pass is exercised, not silently skipped.
+const LT_SECRETS = { PROXY_API_KEY: "lt-inbound-key-long", OCP_ADMIN_KEY: "lt-admin-key-long", PROXY_ANONYMOUS_KEY: "lt-anon-key-long" };
+// The alias OCP itself creates via `ocp-connect`: same value, a name not on the list.
+const LT_ALIAS = { OPENAI_API_KEY: "lt-inbound-key-long" };
+
+function ltAssertNoInboundSecrets(dump, where) {
+  assert.ok(dump.length > 0, `${where}: env capture is EMPTY — the assertions below would pass vacuously`);
+  assert.match(dump, /^CLAUDE_CODE_DISABLE_AUTO_MEMORY=|^HOME=|^PATH=/m,
+    `${where}: control failed — capture does not look like an environment dump: ${dump.slice(0, 120)}`);
+  for (const [name, value] of Object.entries(LT_SECRETS)) {
+    assert.ok(!new RegExp(`^${name}=`, "m").test(dump), `${where}: ${name} reached the child`);
+    assert.ok(!dump.includes(value), `${where}: the VALUE of ${name} reached the child under some other name`);
+  }
+}
+
+ltTest("integration (#328, the money test): the -p spawn does NOT inherit OCP's inbound credentials", async () => {
+  if (!LT_POSIX) return; // sh fake — skip on Windows CI
+  const dir = ltMkdir(); const cap = join(dir, "env.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh(
+    { ...LT_SECRETS, ...LT_ALIAS, CLAUDE_CODE_OAUTH_TOKEN: "lt-outbound-token", CLAUDE_BIN: fake, ENV_CAPTURE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    // Wait for CONTENT, not existence. `env > "$ENV_CAPTURE"` creates the file empty and then
+    // writes it, so waiting on existence returns mid-write and the assertions below read "".
+    // AGENTS.md: "wait for the thing you are about to assert, not a proxy for it" (#199/#203).
+    // This is almost certainly the intermittent failure an independent reviewer saw once and
+    // could not reproduce — same shape, either integration test, timing-dependent.
+    assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").length > 0),
+      "fake claude was spawned and finished dumping its env");
+    const dump = _ltRead(cap, "utf8");
+    // ltBootFresh passed all three secrets in the SERVER's env, so the parent definitely holds
+    // them — this cannot pass merely because the variables were never set anywhere.
+    ltAssertNoInboundSecrets(dump, "request spawn");
+    // The child must still get what it legitimately needs, or this "fix" would be a break.
+    // Asserted on CLAUDE_CODE_OAUTH_TOKEN ALONE. An earlier revision wrote
+    // `/^CLAUDE_CODE_OAUTH_TOKEN=|^HOME=/m` — HOME always exists, so that alternation could not
+    // fail, and an independent review proved it: adding `delete env.CLAUDE_CODE_OAUTH_TOKEN` (the
+    // obvious over-correction this line exists to catch) left the suite fully green. The token is
+    // now set explicitly in the boot env below, so the assertion has something to bind to on a CI
+    // host that has no real token.
+    //
+    // WHERE TO MUTATE, because the obvious spot does not work and will look like a weak test:
+    // a `delete env.CLAUDE_CODE_OAUTH_TOKEN` placed at the scrub site (server.mjs, next to
+    // scrubInboundAuthEnv) leaves this GREEN — not because the assertion is weak, but because the
+    // isolated-spawn branch re-injects `env.CLAUDE_CODE_OAUTH_TOKEN = decision.token` a few lines
+    // LATER, so the delete is overwritten by the code itself. Mutate immediately before
+    // `spawn(CLAUDE, ...)`, after every re-injection, and this goes red (verified). The same
+    // structure is why adding the token to INBOUND_AUTH_ENV_VARS could not break requests either:
+    // the isolated path would re-establish it regardless.
+    assert.match(dump, /^CLAUDE_CODE_OAUTH_TOKEN=lt-outbound-token$/m,
+      "the OUTBOUND credential the child needs must survive — stripping it would break every request");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#328): the AUTH PROBE child does not inherit them either — the second scrub site", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const cap = join(dir, "envprobe.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT_SECRETS, CLAUDE_BIN: fake, ENV_CAPTURE_PROBE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // The probe runs at boot; no request needed. Waiting on the file is waiting on the thing
+    // asserted, not on a proxy for it.
+    assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").length > 0, 20000),
+      "the boot auth probe spawned the fake and finished dumping its env");
+    ltAssertNoInboundSecrets(_ltRead(cap, "utf8"), "auth probe spawn");
+    assert.ok(port > 0, "server reached listening state");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -5828,6 +5923,54 @@ test("LEGACY_SESSION_NAME_RE matches only the exact old bare-prefix shape, never
 
 console.log("\nTUI command construction (proxy-purity / #4):");
 
+test("#328 (P1 from review 5): the pane prefix unsets ALIASED carriers, not just the three names", () => {
+  // The alias layer added in response to review 4 was NOT pinned: neutering it left the suite at
+  // exactly the baseline, and the test above only asserts the three constants — the `...aliased`
+  // spread was invisible to it. So a reviewer reading that test would reasonably conclude the
+  // review-4 fix was covered when it was not. This is the test that actually covers it.
+  const saved = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "ocp_" + randomBytes(24).toString("base64url");
+  try {
+    const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-alias", "/home/u", "cli");
+    assert.match(cmd, /-u '?OPENAI_API_KEY'?/,
+      `the pane must unset a variable that CARRIES an OCP credential, even though its name is not ` +
+      `on INBOUND_AUTH_ENV_VARS; got: ${cmd.slice(0, 220)}`);
+  } finally {
+    if (saved === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = saved;
+  }
+});
+
+test("#328 (P2 from review 5): a metacharacter-bearing variable NAME cannot escape the pane command", () => {
+  // Every other runtime value in the pane prefix goes through shq(); the alias names were the
+  // first runtime-derived value to reach it and did not. A reviewer executed the gap to a created
+  // marker file via tmux.
+  const evil = "EVIL;touch /tmp/ocp-should-not-exist;X";
+  process.env[evil] = "ocp_" + randomBytes(24).toString("base64url");
+  try {
+    const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-shq", "/home/u", "cli");
+    assert.ok(!cmd.includes("-u EVIL;touch"), `the name must be quoted, not spliced raw; got: ${cmd.slice(0, 260)}`);
+    assert.ok(cmd.includes("'" + evil + "'"), "and it must appear single-quoted");
+  } finally { delete process.env[evil]; }
+});
+
+test("#328 (P0, found by independent review): buildTuiCmd unsets OCP's inbound credentials in the PANE", () => {
+  // The third copy of the four-name denylist lived here, and this is the ONLY request path when
+  // CLAUDE_TUI_MODE=true — server.mjs picks callClaudeTui over callClaude wholesale, so a fix
+  // applied only to spawnClaudeProcess leaves every TUI request unprotected. Behavioural: this
+  // asserts the argv `buildTuiCmd` actually returns, which is the pane's real command line.
+  const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-328", "/home/u", "cli"); // already a string
+  for (const name of INBOUND_AUTH_ENV_VARS) {
+    assert.ok(cmd.includes(`-u '${name}'`), `pane command must unset ${name} (shq-quoted since review 5); got: ${cmd.slice(0, 200)}`);
+  }
+  // Control: the pre-existing four are still unset (this must EXTEND the list, not replace it),
+  // and the outbound credential is not among the unsets.
+  for (const name of ["CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]) {
+    assert.ok(cmd.includes(`-u '${name}'`), `pane command must still unset ${name} — the list was replaced, not extended`);
+  }
+  assert.ok(!cmd.includes("-u 'CLAUDE_CODE_OAUTH_TOKEN'"),
+    "the OUTBOUND credential must NOT be unset — the pane's claude needs it to authenticate");
+});
+
 test("buildTuiCmd suppresses host CLAUDE.md + auto-memory (proxy purity, #4)", () => {
   const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-1", "/home/u", "cli");
   // OCP is a proxy: the host's CLAUDE.md / auto-memory must never leak into the proxied turn.
@@ -5865,7 +6008,7 @@ test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
   // 'auto' mode must NOT pin the entrypoint (claude self-classifies via TTY).
   const auto = buildTuiCmd("/usr/bin/claude", "m", "sid-3", "/home/u", "auto");
   assert.ok(!/CLAUDE_CODE_ENTRYPOINT=/.test(auto), "auto mode leaves entrypoint unset");
-  assert.ok(/-u CLAUDE_CODE_ENTRYPOINT/.test(auto), "auto mode unsets any inherited entrypoint");
+  assert.ok(/-u '?CLAUDE_CODE_ENTRYPOINT'?/.test(auto), "auto mode unsets any inherited entrypoint");
 });
 
 // CLAUDE_CODE_OAUTH_TOKEN passthrough (PI231 401 incident): tmux doesn't forward the parent
@@ -8019,6 +8162,155 @@ test("isLoopbackBind: '100.64.0.1' → false (Tailscale IP)", () => {
 });
 
 // ── Spawn-auth primitives (F3 / F5 / F6, lib/spawn-auth.mjs) ──
+
+// #328 — scrubInboundAuthEnv. The integration tests prove the wiring; these pin the contract at
+// the boundary, where the integration tests cannot reach (absent vars, unrelated vars, aliasing).
+test("#328: scrubInboundAuthEnv removes every inbound-auth var and reports which", () => {
+  const env = { PROXY_API_KEY: "a", OCP_ADMIN_KEY: "b", PROXY_ANONYMOUS_KEY: "c", PATH: "/usr/bin" };
+  const { env: out, removed } = scrubInboundAuthEnv(env);
+  assert.deepEqual(removed.sort(), ["OCP_ADMIN_KEY", "PROXY_ANONYMOUS_KEY", "PROXY_API_KEY"]);
+  assert.deepEqual(Object.keys(out), ["PATH"], "only the non-secret survives");
+  assert.equal(out, env, "mutates in place, so it composes with the existing delete-blocks");
+});
+
+test("#328: absent vars are not an error, and unrelated vars are untouched", () => {
+  const { removed, env } = scrubInboundAuthEnv({ PATH: "/usr/bin", CLAUDE_CODE_OAUTH_TOKEN: "keep-me" });
+  assert.deepEqual(removed, [], "nothing to remove reports nothing removed");
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "keep-me",
+    "the OUTBOUND credential the child genuinely needs must survive — stripping it would break every request");
+});
+
+test("#328: an empty-string secret is still removed (falsy value, real leak)", () => {
+  // `if (env[name])` would skip this and leave the name visible to the child. Presence is the
+  // criterion, not truthiness.
+  const { removed } = scrubInboundAuthEnv({ PROXY_API_KEY: "" });
+  assert.deepEqual(removed, ["PROXY_API_KEY"]);
+});
+
+// ── setup.mjs's two spawns, tested by SLICE (#328, review-3 P2-1) ───────────
+// An earlier revision of this PR declared these two sites "fixed but untestable" because running
+// the real setup.mjs writes configs and installs autostart, and AGENTS.md records an incident from
+// a harness doing exactly that. A reviewer showed that was a false dichotomy: the choice was never
+// "run it or don't test it", it is "run it or SLICE it" — the technique AGENTS.md itself endorses
+// for ocp-connect. This slices only the two `execSync(...)` statements and evaluates them with a
+// recording execSync, so nothing is spawned and nothing is written.
+function _s328Slice(marker) {
+  const src = _ltRead(spotJoin(_spotDir, "setup.mjs"), "utf8");
+  const i = src.indexOf(marker);
+  assert.notEqual(i, -1, `anchor drift: ${JSON.stringify(marker)} not found in setup.mjs`);
+  const start = src.lastIndexOf("execSync(", i + marker.length);
+  assert.notEqual(start, -1, "no execSync( before the anchor — slice boundary wrong");
+  // Balance parens from `execSync(` to its close, so the slice is the whole call and not a prefix.
+  let depth = 0, end = -1;
+  for (let k = start + "execSync".length; k < src.length; k++) {
+    if (src[k] === "(") depth++;
+    else if (src[k] === ")") { depth--; if (depth === 0) { end = k + 1; break; } }
+  }
+  assert.notEqual(end, -1, "unbalanced parens — slice boundary wrong");
+  const slice = src.slice(start, end);
+  assert.ok(slice.length > 0 && slice.includes("execSync("), "empty or malformed slice — anchor drift");
+  return slice;
+}
+
+function _s328Env(slice) {
+  let seen = null;
+  const execSync = (_cmd, opts) => { seen = opts; return ""; };
+  // Only the names the sliced expressions actually reference. Not a sandbox — a drift guard.
+  const fn = new Function("execSync", "process", "scrubInboundAuthEnv", `return (${slice});`);
+  fn(execSync, { env: { PROXY_API_KEY: "ocp_secretlongvalue1", OCP_ADMIN_KEY: "ocp_adminlongvalue1",
+                        PROXY_ANONYMOUS_KEY: "ocp_anonlongvalue11", CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-outbound",
+                        PATH: "/usr/bin" } },
+     scrubInboundAuthEnv);
+  return seen;
+}
+
+for (const [label, marker] of [["which claude", "which claude 2>/dev/null"],
+                               ["claude --version", "claude --version 2>/dev/null"],
+                               ["claude -p auth probe", "--no-session-persistence"]]) {
+  test(`#328: setup.mjs's \`${label}\` spawn does not hand the child OCP's inbound credentials`, () => {
+    const opts = _s328Env(_s328Slice(marker));
+    assert.ok(opts && opts.env, `${label}: the sliced call passed no env at all — that IS the leak`);
+    // Control first: the env is populated and the outbound credential survives, so an empty
+    // object cannot satisfy the assertions below.
+    assert.equal(opts.env.CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-outbound",
+      `${label}: control — the OUTBOUND credential must reach the child`);
+    for (const name of INBOUND_AUTH_ENV_VARS) {
+      assert.ok(!(name in opts.env), `${label}: ${name} reaches the child`);
+    }
+    assert.ok(!JSON.stringify(opts.env).includes("ocp_secretlongvalue1"),
+      `${label}: the VALUE reached the child under some other name`);
+  });
+}
+
+test("#328 (P1 from review 3): a secret aliased under ANOTHER name is removed by VALUE", () => {
+  // OCP itself creates this: `ocp-connect` writes the user's OCP credential into OPENAI_API_KEY —
+  // shell rc, `launchctl setenv` (user domain), `~/.config/environment.d/` — and OCP's own
+  // autostart runs in exactly those scopes. So on any host that ran `ocp connect`, deleting by
+  // name alone left the same secret reaching the child under a different variable.
+  const SECRET = "ocp_averylongsecretvalue123456";
+  const { env, removed } = scrubInboundAuthEnv({
+    PROXY_API_KEY: SECRET, OPENAI_API_KEY: SECRET, OPENAI_BASE_URL: "http://127.0.0.1:3456/v1", PATH: "/usr/bin",
+  });
+  assert.ok(!("OPENAI_API_KEY" in env), "the aliased carrier must go, even though its NAME is not on the list");
+  assert.ok(removed.includes("OPENAI_API_KEY"), "and it must be reported, so the behaviour is assertable");
+  assert.ok(!JSON.stringify(env).includes(SECRET), "the VALUE must not survive under any name");
+  assert.equal(env.OPENAI_BASE_URL, "http://127.0.0.1:3456/v1",
+    "a same-prefix variable that is NOT the secret must survive — this removes a credential, not a namespace");
+  assert.equal(env.PATH, "/usr/bin", "and unrelated variables are untouched");
+});
+
+test("#328 (P1 from review 4): a PER-USER `ocp keys add` credential is removed by FORMAT", () => {
+  // The path both earlier passes are structurally blind to. `ocp-connect`'s documented flow when
+  // the remote requires auth is `ocp keys add <name>`; that key lives in OCP's SQLite store, not
+  // in any environment variable the scrub can observe, so it is neither one of the three names
+  // nor equal to any of their values. In multi mode PROXY_API_KEY is typically unset, which makes
+  // the by-VALUE pass entirely inert — measured: removed: [] with the key untouched.
+  const perUser = "ocp_" + "A".repeat(32);
+  const { env, removed } = scrubInboundAuthEnv({ CLAUDE_AUTH_MODE: "multi", OPENAI_API_KEY: perUser,
+                                                 OPENAI_BASE_URL: "http://host:3456/v1", PATH: "/usr/bin" });
+  assert.ok(removed.includes("OPENAI_API_KEY"), "a key this proxy issued must not reach a child, under any name");
+  assert.ok(!JSON.stringify(env).includes(perUser), "and its value must be gone entirely");
+  assert.equal(env.OPENAI_BASE_URL, "http://host:3456/v1", "the base URL is not a secret and must survive");
+});
+
+test("#328: the issued-key pattern is exact — it matches what keys.mjs mints and nothing else", () => {
+  // Matched by FORMAT rather than by name because ocp-connect puts it in OPENAI_API_KEY today but
+  // nothing constrains it to that. The shape is `ocp_` + exactly 32 base64url chars, which is
+  // `randomBytes(24).toString("base64url")` — asserted against a REAL mint, not a hand-written
+  // literal, so a change to the key format fails this instead of silently disabling the pass.
+  const real = "ocp_" + randomBytes(24).toString("base64url");
+  assert.ok(scrubInboundAuthEnv({ X: real }).removed.includes("X"), "a genuinely minted key must match");
+  for (const near of ["ocp_short", "ocp_" + "A".repeat(31), "ocp_" + "A".repeat(33),
+                      "sk-proj-a-genuine-openai-key", "ocp-" + "A".repeat(32), "prefix_ocp_" + "A".repeat(32)]) {
+    assert.ok(!scrubInboundAuthEnv({ X: near }).removed.includes("X"),
+      `${near.slice(0, 22)}… must NOT match — over-matching would delete unrelated variables`);
+  }
+});
+
+test("#328: a legitimate OPENAI_API_KEY that is NOT OCP's credential is left alone", () => {
+  // The reason this is done by value and not by adding OPENAI_API_KEY to the name list: a child
+  // can legitimately need a real OpenAI key (an MCP server loaded via CLAUDE_MCP_CONFIG). The
+  // goal is to remove OCP's credential, not to blank that variable.
+  const { env } = scrubInboundAuthEnv({ PROXY_API_KEY: "ocp_thisisocpsownkey000000", OPENAI_API_KEY: "sk-proj-a-real-openai-key" });
+  assert.equal(env.OPENAI_API_KEY, "sk-proj-a-real-openai-key", "an unrelated key must survive");
+});
+
+test("#328: a SHORT secret does not trigger collateral deletion by value", () => {
+  // Value-matching on a short secret would strip every variable that happens to share it. Below
+  // the length floor only the name-based pass applies — stated as a deliberate limit, not a bug.
+  const { env, removed } = scrubInboundAuthEnv({ PROXY_API_KEY: "1", DEBUG: "1", VERBOSE: "1" });
+  assert.deepEqual(removed, ["PROXY_API_KEY"], "only the named one goes");
+  assert.equal(env.DEBUG, "1", "a flag that merely shares the value must not be collateral");
+  assert.equal(env.VERBOSE, "1");
+});
+
+test("#328: the var list is the single source both scrub sites read", () => {
+  // Not a source-grep: this asserts the exported list's CONTENT, which is what server.mjs's two
+  // call sites consume. Adding a fourth inbound-auth var without adding it here makes this fail.
+  assert.deepEqual([...INBOUND_AUTH_ENV_VARS].sort(), ["OCP_ADMIN_KEY", "PROXY_ANONYMOUS_KEY", "PROXY_API_KEY"]);
+  assert.throws(() => { INBOUND_AUTH_ENV_VARS.push("X"); }, "frozen, so no caller can widen it at runtime");
+});
+
 // Pure, dependency-injected primitives extracted from server.mjs so the spawn-token concurrency /
 // caching / expiry logic is testable without booting the server or mocking execFileSync/spawn.
 console.log("\nSpawn-auth (F3 mutex / F5 TTL cache + label memo / F6 expiry gate):");
@@ -8711,15 +9003,23 @@ import { tmpdir as tmpdir2 } from "node:os";
 // Fake tmux that records the spawned pane command and always looks ready + pasted.
 function makeTmuxRecorder() {
   const cmds = [];
-  const tmux = (args) => {
+  const opts = [];
+  // #328: the second argument was dropped, which is why the tmux-SERVER env scrub had no test —
+  // removing it left the suite fully green while an execution probe showed the layer is
+  // load-bearing. Capturing it makes that a unit test needing no real tmux at all.
+  const tmux = (args, o) => {
     cmds.push(args);
+    opts.push(o);
     if (args[0] === "capture-pane") {
       // input bar present AND the prompt visibly landed → both polls pass immediately
       return { status: 0, stdout: "[Pasted text #1 +2 lines]\n ? for shortcuts" };
     }
     return { status: 0, stdout: "" };
   };
-  return { tmux, cmds, paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "" };
+  const newSessionIdx = () => cmds.findIndex((a) => a[0] === "new-session");
+  return { tmux, cmds, opts,
+    paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "",
+    newSessionOpts: () => { const i = newSessionIdx(); return i === -1 ? undefined : opts[i]; } };
 }
 
 // A HOME with one already-terminal transcript for `sid`, so readTuiTranscript returns at once.
@@ -8732,6 +9032,36 @@ function seedTranscript(home, sid, text) {
     turn_duration: 1234, cc_entrypoint: "cli",
   }) + "\n");
 }
+
+test("#328: bootTuiPane scrubs the inbound secrets from the TMUX SERVER's environment too", async () => {
+  // A tmux server STARTED by this spawn inherits this env, and every later pane inherits from the
+  // server — so this layer leaks independently of the pane's `env -u` prefix, and it is reachable
+  // cross-platform from inside the pane via `tmux show-environment -g`, not only through Linux
+  // /proc. An independent reviewer measured both. Without this test, deleting the scrub left the
+  // whole suite green.
+  const saved = {};
+  for (const k of INBOUND_AUTH_ENV_VARS) { saved[k] = process.env[k]; process.env[k] = `lt-${k}`; }
+  const savedTok = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = "lt-outbound";
+  try {
+    const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+    const rec = makeTmuxRecorder();
+    await bootPaneUnderTest({ model: "sonnet", claudeBin: "claude", home, realHome: home,
+                              cwd: `${home}/wk`, port: 3456, tmux: rec.tmux });
+    const o = rec.newSessionOpts();
+    assert.ok(o && o.env, "new-session must have been given an env — otherwise this asserts nothing");
+    // Control first: the instrument works and the env is a real one, not an empty object.
+    assert.equal(o.env.CLAUDE_CODE_OAUTH_TOKEN, "lt-outbound",
+      "the OUTBOUND credential must reach the tmux server — control that this env is populated");
+    for (const k of INBOUND_AUTH_ENV_VARS) {
+      assert.ok(!(k in o.env), `${k} must not reach the tmux server's environment`);
+      assert.ok(!JSON.stringify(o.env).includes(`lt-${k}`), `${k}'s VALUE must not survive under another name`);
+    }
+  } finally {
+    for (const k of INBOUND_AUTH_ENV_VARS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    if (savedTok === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = savedTok;
+  }
+});
 
 test("bootTuiPane with a streamDir installs the hook AT BOOT and hands the sink back on the pane", async () => {
   const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
