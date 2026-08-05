@@ -52,7 +52,7 @@ import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv } from "./lib/spawn-auth.mjs";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
@@ -1150,12 +1150,54 @@ let authStatus = {
   // B.2 field (the ADR 0010 test). Consumers that must DECIDE — doctor, and through it the
   // `ocp update` gate — read this alongside `ok` instead.
   consecutiveInconclusive: 0,
+  // #308 / ADR 0014. HOW and WHEN `ok` was established — distinct from lastOutcome/lastCheck,
+  // which describe the last PROBE. Conflating them made the freshness window both unreachable
+  // under the default config and permanently disarmable by a single inconclusive probe.
+  okSource: "none",          // "none" | "probe" | "request" | "expired"
+  okAt: 0,                   // when `ok` was established, by whichever source
 };
 
 // The single definition of "can this proxy serve?", used by BOTH /status and /health (#232).
 // Those two carried byte-identical copies of the old expression; a shared function is what keeps
 // them from drifting. Value domain is exactly {"ok","degraded"} — dashboard.html and
 // ocp-plugin/index.js compare against those two strings, so do not invent a third. See ADR 0010.
+// #308 / ADR 0014. How long a verdict established by a REAL REQUEST stays fresh.
+//
+// A successful completion is the strongest evidence OCP can have that the credential works —
+// stronger than any probe, and free, because the request was happening anyway. But a raised
+// verdict that never expires is a latch, and on an env-token host NOTHING can lower it: the
+// `claude auth status` probe exits 0 whenever a token is merely PRESENT (measured: a fabricated
+// token yields exit 0 / loggedIn:true), so it can never contradict a stale `true`. That is
+// #324's defect shape in the opposite direction, with no clearing path at all — the criterion
+// from that issue applies here: do not ask what the clearing condition is, ask whether it is
+// REACHABLE.
+//
+// So the raise expires. Past the window with no new success, the honest value is `null` —
+// "it worked, that was a while ago, we do not know now" — which is a state ADR 0010 already
+// defines and doctor already treats as WARN rather than FAIL. A serving proxy refreshes this on
+// every request and never decays; only one that has stopped succeeding does.
+const AUTH_REQUEST_VERDICT_TTL_MS = 900000; // 15 min
+
+// #308: a completed request proves the credential is valid. Called from both claude_ok sites.
+// Deliberately does NOT touch consecutiveFailures: that tally counts CONCLUSIVE PROBE rejections
+// and drives ADR 0010's degraded verdict, which this change does not alter.
+function noteAuthVerifiedByRequest() {
+  const now = Date.now();
+  // Does NOT touch lastOutcome/lastCheck: those belong to the probe, and overwriting them would
+  // make /health claim a probe ran when none did. It DOES clear consecutiveFailures — a completed
+  // request is direct evidence the credential is not being refused. An earlier revision of this
+  // header said "deliberately does NOT touch consecutiveFailures" three lines above the code that
+  // writes it; the reviewer who caught that was reading the comment, which is what comments are for.
+  authStatus = { ...authStatus, ok: true, okSource: "request", okAt: now,
+                 message: "verified by a completed request", consecutiveFailures: 0 };
+}
+
+// #308: apply the TTL at READ time rather than on a timer — no extra interval to keep alive, and
+// the value is correct the instant it is asked for rather than up to one tick late.
+function effectiveAuthStatus(now = Date.now()) {
+  return applyRequestVerdictTtl(authStatus, now, AUTH_REQUEST_VERDICT_TTL_MS);
+}
+
 function proxyHealthStatus(binaryOk) {
   if (!binaryOk) return "degraded";
   if (authStatus.consecutiveFailures >= AUTH_DEGRADE_AFTER) return "degraded";
@@ -1197,8 +1239,23 @@ async function checkAuth() {
         // explicitly — the message below depends on it.
         (err, _stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve()));
     });
-    authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated",
-                   lastOutcome: "authenticated", consecutiveFailures: 0, consecutiveInconclusive: 0 };
+    const tokenFromEnv = typeof env.CLAUDE_CODE_OAUTH_TOKEN === "string" && env.CLAUDE_CODE_OAUTH_TOKEN.length > 0;
+    const nowP = Date.now();
+
+    if (tokenFromEnv) {
+      // Presence, not validity. But do NOT clobber a FRESHER verdict that a real request
+      // established — a probe that measured less must not overwrite evidence that measured more.
+      const keepRequestVerdict = authStatus.okSource === "request" &&
+                                 nowP - authStatus.okAt <= AUTH_REQUEST_VERDICT_TTL_MS;
+      authStatus = keepRequestVerdict
+        ? { ...authStatus, lastCheck: nowP, lastOutcome: "token-present", consecutiveFailures: 0 }
+        : { ...authStatus, ok: null, okSource: "probe", okAt: nowP, lastCheck: nowP,
+            message: "a token is present; the probe cannot tell whether it is valid",
+            lastOutcome: "token-present", consecutiveFailures: 0 };
+    } else {
+      authStatus = { ok: true, okSource: "probe", okAt: nowP, lastCheck: nowP, message: "authenticated",
+                     lastOutcome: "authenticated", consecutiveFailures: 0, consecutiveInconclusive: 0 };
+    }
   } catch (e) {
     const msg = (e.stderr || e.message || "").slice(0, 200);
     const now = Date.now();
@@ -1220,8 +1277,13 @@ async function checkAuth() {
       // CONCLUSIVE REJECTION. claude ran to completion and exited non-zero. checkAuth and
       // spawnClaudeProcess scrub the environment identically, so the probe resolves the SAME
       // credentials the request path uses — a non-zero exit genuinely predicts serving failure.
-      authStatus = { ok: false, lastCheck: now, message: msg, lastOutcome: "rejected",
-                     consecutiveFailures: authStatus.consecutiveFailures + 1, consecutiveInconclusive: 0 };
+
+      // okSource/okAt on this branch too: a conclusive rejection IS a probe-established verdict.
+      // Omitting them made the fields VANISH after a rejection — a fifth state ("absent") outside
+      // the domain ADR 0014 and the README document, found by execution in review.
+      authStatus = { ok: false, okSource: "probe", okAt: now, lastCheck: now, message: msg,
+                     lastOutcome: "rejected", consecutiveFailures: authStatus.consecutiveFailures + 1,
+                     consecutiveInconclusive: 0 };
     }
     // Carries the outcome class so an operator can tell a timeout from a real rejection.
     console.error(`[auth] check ${authStatus.lastOutcome}: ${msg}`);
@@ -1726,6 +1788,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       } else {
         recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
+        noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
         logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
         resolve(assembledText);
       }
@@ -2259,6 +2322,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       recordModelSuccess(cliModel, elapsed);
       breakerRecordSuccess(cliModel);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
       // Cache write-back for streaming — only on true success (not errored)
       if (CACHE_TTL > 0 && authInfo.cacheHash) {
@@ -2771,7 +2835,7 @@ async function handleStatus(_req, res) {
       status: proxyHealthStatus(binaryOk),
       version: VERSION,
       uptime: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
-      auth: authStatus.ok ? "ok" : authStatus.message,
+      auth: (() => { const a = effectiveAuthStatus(); return a.ok ? "ok" : a.message; })(),
       activeSessions: sessions.size,
     },
     requests: {
@@ -3452,7 +3516,7 @@ const server = createServer(async (req, res) => {
       claudeBinaryOk: binaryOk,
       authMode: AUTH_MODE,
       ...((isLocalhost || ADVERTISE_ANON_KEY) ? { anonymousKey: PROXY_ANONYMOUS_KEY || null } : {}),
-      auth: authStatus,
+      auth: effectiveAuthStatus(), // #308: the TTL on a request-verified verdict is applied at read time
       config: {
         timeout: TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,
