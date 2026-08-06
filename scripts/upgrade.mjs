@@ -14,6 +14,7 @@
  *   rollback      restore from snapshot
  */
 import { runDoctor, detectMultiUnitBootRace } from "./doctor.mjs";
+import { resolveInstallDir, classifyInstallDir } from "./lib/install-dir.mjs";
 import { execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -59,7 +60,16 @@ export const RESTART_ATTEMPTS = 3;
 // for symlinked install paths. `scripts/upgrade.mjs` always lives at `<ocpDir>/scripts/upgrade.mjs`
 // (setup.mjs never installs it anywhere else), so the OCP root is two `dirname()` calls up.
 // `opts.ocpDir` remains a valid EXPLICIT override (tests use it, and any future CLI flag could) —
-// only the no-override default changed. realpath'd where possible so a symlinked install dir
+// only the no-override default changed.
+//
+// Issue #348 update: runFullUpgrade/runRollback no longer use `join(homedir(), "ocp")` either —
+// they now call scripts/lib/install-dir.mjs's resolveInstallDir(), for the same reason stated
+// above. This function deliberately does NOT call it: resolveInstallDir honors $OCP_DIR, and
+// an override must never be able to answer "which tree is this process running from" — a wrong
+// $OCP_DIR would then silently SUPPRESS the mismatch warning this function exists to raise
+// instead of tripping it. The two questions look identical and are not.
+//
+// realpath'd where possible so a symlinked install dir
 // (~/ocp -> /data/ocp, say) compares correctly against /proc/<pid>/cwd's already-kernel-canonical
 // target; this function must never throw, only degrade to the best answer it has.
 function resolveExpectedWorkingTree(opts) {
@@ -910,7 +920,21 @@ export async function runUpgrade(opts = {}) {
   }
 
   // --- doctor pre-flight ---
-  const doctor = opts.mockDoctor || await runDoctor();
+  // Issue #348 review round-2 MEDIUM-A: this was a bare `runDoctor()`, while runFullUpgrade,
+  // runRollback and runFreshInstall all resolve their directory through
+  // `resolveInstallDir(opts)`. Whenever opts.ocpDir was set the two disagreed -- doctor
+  // describing one tree while the phase that mutates disk operated on another. That is the
+  // same defect class this whole issue is about, one function apart, and it survived the first
+  // revision because opts.ocpDir is dead in production so nothing ever diverged in practice.
+  //
+  // Forwarded deliberately narrowly rather than passing `opts` wholesale: these are the two
+  // options that decide WHICH tree and host doctor is describing. runUpgrade's other opts
+  // (`run`, `mockPlatform`, `mockExec`, `target`, ...) are about restart resolution and
+  // execution, and several are names doctor ALSO reads for unrelated purposes -- handing it
+  // the whole bag would silently repoint doctor's multi-unit probe at the restart tests' fake
+  // command runner. Undefined values are inert: resolveInstallDir falls through to $OCP_DIR
+  // and then its own file location exactly as before.
+  const doctor = opts.mockDoctor || await runDoctor({ ocpDir: opts.ocpDir, skipNetwork: opts.skipNetwork });
   if (!doctor.ready_to_upgrade && doctor.next_action.kind !== "fresh_install") {
     throw new Error(`doctor FAIL: ${doctor.next_action.kind} (run "ocp doctor" for details)`);
   }
@@ -983,8 +1007,20 @@ export async function runUpgrade(opts = {}) {
     } else if (kind === "restart") {
       plan.push(`[plan] restart-only path: NO git/npm changes (tree already at ${doctor.current_version}) — cmd_restart + post-flight verify`);
     } else if (kind === "fresh_install") {
-      plan.push(`[plan] fresh-install ai_executable[]:`);
-      for (const cmd of doctor.next_action.ai_executable) plan.push(`  - ${cmd}`);
+      // Issue #348 review HIGH-2, follow-through: once the deletion guard can withhold the
+      // plan, ai_executable[] is empty for a refused target -- and this loop then printed a
+      // header with nothing under it. That is the exact invisible-failure shape this whole
+      // issue is about, on the one command an operator runs specifically to find out what
+      // WOULD happen. doctor puts the reason in human_required[]; print that instead.
+      if (doctor.next_action.ai_executable.length === 0) {
+        plan.push(`[plan] fresh-install: REFUSED -- no automated steps will be generated:`);
+        const why = doctor.next_action.human_required || [];
+        if (why.length === 0) plan.push(`  ! (no reason supplied by doctor -- run \`ocp doctor\` directly)`);
+        for (const line of why) plan.push(`  ! ${line}`);
+      } else {
+        plan.push(`[plan] fresh-install ai_executable[]:`);
+        for (const cmd of doctor.next_action.ai_executable) plan.push(`  - ${cmd}`);
+      }
     }
     return { path: kind, executed: false, plan };
   }
@@ -1083,7 +1119,12 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
   };
-  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  // Issue #348: this is the git-checkout / npm-install / setup.mjs target — the directory this
+  // function MUTATES. `join(homedir(), "ocp")` here meant a /opt/ocp install would have had its
+  // upgrade applied to whatever happened to sit at $HOME/ocp (or, under sudo, /root/ocp — a
+  // path that does not exist, so every phase would have failed). Resolved from this
+  // installation's own files instead; see scripts/lib/install-dir.mjs.
+  const { dir: ocpDir } = resolveInstallDir(opts);
   // opts.mockPort (test hook, mirrors opts.mockPlatform): lets tests drive resolveRestartPlan's
   // port validation (HIGH-1 follow-up below) with a deliberately malformed value without
   // mutating the real process.env — a global that would otherwise leak across tests.
@@ -1465,13 +1506,69 @@ async function runFreshInstall({ doctor, opts }) {
   // operator who wants THIS path has to say so, separately from the generic non-interactive
   // flag. `--fresh-install` is that separate, explicit opt-in -- both it and --yes are
   // required; --yes alone (the routine case) now refuses here instead of executing.
+  // Issue #348 review, HIGH-1: this message used to hardcode `rm -rf ~/ocp`. That was true
+  // while doctor's step was also hardcoded to $HOME/ocp; once doctor started building
+  // `rm -rf ${ocpDir}` from the RESOLVED directory, the consent gate began naming a different
+  // directory from the one that actually gets deleted -- on the /opt/ocp host this whole
+  // change exists to serve, it would have said `~/ocp` and deleted `/opt/ocp`. The last thing
+  // an operator reads before typing --fresh-install --yes must name the real target, so it is
+  // interpolated from the same resolution doctor used, never restated as a constant.
+  const { dir: freshDir, source: freshSource } = resolveInstallDir(opts);
+  const freshTarget = classifyInstallDir(freshDir);
+
+  // Issue #348 review, HIGH-2, and then round-2 MEDIUM-A which corrected this comment.
+  //
+  // WHAT THIS CHECK COVERS, exactly: the directory THIS FUNCTION resolves. It re-runs the
+  // resolution and the classification itself instead of reading doctor's verdict out of the
+  // JSON, so a resolution that lands on something unsafe is refused here even when the JSON
+  // handed in says otherwise. That is a real, independent check and the "#348 HIGH-2 (defence
+  // in depth)" test pins it: the fixture's mockDoctor asserts nothing about safety and the
+  // refusal still fires.
+  //
+  // WHAT IT DOES NOT COVER, and the first revision of this comment wrongly implied it did:
+  // the contents of ai_executable[]. Those strings are executed verbatim and are never
+  // inspected. A caller that hands in a plan built for some OTHER directory gets that plan
+  // run -- demonstrated by review with `mockDoctor: { ai_executable: ["rm -rf /etc/..."] }`,
+  // which executed. Not production-reachable today (opts.mockDoctor is test-only and
+  // opts.ocpDir is set by nothing in production; the `ocp` wrapper passes neither), but the
+  // claim was false as written, and a comment promising protection is exactly where the next
+  // maintainer stops looking.
+  //
+  // WHY IT IS NOT FIXED BY INSPECTING THE COMMANDS: ai_executable[] is arbitrary shell.
+  // Deciding "this list cannot delete anything foreign" by pattern-matching its text is the
+  // substring-denylist shape this repo has already had bypassed three times in one PR (#218,
+  // recorded in AGENTS.md: "Guards on dynamic execution must bound capability, not scan text
+  // ... Claiming 'this code cannot do X' while the implementation is 'its text doesn't contain
+  // Y' is false"). A scan here would read as a stronger guarantee than the one above while
+  // being weaker than it looks -- strictly worse than saying plainly what is checked.
+  //
+  // WHERE THE PROTECTION ACTUALLY LIVES: doctor is the only producer of ai_executable[] in
+  // production, and it withholds every destructive step for an unsafe target (see its
+  // fresh_install next_action). IF A SECOND PRODUCER IS EVER ADDED -- a new caller, an
+  // imported plan, a --plan-file flag -- it does NOT inherit that, and this function will run
+  // whatever it is given. Bounding a new producer is that change's job, not this one's.
+  //
+  // Checked BEFORE the --fresh-install/--yes gate below: a target this tool must not delete is
+  // a refusal regardless of how much consent was given, and saying so first is more useful
+  // than telling the operator to re-run with flags that will then also refuse.
+  if (!freshTarget.safeToReplace) {
+    throw new Error(
+      `Refusing the fresh_install path: ${freshTarget.why}. The first destructive step would ` +
+      `be \`rm -rf ${freshDir}\` (install dir resolved from ${freshSource}), and this tool only ` +
+      `does that to a directory that is absent, empty, or verifiably an OCP install. ` +
+      `If OCP is installed elsewhere, set an absolute OCP_DIR pointing at it; if you genuinely ` +
+      `want this directory replaced, remove it yourself first, then re-run.`
+    );
+  }
+
   if (!opts.yes || !opts.freshInstall) {
     throw new Error(
       `doctor concluded kind="fresh_install" for this host (from-version is unsupported or ` +
       `unparseable -- run \`ocp doctor\` for the specific check). This path has never been ` +
-      `execution-verified (issue #227): its ai_executable steps run \`rm -rf ~/ocp\` and ` +
-      `reinstall from scratch, and it is no longer reachable off a bare --yes. To proceed ` +
-      `anyway, re-run with both flags: \`ocp update --fresh-install --yes\`. This is not a ` +
+      `execution-verified (issue #227): its ai_executable steps run \`rm -rf ${freshDir}\` ` +
+      `(the resolved install dir, from ${freshSource}) and reinstall from scratch, and it is ` +
+      `no longer reachable off a bare --yes. To proceed anyway, re-run with both flags: ` +
+      `\`ocp update --fresh-install --yes\`. This is not a ` +
       `claim that the path is broken -- only that nobody has run it long enough to know either ` +
       `way; see docs/upgrading.md's "Old version (< v3.4.0)" section for what that means.`
     );
@@ -1600,7 +1697,9 @@ async function runRollback(opts) {
     }
   };
 
-  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  // Issue #348: same as runFullUpgrade above — this is the directory rollback checks out into
+  // and npm-installs, not a place to guess at. See scripts/lib/install-dir.mjs.
+  const { dir: ocpDir } = resolveInstallDir(opts);
   // Issue #262: was `exec(\`git -C ${ocpDir} checkout ${meta.fromCommit}\`, "git-checkout")` --
   // a shell template string carrying a disk-read value. Now argv form; see execArgv above and
   // the SHA-shape validation above meta.fromCommit is first read.
