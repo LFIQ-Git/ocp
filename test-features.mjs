@@ -5407,6 +5407,263 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── #379 case 3: a non-numeric ?limit / ?hours must be ANSWERED, not walked into ──────────────
+//
+// The same mechanism as #360 above, reached WITHOUT A BODY. `GET /api/usage?limit=%` is a bare
+// GET — no body, no Authorization header — and `parseInt("%", 10)` is NaN, `Math.min(NaN, 500)`
+// is NaN, and NaN went straight to a sink that throws:
+//
+//   ?limit=%  → getRecentUsage(NaN)              → SQLite bind → "datatype mismatch"
+//   ?hours=%  → new Date(NaN).toISOString()      → RangeError  → "Invalid time value"
+//
+// The throw escapes the `async` request callback, `unhandledRejection` logs it, and nothing
+// answers or closes the socket. Measured on this tree before the fix, from loopback in the
+// DEFAULT `CLAUDE_AUTH_MODE=none`: 0 bytes, socket still open at a 4 s deadline, one
+// `unhandled_rejection` per request. `?limit=abc` and `?hours=abc` behave identically — the
+// percent-escape is incidental, NaN is the defect.
+//
+// `hours` is covered here alongside `limit` deliberately. The issue names `?limit=%`, but `hours`
+// is the SAME cause on the ADJACENT LINE of the SAME handler at the same severity and citation
+// class, and fixing only `limit` would leave an identical credential-free hang one character
+// away. Iron Rule 11 §11.1 fold-in test: cheaper than its own PR, found by this PR's stated job,
+// and a reviewer can still follow the diff.
+//
+// WHY EVERY VALUE IS ASSERTED, not just the status. The fix must be behaviour-preserving under
+// ADR 0006's grandfather clause (route (a)), which means no input that is ANSWERED today may
+// change its answer. Two natural-but-wrong implementations are what these pin:
+//   - `parsed || fallback`            → turns `?limit=0` (0 rows today) into the default. The
+//                                       `?limit=0` assertion below is the one that catches it.
+//   - `parsePositiveInt` (lib/env.mjs) → rejects `<= 0` and partially-consumed values, so
+//                                       `?limit=1abc` (1 today) and `?limit=-1` (SQLite
+//                                       `LIMIT -1` = unbounded) would both change.
+// Hence the guard under test is `Number.isFinite` ONLY, and these arms are what make that
+// narrowness a measured property rather than a claim in a comment.
+// ── What these arms do NOT pin, stated so a green run is not mistaken for coverage ──────────
+// Same discipline as docs/governance/b2-response-keys.json's `notCovered` block, and written
+// for the same reason: this suite's #379 arms were twice found unable to fail (the ?limit
+// default pinned ">= 3" rather than 50; the ?hours default compared against a baseline that
+// moved with it). Both are fixed. These are what remain unpinned.
+//
+//   - THE TWO CAPS — 500 for `limit`, 720 for `hours`. [measured] Booted a real server.mjs at
+//     this commit with the caps changed to 1000 and 1440, seeded the same 60 rows with the same
+//     30 backdated, and probed all eight paths these arms read: `status`, `recent.length` and
+//     `timeline.length` are IDENTICAL to the unmutated tree for every one. The cap cannot be
+//     observed because 60 seeded rows sits below both caps, so `Math.min(x, cap)` is never the
+//     binding constraint on anything asserted. This is the SAME SHAPE as the ?limit default
+//     defect one field over — an expectation that cannot discriminate because the fixture's row
+//     count is below the value it would have to distinguish. It is a COVERAGE GAP, not a defect:
+//     this PR preserves both caps and the R1/H/D/M1 mutations still fail as intended.
+//     Pinning `limit`'s cap honestly needs >500 seeded rows, which is a fixture-cost decision
+//     rather than a one-line fix; it is recorded on ISSUE #400, which already has to reason
+//     about both sinks' boundaries.
+//
+//     NOTE FOR WHOEVER PINS IT: do not compare response BODIES to detect a cap change. The body
+//     embeds `created_at`, so its hash differs between any two runs — a digest comparison reports
+//     a difference that has nothing to do with the cap. [measured] That false positive was hit
+//     while establishing the line above. Compare the COUNTS, which is what these arms assert.
+//
+//   - THE THROWING FINITE INPUTS. [measured] `?limit=-100000000000000000000` and
+//     `?hours=-2400000000` are finite, pass this guard, reach the sinks and still hang. Not a
+//     regression — identical at v3.16.4 and on main — and deliberately out of scope; ISSUE #400.
+//
+//   - THE `getUsageTimeline` DATETIME MISMATCH. [measured] `?hours=+1` returns 0 buckets for a
+//     row written seconds ago, because `since` is built with `.toISOString()` ("…T15:09:39.023Z")
+//     while `created_at` is stored SQLite-style ("… 16:09:39") and `' ' < 'T'`. That is why the
+//     ?hours=-1 arm cannot detect a sign-losing guard. Pre-existing; ISSUE #400.
+//
+//   - NON-LOOPBACK AND NON-DEFAULT AUTH MODES. [reasoned] Every probe here is loopback with
+//     CLAUDE_AUTH_MODE=none. The clamp is downstream of the auth gate, so the mode cannot change
+//     its behaviour — but that is read off the code, NOT measured, and 127.0.0.2 is not bound on
+//     macOS so a non-loopback arm could not be added without binding a LAN interface.
+const LT379_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
+
+// MUST exceed the documented default of 50, or the default arm cannot pin 50. With 3 rows (the
+// first version of this test) EVERY wrong default >= 3 passes, including 500 and -1/unbounded —
+// i.e. exactly the ADR-relevant substitutions the assertion message claims to catch. An
+// independent reviewer demonstrated that by mutating the non-finite branch to `: 500` and
+// watching the suite stay green. 60 > 50 makes `recent.length === 50` a real equality.
+const LT379_SEED_ROWS = 60;
+// Half the rows are backdated past the default 24 h window, so the WINDOW SIZE is observable:
+// with every row written at the same instant, timeline.length is 1 for any positive `hours` and
+// the ?hours arms cannot tell 24 from 720 (mutating the hours default to 720 also stayed green).
+const LT379_OLD_ROWS = 30;    // written 100 h ago → inside 720 h, outside 24 h
+const LT379_DEFAULT_LIMIT = 50;   // the DOCUMENTED default, asserted as a literal, never derived
+const LT379_DEFAULT_HOURS = 24;   // ditto — deriving it from `base` is what made the arm blind
+
+// Seed usage rows DIRECTLY into the same store the server will open. Deliberately not through
+// `POST /v1/chat/completions`: 60 rows would mean 60 real child spawns, and backdating
+// `created_at` is not expressible through the request path at all. This is fixture setup, not
+// the behaviour under test — the PREMISE assertions below verify on the wire that the rows the
+// server actually serves match what was seeded, so a broken seed fails loudly instead of
+// quietly making every count assertion vacuous.
+function lt379Seed(dir, keysPath) {
+  const script = `
+    import { recordUsage, getDb, closeDb } from ${JSON.stringify(keysPath)};
+    for (let i = 0; i < ${LT379_SEED_ROWS}; i++) {
+      recordUsage({ keyId: null, keyName: "local", model: "m" + i,
+        promptChars: 1, responseChars: 1, elapsedMs: 1, success: true });
+    }
+    // Backdate the OLDEST ${LT379_OLD_ROWS} by 100 hours: inside the 720 h cap, outside the 24 h default.
+    getDb().prepare(
+      "UPDATE usage_log SET created_at = datetime('now','-100 hours') WHERE id IN " +
+      "(SELECT id FROM usage_log ORDER BY id LIMIT ${LT379_OLD_ROWS})"
+    ).run();
+    process.stdout.write("SEEDED");
+    closeDb();
+  `;
+  const out = _ltExecFile(process.execPath, ["--input-type=module", "--eval", script],
+    { env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir }, encoding: "utf8" });
+  assert.match(out, /SEEDED/, `seeding ${LT379_SEED_ROWS} usage rows failed: ${out.slice(0, 300)}`);
+}
+
+// One probe. Asserts, IN THIS ORDER: the server answered at all, then the answer was 200, then
+// hands back the parsed body. The order is load-bearing — a hang must be reported as silence,
+// which is what the defect is, and never as a status mismatch, which is a different and lesser
+// bug. Removing the clamp makes the FIRST assertion fire; see the mutation table in the PR.
+async function lt379Get(port, path, what) {
+  const r = await ltRawSend(port, {
+    method: "GET", path, bytes: Buffer.alloc(0), contentLength: 0, timeoutMs: LT379_BUDGET,
+  });
+  assert.ok(!r.timedOut,
+    `${what} (${path}): NO RESPONSE within ${LT379_BUDGET}ms and the socket was never closed. ` +
+    `This is #379 case 3 itself — parseInt yielded NaN, the sink threw, the throw escaped the ` +
+    `async request callback into unhandledRejection, and the client is left holding a connection ` +
+    `the server will never release. A bare GET with no credentials can do this on the default ` +
+    `configuration, so it is a connection-exhaustion primitive, not only a correctness bug.`);
+  assert.equal(r.status, 200,
+    `${what} (${path}): expected 200, got ${r.status}: ${r.text.slice(0, 200)}`);
+  try { return JSON.parse(r.text); }
+  catch (e) { throw new assert.AssertionError({ message: `${what} (${path}): body is not JSON: ${e.message} — ${r.text.slice(0, 200)}` }); }
+}
+
+ltTest("integration (#379 case 3): GET /api/usage answers a non-numeric limit/hours within a bounded time, and every already-answered value is unchanged", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // Seed BEFORE the server boots, so there is no window in which a probe sees a partial store.
+  lt379Seed(dir, _ltF2P(new URL("./keys.mjs", import.meta.url)));
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // ── PREMISE, asserted before anything depends on it, and asserted ON THE WIRE rather than
+    // trusted from the seeder. Every count below is meaningless if the rows are not visible to
+    // this caller's scope — they are attributed to key_name "local", which is what a loopback
+    // caller with no token resolves to, and a mismatch silently empties `recent`.
+    //
+    // `?all=true&limit=0`… no: `limit=0` returns no rows. The honest premise is the TOTAL, which
+    // `?limit=-1` gives (SQLite `LIMIT -1` = unbounded) — a value pinned as unchanged below, so
+    // it cannot drift without another arm failing first.
+    const all = await lt379Get(port, "/api/usage?limit=-1", "the unbounded baseline");
+    assert.equal(all.recent.length, LT379_SEED_ROWS,
+      `PREMISE FAILED: expected ${LT379_SEED_ROWS} seeded rows via ?limit=-1 (unbounded), saw ` +
+      `recent.length=${all.recent.length}. Every count below would be vacuous. Causes: the rows ` +
+      `are not visible to this caller's scope (key_name must be "local"), the seed failed, or ` +
+      `?limit=-1 stopped meaning unbounded.`);
+
+    // The default window must be OBSERVABLE, i.e. 24 h and 720 h must give different answers.
+    // Without this the ?hours arms cannot detect a changed default at all: an independent
+    // reviewer mutated the hours default to 720 and the suite stayed green, because every row
+    // had been written at the same instant. LT379_OLD_ROWS are backdated 100 h for this reason.
+    const win24 = await lt379Get(port, `/api/usage?hours=${LT379_DEFAULT_HOURS}`, "the 24h window");
+    const win720 = await lt379Get(port, "/api/usage?hours=720", "the 720h window");
+    assert.notDeepEqual(win24.timeline, win720.timeline,
+      `PREMISE FAILED: the 24 h and 720 h windows return the SAME timeline, so no assertion ` +
+      `below can tell the default apart from the cap. Backdating (LT379_OLD_ROWS=${LT379_OLD_ROWS}) ` +
+      `is what makes the window size observable; if this fires, the backdating did not take.`);
+
+    // ── THE DEFECT. Each of these hung before the fix. They must answer, and answer with the
+    // DOCUMENTED DEFAULT — asserted against the LITERAL 50 / 24, never against the
+    // unparameterised request, because the absent-parameter path resolves through the SAME
+    // fallback and would move with it (that is how the first version of this test was blind).
+    for (const path of ["/api/usage?limit=%", "/api/usage?limit=abc"]) {
+      const r = await lt379Get(port, path, "a non-numeric ?limit");
+      assert.equal(r.recent.length, LT379_DEFAULT_LIMIT,
+        `${path} must fall back to the DOCUMENTED default limit of ${LT379_DEFAULT_LIMIT}, so with ` +
+        `${LT379_SEED_ROWS} rows seeded it must return exactly ${LT379_DEFAULT_LIMIT}; got ` +
+        `recent.length=${r.recent.length}. Answering with some OTHER number (500, or -1/unbounded) ` +
+        `would be a new behaviour for this input rather than the documented default, and would ` +
+        `need its own ADR instead of ADR 0006 route (a). Seeding more rows than the default is ` +
+        `what makes this an equality rather than a floor.`);
+    }
+    for (const path of ["/api/usage?hours=%", "/api/usage?hours=abc"]) {
+      const r = await lt379Get(port, path, "a non-numeric ?hours");
+      assert.deepEqual(r.timeline, win24.timeline,
+        `${path} must fall back to the DOCUMENTED default of ${LT379_DEFAULT_HOURS} hours, i.e. ` +
+        `produce exactly what ?hours=${LT379_DEFAULT_HOURS} produces. Compared against the ` +
+        `explicit 24 h request, NOT against the unparameterised one — the latter shares this ` +
+        `fallback and moves with it. The 720 h window is asserted different above, so this ` +
+        `equality can actually fail.`);
+    }
+
+    // ── PRESERVATION. Every one of these is ANSWERED today; the fix must not have moved any of
+    // them. These are the arms that fail if the guard is widened past `Number.isFinite`.
+    const stillValid = [
+      ["/api/usage?limit=1", 1,
+        "an ordinary numeric limit must still be honoured — a guard that ignored `limit` entirely would pass every arm above"],
+      ["/api/usage?limit=1abc", 1,
+        "parseInt's PREFIX semantics are current behaviour: `parseInt('1abc', 10)` is 1. A stricter parse (parsePositiveInt rejects partially-consumed values) would return the default and change an answered request"],
+      ["/api/usage?limit=0", 0,
+        "`?limit=0` returns zero rows today. This is the arm that catches `parsed || fallback`, the natural wrong fix: 0 is falsy, so it would be replaced by the default"],
+      ["/api/usage?limit=-1", LT379_SEED_ROWS,
+        "`?limit=-1` reaches SQLite as `LIMIT -1`, which means UNBOUNDED, and returns every row today. parsePositiveInt would reject it as non-positive and change that"],
+      // THE REGRESSION ARM. `parseInt` of a 400-digit number is `+Infinity`, and
+      // `Math.min(+Infinity, 500)` is 500 — an ordinary finite value that is ANSWERED at
+      // v3.16.4, returning the 500-row cap. The first version of this fix put the finiteness
+      // check BEFORE the clamp, which turned that into the default 50: a contract change on an
+      // answered request, found by independent review and invisible to every other arm here
+      // (the shortest input that reaches it is 309 digits). This arm is why the guard must run
+      // after `Math.min`, and it fails if anyone reorders them back.
+      [`/api/usage?limit=${"9".repeat(400)}`, LT379_SEED_ROWS,
+        "a `limit` that overflows parseInt to +Infinity is clamped to the 500 cap by Math.min and ANSWERED today; with 60 rows seeded that is all 60. A finiteness guard placed BEFORE the clamp substitutes the default 50 instead — a contract change on an answered request (ALIGNMENT.md:114)"],
+    ];
+    for (const [path, expected, why] of stillValid) {
+      const r = await lt379Get(port, path, "an already-answered ?limit");
+      assert.equal(r.recent.length, expected,
+        `${path}: expected recent.length=${expected}, got ${r.recent.length}. ${why}. This PR is ` +
+        `authorized as behaviour-preserving under ADR 0006's grandfather clause (route (a)); if ` +
+        `this assertion fails, the change is a CONTRACT CHANGE and needs its own ADR.`);
+    }
+
+    // `?hours=-1` returns 0 buckets today, and is pinned because a guard that REJECTED negatives
+    // would fall back to 24 h and repopulate it — measured: that mutation does fire this arm.
+    //
+    // What this arm does NOT catch, stated because an earlier version of this comment claimed it
+    // did and a reviewer measured otherwise: a SIGN-LOSING guard (`Math.abs`) is invisible here,
+    // because `?hours=+1` also returns 0 buckets. The reason is a PRE-EXISTING bug unrelated to
+    // this PR: getUsageTimeline builds `since` with `.toISOString()` ("2026-08-10T15:09:39.023Z")
+    // while `created_at` is stored SQLite-style with a space ("2026-08-10 16:09:39"), and
+    // ' ' (0x20) < 'T' (0x54), so a same-day `since` excludes today's rows under string
+    // comparison. keys.mjs already has `sqliteDatetime` for exactly this mismatch and this
+    // function does not use it. Not fixed here — it is a different defect on a different line,
+    // and changing which rows a timeline returns is a contract change needing its own ADR.
+    // The ?hours side of the +Infinity regression arm. `parseInt` of 400 digits is `+Infinity` and
+    // `Math.min(+Infinity, 720)` is 720, so this is ANSWERED today with the 720 h window — the same
+    // contract question as the ?limit arm, one parameter over. It is currently redundant with that
+    // arm because `usageQueryInt` is shared, and it stops being redundant the moment the two call
+    // sites diverge; that is precisely when a missing arm costs something. Proven non-vacuous by a
+    // mutation that makes ONLY the hours call site finiteness-first (R1H), which this catches and
+    // the ?limit arm does not.
+    const hoursInf = await lt379Get(port, `/api/usage?hours=${"9".repeat(400)}`, "an already-answered ?hours");
+    assert.deepEqual(hoursInf.timeline, win720.timeline,
+      `?hours=<400 nines> overflows parseInt to +Infinity, which Math.min pins to the 720 h cap, so ` +
+      `it must return exactly what ?hours=720 returns. A finiteness guard placed BEFORE the clamp ` +
+      `substitutes the 24 h default instead — a contract change on an answered request.`);
+
+    const futureWindow = await lt379Get(port, "/api/usage?hours=-1", "an already-answered ?hours");
+    assert.equal(futureWindow.timeline.length, 0,
+      `?hours=-1 returns 0 buckets today; got ${futureWindow.timeline.length}. A guard that ` +
+      `REJECTED negatives would fall back to 24 h and repopulate this, changing an answered request.`);
+
+    // ── Not wedged, and — the other tell for this whole family — nothing was swallowed. Before
+    // the fix each hung request left exactly one of these lines behind, which is the ONLY place
+    // the defect surfaced at all.
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── #365: the CHILD's stdout/stderr must decode UTF-8 ACROSS chunk boundaries ───────────────
 //
 // The other half of #359. `lineBuffer += d.toString()` and `stderr += d` decoded each Buffer from

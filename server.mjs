@@ -2515,6 +2515,92 @@ function sanitizeError(msg) {
 const isJsonObject  = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 
+// ── Query-integer parse for GET /api/usage (#379) ───────────────────────
+// GUARANTEE, and the only one: the return value is always a FINITE number. That is the whole
+// job. `parseInt("%", 10)` is NaN, `Math.min(NaN, 500)` is NaN, and the two call sites hand
+// that NaN straight to a sink that throws:
+//
+//   ?limit=%  → getRecentUsage(NaN)  → SQLite bind → "datatype mismatch"      (TypeError)
+//   ?hours=%  → getUsageTimeline({hours: NaN}) → new Date(NaN).toISOString()
+//                                             → "Invalid time value"          (RangeError)
+//
+// Both throws escape the `async` request callback, which Node does not observe, so nothing
+// answers and the socket is held open until the client gives up. Measured on this tree before
+// the fix: 0 bytes received, socket still open at a 4 s deadline, and one
+// `unhandled_rejection` line per request in the proxy log. That is a credential-free
+// connection-exhaustion primitive on the DEFAULT configuration (`CLAUDE_AUTH_MODE=none`), from
+// a bare GET with no body and no Authorization header.
+//
+// NOT modelled on `/logs`, and the difference is worth recording because issue #379 names
+// `/logs` as the precedent to copy and that is a MISREADING — checked on the wire rather than
+// taken on trust:
+//   - `GET /logs?limit=…` answers 200 because `/logs` HAS NO `limit` PARAMETER (it reads `n`
+//     and `level`, server.mjs handleLogs). The 200 is an unread query param, not a clamp.
+//   - `GET /logs?n=%` also answers 200, but NOT because anything clamps: NaN flows into
+//     `Array.prototype.slice`, which coerces NaN to 0, so `slice(-NaN*3)` returns EVERYTHING.
+//     Measured: `?n=%` → 173517 bytes vs `?n=5` → 776 bytes, i.e. the whole log file.
+// `/logs` survives by SINK TOLERANCE, not by a guard. Copying it would mean letting NaN through
+// and hoping the next sink is forgiving — which is precisely what fails here, because SQLite's
+// bind and `Date.prototype.toISOString` are not.
+//
+// NOT `parsePositiveInt` (lib/env.mjs) either, for a reason that is the crux of the class
+// analysis: it rejects `<= 0` and any value `parseInt` only partially consumed. Both of those
+// inputs are ANSWERED today and must keep their exact answers —
+//   `?limit=5abc` → 5 (parseInt prefix), `?limit=-1` → SQLite `LIMIT -1` = unbounded,
+//   `?limit=0` → 0 rows, `?hours=-1` → a window in the future.
+// Using it would change WHICH VALUE a currently-answered request gets, which is the contract
+// change ALIGNMENT.md:114 makes a new authorization request.
+//
+// THE GUARD RUNS *AFTER* `Math.min`, AND THAT ORDER IS THE WHOLE CORRECTNESS ARGUMENT.
+// `parseInt` returns NaN, ±Infinity, or a finite integer — and `Math.min(+Infinity, cap)` is
+// `cap`, an ordinary finite value that reaches the sink and IS ANSWERED at v3.16.4. A 400-digit
+// `?limit` overflows to `+Infinity` and therefore answers 500 rows today. Guarding BEFORE the
+// clamp would substitute the default instead, changing the value of a request that is answered
+// — a contract change, caught by independent review after the first version of this patch did
+// exactly that. Guarding after the clamp keeps `+Infinity → cap` intact and still catches NaN
+// (`Math.min(NaN, cap)` is NaN) and `-Infinity` (which is NOT answered today: it reaches the
+// bind and throws).
+//
+// ROUTE (a) IS SOUND BY CASE EXHAUSTION HERE, not merely by sampling — which is worth stating
+// because a sampled argument is what let the `+Infinity` case through in the first place.
+// `parseInt` returns exactly one of NaN, +Infinity, -Infinity, or a finite integer, so the
+// non-finite values `Math.min(parseInt(…), cap)` can produce are exactly TWO:
+//   NaN        -> `Math.min(NaN, cap)` is NaN                       -> guard fires
+//   -Infinity  -> `Math.min(-Infinity, cap)` is -Infinity           -> guard fires
+//   +Infinity  -> `Math.min(+Infinity, cap)` is CAP, a finite value -> guard CANNOT fire
+// So the guard is reachable only for NaN and -Infinity, and BOTH were measured to throw at both
+// sinks (`datatype mismatch` / `Invalid time value`), i.e. both were unanswered. The set of
+// inputs whose value changes is therefore EXACTLY the set that received no response — not a
+// sample of it. Corroborated empirically over 47 raw inputs × both parameters against the real
+// sinks: ZERO inputs the old code answered change value, and 20 that it could not answer now do.
+//
+// WHAT THIS DOES NOT FIX, STATED SO THE NEXT READER DOES NOT TRUST IT TOO FAR. A FINITE value
+// can still reach both sinks and throw, and those requests still hang. Measured, on this tree,
+// after this fix:
+//   `?limit=-100000000000000000000` → SQLite bind rejects it        → "datatype mismatch"
+//   `?hours=-2400000000`            → Date range overflow           → "Invalid time value"
+// Both are PRE-EXISTING — they hang identically at v3.16.4 and on `main` — and both are a
+// different input class from the `parseInt`-yields-NaN defect issue #379 case 3 describes, with
+// their own contract questions (SQLite's int64 bind range; `Date`'s ±8.64e15 ms range, plus a
+// separate pre-existing `created_at` string-comparison bug in getUsageTimeline). Tracked as
+// ISSUE #400, which carries both sinks' measured acceptance sets. This guard closes the NaN
+// class only, and the ?hours=-1 test arm records the string-comparison defect it runs into.
+//
+// Authorized by ADR 0006 (grandfathered as of v3.16.4) — behaviour-preserving, route (a). At
+// v3.16.4 (`git rev-list -n1 v3.16.4` → 9e25160; note v3.16.4 and main share NO ancestor, so
+// `git log -S` on main cannot see this) BOTH call sites here AND both sinks in keys.mjs
+// (getRecentUsage, getUsageTimeline) are byte-identical to the pre-fix code. The grandfathered
+// snapshot therefore IS the defective behaviour — the hang is inside what ADR 0006 froze, not
+// something added after it. Contrast #383, where POST /api/keys' name regex entered between
+// v3.17.1 and v3.18.0 and is consequently unauthorized. `limit`'s documented meaning — "how
+// many recent rows, default 50, capped at 500" — is unchanged. Same reasoning as #360's
+// `parsed === null` guard: a request that currently receives NO RESPONSE AT ALL is not a
+// behaviour anyone can be relying on.
+function usageQueryInt(raw, fallback, cap) {
+  const clamped = Math.min(parseInt(raw || String(fallback), 10), cap);
+  return Number.isFinite(clamped) ? clamped : fallback;
+}
+
 // ── Response helpers ────────────────────────────────────────────────────
 function jsonResponse(res, status, data, extraHeaders = null) {
   if (res.headersSent || res.writableEnded || res.destroyed) return;
@@ -3981,10 +4067,14 @@ const server = createServer(async (req, res) => {
     }
 
     const byKeyAll = getUsageByKey({ since, until });
-    const recentAll = getRecentUsage(Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500));
+    // #379: both were `Math.min(parseInt(<param> || "<default>", 10), <cap>)`, which yields NaN
+    // for any non-numeric value and hands it to a sink that throws. usageQueryInt is that same
+    // expression with a finiteness check appended AFTER the clamp — the order matters, see its
+    // comment.
+    const recentAll = getRecentUsage(usageQueryInt(url.searchParams.get("limit"), 50, 500));
     const timeline = getUsageTimeline({
       keyName: scopeName || undefined,
-      hours: Math.min(parseInt(url.searchParams.get("hours") || "24", 10), 720),
+      hours: usageQueryInt(url.searchParams.get("hours"), 24, 720),
     });
 
     const byKey = scopeName ? byKeyAll.filter((row) => row.key_name === scopeName) : byKeyAll;
