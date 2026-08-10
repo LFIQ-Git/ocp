@@ -1555,6 +1555,46 @@ function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltC
 // wall-clock luck. See the assertion at the end of this integration block.
 let _ltActiveBoots = 0;
 let _ltPeakBoots = 0;
+// #358: every teardown wait that timed out, with where it was and how long it waited.
+// Non-empty means _ltPeakBoots is UNATTRIBUTABLE — see the assertions at the end of the file.
+const _ltDrainTimeouts = [];
+
+// #358 round 2: the between-test drain is NOT the only place a boot waits for a predecessor to
+// close. Five sites do it INSIDE a single test body, because two boots in one body are not
+// separated by ltTest's barrier at all — the comment at the `bootOnce` site says so verbatim.
+// Each of those was `await ltWait(...)` with the boolean discarded: the same defect this fix is
+// about, one scope down.
+//
+// That mattered, and not hypothetically. The first revision of this fix asserted that a completed
+// barrier proves adjacent tests did not overlap, and therefore that peak > 1 means a real
+// serialization regression. The first clause is true; the second does not follow, because an
+// in-body wait can let two boots overlap with every barrier succeeding. A reviewer built the
+// counterexample by deferring one kill 1500ms: peak reached 2 while serialization was intact, and
+// the new message confidently called it a regression. The fix for a misleading message had
+// introduced a misleading message.
+//
+// To re-derive that counterexample against the CURRENT code, the deferral has to exceed the
+// drain's own budget — 1500ms was calibrated against the pre-fix site, and the drain that now
+// guards it simply absorbs a delay that small. Measured: 1500ms leaves the suite green (the
+// mutation lands, but on a target the drain already covers); 6000ms against the 5000ms budget
+// reproduces it and is correctly reported as UNPROVEN.
+//
+// So every wait that separates one boot from another records its own timeout. Use this, not a
+// bare ltWait, wherever a test waits for a child to close before booting another.
+//
+// `ms` in the record is ELAPSED, and elapsed has no upper bound — do not read it as "the budget".
+// ltWait caps its DEADLINE at ms*10, but only re-checks the clock at the top of the loop, so a
+// single late `await` overruns the cap by however long the event loop was stalled. Measured with
+// ltWait copied verbatim: a quiet host returns at 83ms for ms=50, while blocking the loop 3s
+// returns at 3012ms — 6.0x past the 500ms cap. That is why this records the duration rather than
+// just a boolean: a drain that gave up after 5.2s and one that gave up after 78s are different
+// diagnoses, and both were observed while mutation-proving this fix.
+async function ltDrain(cond, where, ms = 5000) {
+  const t0 = Date.now();
+  const ok = await ltWait(cond, ms);
+  if (!ok) _ltDrainTimeouts.push({ where, ms: Date.now() - t0, active: _ltActiveBoots });
+  return ok;
+}
 function ltBoot(env, dir, nodeArgs = []) {
   const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
     env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
@@ -1743,7 +1783,7 @@ async function ltBootFresh(env, dir, nodeArgs = [], maxAttempts = 3, onPort = nu
     // teardown, pushing _ltActiveBoots above 1 even though only one attempt is ever meant to be
     // "live" at a time. Caught by the #248 peak-concurrency regression test once this test
     // (added by #219) joined that same ltTest queue.
-    await ltWait(() => buf.closed, 5000);
+    await ltDrain(() => buf.closed, "ltBootFresh-retry", 5000);
   }
   return last; // attempts exhausted — hand back the last (still-collided) attempt for the caller to diagnose
 }
@@ -1796,7 +1836,19 @@ function ltTest(name, fn) {
     // false claim of "at most one at a time" — caught by the peak-count regression test below).
     // Draining to 0 here, not in the individual finally blocks, keeps the guarantee in ONE
     // place instead of requiring every ltBoot-based test to get its own teardown wait right.
-    _ltQueue = run.catch(() => {}).then(() => ltWait(() => _ltActiveBoots === 0, 5000));
+    // #358: ltWait RETURNS whether the condition held, and the previous version of this line
+    // discarded it. That discard is the whole defect: when the drain times out the next test boots
+    // anyway, _ltActiveBoots reaches 2, and _ltPeakBoots latches there via Math.max with no reset —
+    // so a slow teardown became indistinguishable from a serialization regression, permanently, for
+    // the rest of the run. Two PRs had a real failure dismissed as "load" on that evidence.
+    //
+    // Keeping the boolean makes the timeout measurable instead of silent. This barrier CALLS
+    // ltDrain rather than inlining its body: an earlier revision hand-copied it, and the copy
+    // immediately diverged — it recorded under `test:` while the summary renders `where:`, so
+    // this, the ORIGINAL #358 scenario, printed `undefined(...)` and lost the test name. One
+    // call site means the next field added to the record cannot diverge again.
+    _ltQueue = run.catch(() => {}).then(() =>
+      ltDrain(() => _ltActiveBoots === 0, `between-tests:${name}`, 5000));
     return run;
   });
 }
@@ -1967,13 +2019,13 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
         assert.notEqual(buf.exit, 0, `[${c.label}] must exit non-zero — ${ltDiag(buf)}`);
         assert.ok(/FATAL[\s\S]*OCP_LOCAL_TOOLS/.test(buf.err), `[${c.label}] expected a local-tools FATAL — ${ltDiag(buf)}`);
       } finally {
-      child.kill("SIGKILL");
-      // bootOnce calls twice sequentially within one test; without waiting for THIS boot's
-      // 'close', the next `await bootOnce(...)` could spawn its own child while this one is
-      // still mid-teardown — a false "two at once" that ltTest's between-TEST draining doesn't
-      // cover, because both boots happen inside a single test body.
-      await ltWait(() => buf.closed, 5000);
-    }
+        child.kill("SIGKILL");
+        // This loop boots one child per case, all three inside a single test body, so ltTest's
+        // between-TEST drain never runs between them. Without waiting for THIS boot's 'close',
+        // the next iteration's ltBootFresh could spawn while this child is still mid-teardown —
+        // a false "two at once".
+        await ltDrain(() => buf.closed, "boot-gate-loop", 5000);
+      }
     }
   } finally { _ltRmRetry(dir); }
 });
@@ -2046,7 +2098,7 @@ ltTest("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response 
       // 'close', the next `await bootOnce(...)` could spawn its own child while this one is
       // still mid-teardown — a false "two at once" that ltTest's between-TEST draining doesn't
       // cover, because both boots happen inside a single test body.
-      await ltWait(() => buf.closed, 5000);
+      await ltDrain(() => buf.closed, "epoch-fold-in-body", 5000);
     }
   };
   try {
@@ -2545,7 +2597,7 @@ ltTest("integration: a config change invalidates the STRUCTURED cache too (close
       // 'close', the next `await bootOnce(...)` could spawn its own child while this one is
       // still mid-teardown — a false "two at once" that ltTest's between-TEST draining doesn't
       // cover, because both boots happen inside a single test body.
-      await ltWait(() => buf.closed, 5000);
+      await ltDrain(() => buf.closed, "structured-cache-in-body", 5000);
     }
   };
   try {
@@ -3266,7 +3318,7 @@ ltTest("integration (#346): every grandfathered B.2 endpoint's response key set 
       return await probeB2KeySets(port);
     } finally {
       child.kill("SIGKILL");
-      await ltWait(() => buf.closed, 5000);
+      await ltDrain(() => buf.closed, "b2-snapshot-in-body", 5000);
       fx.cleanup();
     }
   }
@@ -4105,8 +4157,44 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
   await ltWait(() => _ltActiveBoots === 0, 5000);
   assert.equal(_ltActiveBoots, 0,
     `all boots in this block must have closed by the time the last queued test runs, got ${_ltActiveBoots} still active`);
-  assert.equal(_ltPeakBoots, 1,
-    `ltTest must serialize ltBoot-spawned children to 1 at a time; peak observed was ${_ltPeakBoots}`);
+  // #358: a timed-out drain matters ONLY when the peak is also above 1. That is the state where
+  // the peak becomes unattributable — a slow teardown and a real overlap produce the same number,
+  // and reporting that number as though it settled the question is what let two real failures be
+  // dismissed as "load". When the peak stayed 1 the question IS settled: the child closed before
+  // the next boot, or the drain was terminal in its scope and no boot follows. Serialization is
+  // PROVEN, and failing here would report a slow teardown as a serialization result — the same
+  // defect inverted. An earlier revision of this PR asserted `_ltDrainTimeouts.length === 0`
+  // unconditionally and did exactly that: independent review measured it firing with peak === 1,
+  // the record's own `active=0` sitting inside the message contradicting the sentence next to it.
+  // Four of the six gaps are terminal on their last iteration, so it needed no mutation to reach.
+  //
+  // The timeout is still worth surfacing — it is the #374 lead — so it is reported, not asserted.
+  const _drainSummary = _ltDrainTimeouts
+    .map(d => `${d.where}(${d.ms}ms, active=${d.active})`).join(", ");
+  if (_ltDrainTimeouts.length && _ltPeakBoots === 1) {
+    console.warn(`    [#358] ${_ltDrainTimeouts.length} teardown wait(s) timed out, but peak stayed 1, ` +
+      `so serialization is still PROVEN — a slow-teardown lead (#374), not a failure here. ` +
+      `Offenders: ${_drainSummary}`);
+  }
+
+  // Both directions of "not 1" are failures, and they mean different things — say which. And when
+  // peak > 1, whether a drain timed out decides which of two unrelated things happened, so the
+  // message must not pick one without looking. Measured while mutation-proving this: bypassing the
+  // _ltQueue chain yields peak 0, not 2, because this assertion then runs concurrently and reads
+  // the counter before anything has booted. A message reporting that as "children overlapped"
+  // would be a true number under a false claim — the exact defect #358 is about.
+  assert.equal(_ltPeakBoots, 1, _ltPeakBoots > 1
+    ? (_ltDrainTimeouts.length
+        ? `peak observed was ${_ltPeakBoots}, and ${_ltDrainTimeouts.length} teardown wait(s) timed ` +
+          `out, so the serialization claim is UNPROVEN rather than violated (#358): a slow teardown ` +
+          `and a real overlap are indistinguishable in this state. Offenders: ${_drainSummary}`
+        : `ltTest must serialize ltBoot-spawned children to 1 at a time; peak observed was ` +
+          `${_ltPeakBoots}. Every drain completed (0 timed out), so adjacent tests provably did NOT ` +
+          `overlap through a slow teardown — this is a real serialization regression.`)
+    : `peak observed was ${_ltPeakBoots}, i.e. this assertion ran BEFORE any ltBoot did. That is ` +
+      `an ordering failure, not an overlap: ltTest's queue no longer guarantees this test runs ` +
+      `last, so the count it reads is meaningless rather than good. Check that ltTest still ` +
+      `chains through _ltQueue.`);
 });
 
 // ── Upgrade Tests ──
