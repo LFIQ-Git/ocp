@@ -589,7 +589,9 @@ function describeClaim(identity) {
 // a port and all three claim the primary is genuinely two findings, and the operator
 // who fixes only the port collision still has an ambiguous host.
 function groupAndAssessConflicts(units) {
-  if (units.length < 2) return { state: "clear" };
+  // #327 part 5 (review F1): "clear" still ENUMERATED the unit — a single-install host is the
+  // most common shape, and its inventory is exactly as useful to part 4 as a multi-instance one.
+  if (units.length < 2) return { state: "clear", units };
 
   const portGroups = groupBy(units, u => u.port).filter(g => g.length >= 2);
   const identityGroups = groupBy(units, claimedInstance)
@@ -1129,11 +1131,20 @@ export async function runDoctor(opts = {}) {
   // comment above classifyMultiUnitRisk for the full design rationale (why WARN not
   // FAIL, why grouping is by port alone, why this doesn't depend on
   // scripts/lib/restart-unit.mjs).
+  // #327 part 5: the per-host unit inventory is already derived by this check; expose it as
+  // STRUCTURED JSON (not only the human message) so an agent or `ocp update --all-instances` can
+  // enumerate declared instances without parsing prose. Non-null whenever the check ENUMERATED
+  // (clear/warn/declared); null only when it could not (skipNetwork or the unknown state).
+  let units = null;
   if (!opts.skipNetwork) {
     const multiUnit = detectMultiUnitBootRace(opts);
     if (multiUnit.state === "warn") {
+      units = multiUnit.units;
       push("multi_unit_boot_race", "WARN", describeMultiUnitConflict(multiUnit.groups, multiUnit.identityGroups));
+    } else if (multiUnit.state === "clear") {
+      units = multiUnit.units; // single-install host: enumeration SUCCEEDED, so the inventory is real
     } else if (multiUnit.state === "declared") {
+      units = multiUnit.units;
       // #327. Kept under the SAME check id deliberately: this is the same check reaching
       // a verdict, and the id is a stable machine-readable handle an operator or agent may
       // already key on. INFO does not touch warn_count/fail_count, so a correctly-declared
@@ -1309,6 +1320,9 @@ export async function runDoctor(opts = {}) {
     current_version: currentVersion,
     latest_version: latestVersion,
     from_version_supported: fromSupported,
+    // #327 part 5: the structured per-host unit inventory (name/scope/port/instanceName per
+    // enabled unit), null when the check could not enumerate (skipNetwork or unknown state).
+    units,
     fail_count,
     warn_count,
     checks,

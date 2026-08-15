@@ -20040,10 +20040,9 @@ test("#327: ...but the two are still DISTINGUISHABLE in the parsed model and in 
     unitShow({ id: "b.service", port: 3458, instance: "" }),
   );
   // STATE FIRST, THEN DEREFERENCE — the discipline stated in full at the SPACE test below, and
-  // applied to every test in this block that reads `result.units`. `groupAndAssessConflicts`
-  // returns `{ state: "clear" }` with NO `units`, so a regression routing this fixture there
-  // would otherwise surface as `Cannot read properties of undefined (reading 'map')`: a real
-  // detection wearing the name of a JavaScript property instead of the name of the defect.
+  // applied to every test in this block that reads `result.units`. (#327 part 5 changed `clear`
+  // to carry `units` too, so the dereference hazard below is now only the UNKNOWN state, which
+  // still has none — the discipline stays because that state remains reachable.)
   assert.equal(result.state, "warn", "premise: both units are present and both claim the primary");
   const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
   assert.strictEqual(byName["a.service"].instanceName, null, "absent must be null");
@@ -25844,5 +25843,32 @@ test("#416 mode 2: the pid-gone decision is ESRCH-only — a rendered ps state f
   const rec = { pid: dead.pid, nonce: "x", startedAt: Date.now() - 60000, state: "S    running" };
   assert.ok(suiteLockPidGone(rec),
     `a dead pid must read as gone even when a ps-style state renders it alive — the decision is ESRCH-only, never a rendered column (macOS pads "Z    00:02", so a fixed-width read is the failed prescription)`);
+});
+
+
+test("#327 part 5: runDoctor's --json result carries the structured per-host unit inventory", async () => {
+  // Mock the systemctl chain: one undeclared primary in the user scope, one DECLARED second
+  // instance in the system scope — the intended multi-instance host from the issue.
+  const run = (cmd) => {
+    if (cmd.includes("--user list-unit-files")) return "ocp.service enabled";
+    if (cmd.includes("list-unit-files")) return "ocp-wifibot.service enabled";
+    if (cmd.includes("systemctl --user show")) return unitShow({ id: "ocp.service", port: 3456 });
+    if (cmd.includes("systemctl show ")) return unitShow({ id: "ocp-wifibot.service", port: 3457, instance: "wifibot" });
+    throw new Error("unexpected cmd: " + cmd);
+  };
+  const result = await runDoctor({
+    mockPlatform: "linux", run, skipNetwork: false,
+    mockVersion: "v3.29.2", mockLatest: "v3.29.2",
+    // Mocked health so this never probes the live production proxy; the oauth check reads the
+    // same body via classifyAuthOk.
+    mockHealth: { status: 200, body: { version: "3.29.2", auth: { ok: true } } },
+  });
+  assert.ok(Array.isArray(result.units),
+    `the units inventory must be a structured array (null only when the check cannot enumerate); got ${JSON.stringify(result.units)}`);
+  assert.equal(result.units.length, 2, "both enabled units must be in the inventory");
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["ocp-wifibot.service"].instanceName, "wifibot",
+    "the declared name must be in the structured record, not only in the human message");
+  assert.strictEqual(byName["ocp.service"].instanceName, null, "an absent directive is null");
 });
 
