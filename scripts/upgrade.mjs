@@ -1435,6 +1435,23 @@ export async function runUpgrade(opts = {}) {
   const kind = doctor.next_action.kind;
   plan.push(`[doctor] from=${doctor.current_version} to=${doctor.latest_version} kind=${kind}`);
 
+  // #327 part 4: report sibling instances, never act across identities. This update touches ONLY
+  // the instance it was invoked from — a sibling under another Unix identity cannot be written here
+  // (the isolation that motivates a second instance is exactly what prevents one process from
+  // updating both). Each sibling gets its OWN update command printed, to run as its owner.
+  if (Array.isArray(doctor.units) && doctor.units.length > 1) {
+    for (const u of doctor.units) {
+      // Labels match doctor's own vocabulary: null = no declaration, "" = the primary, else the name.
+      const label = u.instanceName === null ? "no OCP_INSTANCE_NAME declared" : (u.instanceName === "" ? "primary" : `instance ${JSON.stringify(u.instanceName)}`);
+      if (u.workingTree) {
+        plan.push(`[multi-instance] ${u.name} (${label}) at ${u.workingTree} — update it from its own tree: (cd ${u.workingTree} && ./ocp update)`);
+      } else {
+        // No tree known -> NO paste-able command (a "cd (tree unknown)" trap is worse than no command).
+        plan.push(`[multi-instance] ${u.name} (${label}) — tree unknown, update it from its own install tree`);
+      }
+    }
+  }
+
   // Issue #260: --target is a PIN ("do not put me on anything else"), not a preference. noop,
   // restart, and fresh_install have no mechanism to redirect what they do onto a specific
   // version: noop does nothing, restart re-serves the CURRENT tree exactly as-is, and
