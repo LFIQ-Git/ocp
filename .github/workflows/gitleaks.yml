@@ -62,8 +62,16 @@ jobs:
         run: |
           set -euo pipefail
           probe="$(mktemp -d "${RUNNER_TEMP}/gitleaks-probe.XXXXXX")"
-          printf 'aws_access_key_id = AKIA%s\n' \
-            "$(LC_ALL=C tr -dc 'A-Z0-9' < /dev/urandom | head -c 16)" > "$probe/planted.txt"
+          # Assembled from two string literals so THIS FILE never contains a
+          # matching sequence — the scan above walks the workflows too, and a
+          # whole planted key written out here would be a finding in its own
+          # right. Fixed, not random: the first version of this control drew 16
+          # bytes from /dev/urandom, and whether the draw tripped the rule
+          # varied run to run (it passed on a PR and failed on main minutes
+          # later). aws-access-token is pure pattern with no entropy floor, so a
+          # constant suffix is matched every time.
+          planted="AKIA""ABCDEFGHIJKLMNOP"
+          printf 'aws_access_key_id = %s\n' "$planted" > "$probe/planted.txt"
           if ./gitleaks dir "$probe" --config .gitleaks.toml --redact --no-banner; then
             echo "::error::Positive control FAILED — gitleaks did not flag a planted AWS key. The ruleset is empty or the allowlist is too broad; this gate is not enforcing anything. Check that .gitleaks.toml still has [extend] useDefault = true."
             rm -rf "$probe"
