@@ -1,12 +1,21 @@
 name: gitleaks
 
 # Secret scanning gate. Runs on every PR (any branch) and every push to main.
-# Configuration is read from the repo-root `.gitleaks.toml` automatically.
+# Configuration is read from the repo-root `.gitleaks.toml`.
 # Hard-fails the build on any detected leak — public repo, no tolerance.
 #
 # To extend the allowlist (e.g. a new known-safe placeholder), edit
 # `.gitleaks.toml`. Do not add `continue-on-error` here without an explicit
-# governance decision.
+# governance decision. Do NOT remove `[extend] useDefault = true` from that
+# file: without it the config declares zero rules and this gate silently
+# enforces nothing (see the comment there).
+#
+# WHY THE CLI AND NOT gitleaks/gitleaks-action: the action refuses to run on an
+# organisation-owned repo without a paid licence key —
+#   "🛑 missing gitleaks license ... [<org>] is an organization."
+# so from the moment this repo moved under an org, every run failed before
+# scanning anything. The gitleaks binary itself is MIT and has no such gate, so
+# the gate is restored by dropping the wrapper rather than by buying a licence.
 
 on:
   push:
@@ -15,6 +24,10 @@ on:
 
 permissions:
   contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
 
 jobs:
   scan:
@@ -26,7 +39,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+          ./gitleaks version
+
+      - name: Scan full history
+        run: ./gitleaks git --config .gitleaks.toml --redact --no-banner
+
+      # A scanner that finds nothing and a scanner that CAN find nothing produce
+      # the same green tick. This repo has already shipped the second one: the
+      # config carried an allowlist and no rules, so every scan passed on an
+      # empty ruleset. Plant a credential and require that it is caught.
+      # Generated at runtime under $RUNNER_TEMP, never inside the checkout, so
+      # the payload cannot be picked up by the real scan above.
+      - name: Positive control — detection must be live
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d "${RUNNER_TEMP}/gitleaks-probe.XXXXXX")"
+          printf 'aws_access_key_id = AKIA%s\n' \
+            "$(LC_ALL=C tr -dc 'A-Z0-9' < /dev/urandom | head -c 16)" > "$probe/planted.txt"
+          if ./gitleaks dir "$probe" --config .gitleaks.toml --redact --no-banner; then
+            echo "::error::Positive control FAILED — gitleaks did not flag a planted AWS key. The ruleset is empty or the allowlist is too broad; this gate is not enforcing anything. Check that .gitleaks.toml still has [extend] useDefault = true."
+            rm -rf "$probe"
+            exit 1
+          fi
+          rm -rf "$probe"
+          echo "Positive control passed: planted credential was detected."
