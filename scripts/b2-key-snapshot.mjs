@@ -156,7 +156,7 @@ exit 0
 // shape is identical on a dev Mac and on a bare CI runner.
 const FIXTURE_SECURITY = "#!/bin/sh\nexit 1\n";
 
-// handleLogs reads $HOME/.openclaw/logs/proxy.log — a file server.mjs never writes (logEvent goes
+// handleLogs reads $HOME/.ocp/logs/proxy.log — a file server.mjs never writes (logEvent goes
 // to stdout/stderr; the file is the service manager's redirect). Left to the ambient HOME it is
 // the developer's own production log on one machine and absent on CI, so /logs would record a
 // different key set (or a 500) depending on where the suite ran. Seeded here with a single
@@ -301,8 +301,8 @@ export function makeB2Fixture(profileId = "default") {
   writeFileSync(tmux, FIXTURE_TMUX(tmuxLog));
   chmodSync(tmux, 0o755);
 
-  mkdirSync(join(home, ".openclaw", "logs"), { recursive: true });
-  writeFileSync(join(home, ".openclaw", "logs", "proxy.log"), FIXTURE_LOG_LINE);
+  mkdirSync(join(home, ".ocp", "logs"), { recursive: true });
+  writeFileSync(join(home, ".ocp", "logs", "proxy.log"), FIXTURE_LOG_LINE);
 
   return {
     dir,
