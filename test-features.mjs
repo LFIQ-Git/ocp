@@ -2984,7 +2984,7 @@ function ltResolveTmuxBin(env, dir) {
 //   both token states.
 //   scripts/b2-key-snapshot.mjs also pins HOME, but for a NEIGHBOURING reason rather than this
 //   one, and the distinction is worth keeping: its stated purpose is snapshot DETERMINISM —
-//   handleLogs reads $HOME/.openclaw/logs/proxy.log, so an ambient HOME makes /logs record a
+//   handleLogs reads $HOME/.ocp/logs/proxy.log, so an ambient HOME makes /logs record a
 //   different key set on a developer machine than on CI. That is about READING the operator's
 //   files; this is about WRITING to their home. Precedent for the mechanism, not the argument.
 //

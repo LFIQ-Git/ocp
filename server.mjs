@@ -3159,7 +3159,7 @@ function handleLogs(req, res) {
   const n = Math.min(parseInt(url.searchParams.get("n") || "30", 10), 200);
   const level = url.searchParams.get("level") || "all"; // all | error | warn | info
 
-  const LOG_PATH = join(process.env.HOME || "/tmp", ".openclaw/logs/proxy.log");
+  const LOG_PATH = process.env.OCP_LOG_PATH || join(homedir(), ".ocp", "logs", "proxy.log");
   let lines;
   try {
     const raw = readFileSync(LOG_PATH, "utf8");
