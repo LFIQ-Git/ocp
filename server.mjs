@@ -41,13 +41,20 @@ import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "nod
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
+import { scheduleKillEscalation } from "./lib/child-tree.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
-import { classifyToolRequest } from "./lib/tool-support.mjs";
+import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
+import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY, cliEffort } from "./lib/unhonoured-fields.mjs";
+import { summarizeResultUsage, summarizeRateLimitEvent } from "./lib/cli-usage.mjs";
+import { selectCredential } from "./lib/credential-source.mjs";
+import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
+         endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_CONTINUATION_SYSTEM_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
@@ -55,11 +62,15 @@ import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs"
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, orderLabelsLastGoodFirst, scrubInboundAuthEnv, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
+import { classifyCapabilityProbe, capabilityBootError } from "./lib/claude-capability.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// lib/mcp-bridge.mjs, resolved from this file's own location so a relocated install (#348) still
+// finds it. Launched by `claude` via --mcp-config, never by this process directly.
+const MCP_BRIDGE_SCRIPT = join(__dirname, "lib", "mcp-bridge.mjs");
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
 const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf8"));
 
@@ -192,14 +203,18 @@ function resolveClaude() {
 }
 
 // ── OCP system prompt wrapper (Phase 6c port — ADR 0009 Amendment 1 analogue) ─
-// Injected via `--system-prompt` flag, replacing claude CLI's default system
-// prompt (which normally includes cwd, OS, tool descriptions, and git status —
-// all irrelevant and potentially misleading when the model is accessed via the
-// OCP HTTP proxy).
+// Injected via `--system-prompt-file` (#453; it was `--system-prompt` until then, and the value
+// is no longer in argv), replacing claude CLI's default system prompt (which normally includes
+// cwd, OS, tool descriptions, and git status — all irrelevant and potentially misleading when the
+// model is accessed via the OCP HTTP proxy).
 //
-// Authority: claude CLI § --system-prompt (ported from OLP, verified v2.1.104;
-// behavior stable through v2.1.158 — OLP ADR 0009 Amendment 1 §
-// "OLP system prompt wrapper"; ported to OCP 2026-05-30).
+// Authority: claude CLI § --system-prompt (ported from OLP, verified v2.1.104; behavior stable
+// through v2.1.158 — OLP ADR 0009 Amendment 1 § "OLP system prompt wrapper"; ported to OCP
+// 2026-05-30). THAT VERIFICATION IS FOR --system-prompt AND DOES NOT TRANSFER: --system-prompt-file
+// was verified separately and much later, and carries a narrower measured range. See
+// spawnClaudeProcess's write site for it -- the version note lives with the code that depends on
+// it rather than here, because this comment is 1400 lines away and the last time a citation sat
+// that far from its subject it went stale without anything noticing.
 // Reference: https://github.com/dtzp555-max/olp commit 97e7d16 (Phase 6c)
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
@@ -207,9 +222,26 @@ const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You 
 // where the operator's own model legitimately has tools (the `-p` path passes --allowedTools). Tells
 // the model it MAY use them instead of disclaiming access it actually holds. Off by default; the
 // default wrapper above is byte-for-byte unchanged. Selecting the positive wrapper does NOT expand
-// the tool surface (governed independently by --allowedTools/--disallowedTools) — it only changes the
-// prompt — and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+// the tool surface (governed independently by --tools/--disallowedTools, and NOT by --allowedTools,
+// which only pre-approves; see lib/prompt.mjs for the measurements) — it only changes the prompt —
+// and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+// The `--tools` half was added when an independent review found this the THIRD copy of the same
+// omission, after README.md and lib/prompt.mjs. It was the least wrong of the three -- it carries
+// no over-claim, only a gap -- which is exactly why it survived two passes.
 const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. Unlike the shared-gateway posture, you may use your available local tools to act on the operator's machine as the task requires. Use only the tools you actually have — do not assume filesystem, shell, or other access beyond the tool set provided to you in this session.`;
+
+// Used on every branch that GRANTS tools without inviting their use — i.e. everything except
+// AUTH_MODE=multi (where the schema is genuinely empty) and OCP_LOCAL_TOOLS=1 (which is an explicit
+// invitation, still boot-gated to loopback/single-user). It exists because the negative wrapper
+// above was measured FALSE on this path: under the flags buildCliArgs pushes here the `system` init
+// event carries a non-empty tool schema including Bash/Edit/Glob/Grep, while the text told the model
+// it had none. See lib/prompt.mjs § selectPromptWrapper for the measurement and its instrument, and
+// ADR 0021 item 2 for the authorization.
+//
+// It states NO capability — neither granting nor denying — because OCP is not the right layer to
+// decide how a granted tool gets used: the client's own instructions are. What it keeps is the half
+// of the negative wrapper that was always true and always useful, the anti-invention clause.
+const OCP_NEUTRAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.`;
 
 // OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
 // callClaudeTui/messagesToPrompt and never calls extractSystemPrompt, so the wrapper is only ever
@@ -220,23 +252,53 @@ const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running
 const LOCAL_TOOLS = process.env.OCP_LOCAL_TOOLS === "1";
 const LOCAL_TOOLS_ACTIVE = LOCAL_TOOLS && process.env.CLAUDE_TUI_MODE !== "true";
 
-// The wrapper actually prepended to each request's system prompt, chosen once at startup.
-const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(LOCAL_TOOLS_ACTIVE, OCP_SYSTEM_PROMPT_WRAPPER, OCP_LOCAL_TOOLS_WRAPPER);
+// The wrapper actually prepended to each request's system prompt is chosen once at startup — but
+// BELOW, next to AUTH_MODE, not here. It now depends on the tool surface the spawn grants, and
+// AUTH_MODE is declared ~190 lines further down (it depends on PROXY_API_KEY). CONFIG_EPOCH, which
+// folds the chosen wrapper into every cache key, moved with it for the same reason. Both are still
+// module-level consts evaluated once; only their position changed. `extractSystemPrompt` below
+// reads SYSTEM_PROMPT_WRAPPER from inside a function body, so it is unaffected by the order.
 
 // Build the full system-prompt string: SYSTEM_PROMPT_WRAPPER prepended,
 // then any system-role messages from the request appended (separated by blank line),
 // then the operator-wide CLAUDE_SYSTEM_PROMPT appended LAST (lib/prompt.mjs — a
 // no-op returning the same string when the var is unset, so the default path is
 // byte-for-byte unchanged). ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
-function extractSystemPrompt(messages) {
+// #479 / ADR 0021 item 2: the wrapper is chosen PER SPAWN when that spawn carries a tool bridge,
+// not once at boot. The boot-time constant reads AUTH_MODE, and in `multi` it is the NEGATIVE
+// wrapper -- "You do NOT have access to any local filesystem ... Respond only based on the
+// conversation provided." That is correct for a multi-mode spawn with an emptied schema, and FALSE
+// for a multi-mode spawn that carries the client's tools through the bridge: MEASURED by #476's
+// reviewer, argv `--tools "" --mcp-config … --allowedTools mcp__ocp__*` arriving with that denial
+// in the system prompt. It is the same contradiction #473 closed for the non-bridge case, reopened
+// on one path -- and #473's own lesson is that the model is told it has nothing while the init
+// event shows it a schema.
+//
+// NEUTRAL, not positive: the bridged tools are the CLIENT's and run on the client, so OCP grants
+// them but does not invite their use -- how a granted tool gets used is the client's instruction to
+// give, not the proxy's. `OCP_LOCAL_TOOLS=1` still wins, because that is an explicit operator
+// invitation and is boot-gated to loopback/single-user.
+//
+// THE RESPONSE CACHE IS NOT AFFECTED, and that is a fact about the call graph rather than a hope:
+// CONFIG_EPOCH hashes the boot-time wrapper into every cache key, so a per-spawn wrapper could in
+// principle let two spawns with different prompts share an entry. They cannot -- `handleToolTurn`
+// returns from handleChatCompletions BEFORE the cache lookup, so a request that declares tools
+// never reads or writes the cache at all. Only non-bridge spawns are cached, and those still use
+// the boot-time wrapper this epoch was computed from.
+function extractSystemPrompt(messages, opts = {}) {
+  const chosen = opts.toolBridge && !LOCAL_TOOLS_ACTIVE ? OCP_NEUTRAL_TOOLS_WRAPPER : SYSTEM_PROMPT_WRAPPER;
+  // #512: the continuation note, unconditionally and byte-constant, on every -p spawn. Conditional
+  // placement (only when the history ends in a tool result) would change the SYSTEM prompt between
+  // steps and invalidate the cache at a layer before the conversation, which is worse than before.
+  const wrapper = MULTIBLOCK_INPUT ? `${chosen}\n\n${TOOL_CONTINUATION_SYSTEM_NOTE}` : chosen;
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
-    return appendOperatorPrompt(SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
+    return appendOperatorPrompt(wrapper, SYSTEM_PROMPT);
   }
   const clientContent = systemMessages.map(m =>
     contentToText(m.content)
   ).join("\n\n");
-  return appendOperatorPrompt(`${SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
+  return appendOperatorPrompt(`${wrapper}\n\n${clientContent}`, SYSTEM_PROMPT);
 }
 
 // ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────
@@ -291,7 +353,23 @@ function parseStreamJsonEvent(event, sawTextDelta) {
     if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
       return { text: inner.delta.text ?? "", fromDelta: true };
     }
-    // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
+    // #478: THE MESSAGE-END SIGNAL, and the only one there is. Reached only when
+    // --include-partial-messages is on, which buildCliArgs adds on the tool-bridge branch alone.
+    // `stop_reason: "tool_use"` means the model finished this message BECAUSE it wants tools run --
+    // every tool_use block it intends is already emitted. Measured on 2.1.270, a two-call message:
+    //
+    //   content_block_start:tool_use -> input_json_delta x3 -> assistant[tool_use] -> block_stop
+    //   content_block_start:tool_use -> input_json_delta x3 -> assistant[tool_use] -> block_stop
+    //   message_delta {"stop_reason":"tool_use"}          <- here
+    //
+    // Deliberately NOT keyed on `message_stop`, which arrives one event later and says only that
+    // the message ended, not why. A message that ends for any other reason must not end a tool
+    // turn early, and this predicate fires on POSITIVE evidence rather than on the absence of more
+    // blocks.
+    if (inner?.type === "message_delta" && inner.delta?.stop_reason === "tool_use") {
+      return { toolTurnEnd: true };
+    }
+    // Other stream_event sub-types (content_block_start, message_stop, etc.) — consumed
     return null;
   }
 
@@ -305,6 +383,11 @@ function parseStreamJsonEvent(event, sawTextDelta) {
   // seen (sawTextDelta), the aggregate duplicates them — ignore it.
   // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
   if (t === "assistant") {
+    // ADR 0022: a `tool_use` for one of the client's bridged tools ends the turn here. Checked
+    // BEFORE the text branch and regardless of sawTextDelta, because in streaming mode the text
+    // has already gone out as deltas and this event is the only place the tool call appears.
+    const toolUses = extractBridgeToolUses(event);
+    if (toolUses) return { toolUses, text: extractAssistantText(event) };
     if (!sawTextDelta) {
       const blocks = event.message?.content;
       if (Array.isArray(blocks)) {
@@ -323,12 +406,18 @@ function parseStreamJsonEvent(event, sawTextDelta) {
     if (event.is_error === true) {
       return { error: event.error_message ?? event.result ?? "claude returned is_error" };
     }
-    return { stop: true };
+    // #512: the token counts ride along to the lane, which logs them on `claude_ok`.
+    return { stop: true, usage: summarizeResultUsage(event.usage) };
   }
 
-  // rate_limit_event / usage — log for observability, don't forward
+  // rate_limit_event / usage — log for observability, don't forward.
+  // #512: a rate_limit_event is logged as parsed fields. The 200-char JSON prefix it replaces cut
+  // `unifiedWindows` -- where the utilization lives -- off every record. The parser keeps a closed
+  // set of fields (lib/cli-usage.mjs), so a field the CLI ADDS later is dropped rather than shown;
+  // an event it cannot parse at all still gets the old prefix.
   if (t === "rate_limit_event" || t === "usage") {
-    logEvent("info", "claude_stream_event", { type: t, data: JSON.stringify(event).slice(0, 200) });
+    const info = t === "rate_limit_event" ? summarizeRateLimitEvent(event) : null;
+    logEvent("info", "claude_stream_event", info ? { type: t, info } : { type: t, data: JSON.stringify(event).slice(0, 200) });
     return null;
   }
 
@@ -355,6 +444,27 @@ const CLAUDE = resolveClaude();
 let TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "600000", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
+// OpenAI tool calling over the MCP bridge (ADR 0022). ON by default because ADR 0021 makes "OCP
+// is an agent backend" a requirement, not a feature. `OCP_TOOL_CALLING=0` restores the pre-0022
+// behaviour -- declared tools are dropped and counted -- and exists because this is a behaviour
+// change on the default path: a client that sent `tools` and was content with prose now gets
+// `tool_calls` and must run them. EXPIRY: when no deployment has needed the switch for two
+// releases, remove it and this comment; a kill-switch nobody has pulled is a second code path
+// nobody tests.
+let TOOL_CALLING = process.env.OCP_TOOL_CALLING !== "0";
+
+// How long after a tool_use block to wait for the message-end signal before ending the turn anyway.
+// MEASURED on claude 2.1.270: the two tool_use events of a parallel message arrive ~100 ms apart and
+// the `message_delta` immediately after the second, so 2 s is ~20x the observed gap. It is a CEILING
+// on the fallback, not a target -- the healthy path never reaches it, because the signal arrives
+// first and clears the timer.
+//
+// EXPIRY: this number is only meaningful while the CLI emits per-content-block events at roughly
+// that cadence. If a future build batches or streams them much slower, a parallel call could be
+// truncated again -- SILENTLY, because the fallback answers rather than fails. The guard against
+// that is the `endedOn` field on every openai_tool_calls log line: a run of "quiescence" where
+// "signal" used to be is the signal to re-measure, and it is why that field is logged at `warn`.
+const TOOL_TURN_QUIESCE_MS = parseIntEnv("OCP_TOOL_TURN_QUIESCE_MS", 2000);
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
@@ -392,6 +502,35 @@ const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 // DNS name — which is also the only deployment DNS rebinding can imitate. See lib/host-gate.mjs.
 const ALLOWED_HOSTS = parseAllowedHosts(process.env.OCP_ALLOWED_HOSTS);
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// #512: hand the conversation to `claude -p` as one content block per message (stream-json), with
+// the tool-continuation note moved into the system prompt, so a growing agent conversation is an
+// append-only block list the prompt cache can match. `OCP_MULTIBLOCK_INPUT=0` restores the
+// single-text-block input and the trailing note, byte for byte. Boot-time only.
+const MULTIBLOCK_INPUT = process.env.OCP_MULTIBLOCK_INPUT !== "0";
+// #512: under MULTIBLOCK_INPUT, OCP puts ONE prompt-cache breakpoint on the last block it sends. The
+// CLI's own final breakpoint lands on a block it appends after the client's content, so the entry it
+// writes is never a prefix of the next request; an entry ending on our last block is, and the API's
+// short lookback finds it. Measured on opus 5.5 through OCP (#512, 2026-09-25): each agent step read
+// the whole previous prompt and wrote ~240 tokens, against ~13.5k re-written per step without it.
+//
+// The CLI already spends 3 of the API's 4 breakpoints (a 2nd client breakpoint was refused "Found 5"),
+// and the TTL must not be shorter than a breakpoint the CLI places AFTER ours (a 5m one before the
+// CLI's 1h one was refused). Both are the CLI's to change, so: OCP_CACHE_BREAKPOINT=1h (default) |
+// 5m | off, and the first 400 that names cache_control switches it off for the rest of this boot.
+// That request fails, as does any spawn already in flight with a breakpoint (each reads the value
+// once, at spawn); spawns after the switch run without it instead of failing too.
+let cacheBreakpointTtl = ({ "": "1h", "1h": "1h", "5m": "5m" })[(process.env.OCP_CACHE_BREAKPOINT || "").trim().toLowerCase()] ?? null;
+if (process.env.OCP_CACHE_BREAKPOINT && cacheBreakpointTtl === null && !/^(off|0|false|no)$/i.test(process.env.OCP_CACHE_BREAKPOINT.trim())) {
+  console.error(`WARNING: OCP_CACHE_BREAKPOINT=${JSON.stringify(process.env.OCP_CACHE_BREAKPOINT)} is not 1h, 5m or off — treating it as off.`);
+}
+// `spawnCarried` is the breakpoint the failing spawn actually sent (review P2 on #520): a 400 from a
+// spawn that sent none -- the kill switch, or the over-budget text path -- says nothing about ours.
+function noteCacheBreakpointRejection(errText, spawnCarried) {
+  if (cacheBreakpointTtl === null || !spawnCarried) return;
+  if (!/cache_control/.test(errText) || !/\b400\b/.test(errText)) return;
+  logEvent("warn", "cache_breakpoint_disabled", { ttl: cacheBreakpointTtl, reason: String(errText).slice(0, 200) });
+  cacheBreakpointTtl = null;
+}
 // Config epoch for the response cache (issue #176). The cache key hashes model + messages +
 // sampling params, but the ANSWER also depends on boot-time server config that shapes the
 // composed prompt / tool surface: the operator system prompt (#175), the OCP wrapper text,
@@ -402,9 +541,6 @@ const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 // Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
 // API) are excluded because a const epoch cannot track them; truncation also only drops
 // context rather than changing the instruction set.
-const CONFIG_EPOCH = cryptoCreateHash("sha256")
-  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
-  .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
 // real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
@@ -412,6 +548,24 @@ const CONFIG_EPOCH = cryptoCreateHash("sha256")
 // HOME's claude config for the spawned process.
 const SPAWN_REAL_HOME = process.env.OCP_SPAWN_REAL_HOME === "1";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
+
+// ── system-prompt wrapper selection (moved here from ~line 233) ─────────────────────────────────
+// Chosen from the tool surface the spawn ACTUALLY grants, so the prompt and the flags cannot drift
+// apart — which they had: see lib/prompt.mjs § selectPromptWrapper for the measurement.
+//
+// `AUTH_MODE === "multi"` is exactly buildCliArgs's own test for the branch that empties the schema
+// (`--tools ""`); every other branch leaves the model holding tools. Reading AUTH_MODE rather than
+// the env var is deliberate — it is the same value buildCliArgs branches on, so there is one
+// derivation, not two that could disagree.
+const TOOLS_GRANTED = AUTH_MODE !== "multi";
+const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(
+  { toolsGranted: TOOLS_GRANTED, localToolsInvited: LOCAL_TOOLS_ACTIVE },
+  { negative: OCP_SYSTEM_PROMPT_WRAPPER, neutral: OCP_NEUTRAL_TOOLS_WRAPPER, positive: OCP_LOCAL_TOOLS_WRAPPER },
+);
+
+const CONFIG_EPOCH = cryptoCreateHash("sha256")
+  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT, MULTIBLOCK_INPUT]))
+  .digest("hex").slice(0, 16);
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
 // When set to "1", advertise PROXY_ANONYMOUS_KEY in the public /health body so
@@ -882,6 +1036,9 @@ const VERSION = _pkg.version;
 const START_TIME = Date.now();
 
 // ── Structured logging helper ───────────────────────────────────────────
+// #512: first 12 hex of sha256 -- enough to tell two prefixes apart in a log, not enough to log content.
+const shortSha = (text) => cryptoCreateHash("sha256").update(String(text)).digest("hex").slice(0, 12);
+
 function logEvent(level, event, data = {}) {
   const entry = { ts: new Date().toISOString(), level, event, ...data };
   if (level === "error" || level === "warn") {
@@ -1045,6 +1202,29 @@ const activeProcesses = new Set();
 // ── Stats & diagnostics ─────────────────────────────────────────────────
 const stats = {
   totalRequests: 0,
+  // #467 / ADR 0021. Requests that DECLARED tools which OCP then dropped -- the silent
+  // degradation, counted. NOT a count of tools, and NOT a count of refusals: the refused shapes
+  // (ADR 0013's four forcing forms) already 400 loudly and are not counted here, because they were
+  // never the invisible case. This is the `tool_choice: "auto"`/absent path, where text is a legal
+  // answer, the request is served exactly as before, and the declared tools quietly never existed.
+  //
+  // Additive read-only field on a grandfathered B.2 endpoint, under ADR 0012. It reaches the wire
+  // through GET /health's bare `stats,` shorthand -- see the ADR 0016 Amendment 1 note below, which
+  // is the same mechanism working in the other direction.
+  toolRequestsDropped: 0,
+  // #470 / additive under ADR 0012: requests that were SERVED while carrying at least one OpenAI
+  // field OCP does not act on. Counts REQUESTS, not fields -- a request sending three inert fields
+  // moves it by one, the same discipline toolRequestsDropped uses, so the number stays readable as
+  // "how much traffic is asking for something it is not getting".
+  unhonouredFieldRequests: 0,
+  // ADR 0022 / additive under ADR 0012: requests that ended with the model calling one of the
+  // client's tools -- i.e. answered with `tool_calls`. The companion of toolRequestsDropped: with
+  // OCP_TOOL_CALLING on, a request that declares tools lands in exactly one of the two.
+  toolCallsEmitted: 0,
+  // ADR 0012 additive: upstream rate limits reported as 429 rather than 500. An operator asking
+  // "did we hit the wall, or is the proxy broken?" reads this instead of grepping the log; it is
+  // the counter that separates the two, which `errors` alone never did.
+  upstreamRateLimits: 0,
   activeRequests: 0,
   errors: 0,
   timeouts: 0,
@@ -1340,11 +1520,13 @@ const authCheckInterval = setInterval(checkAuth, AUTH_CHECK_INTERVAL_MS);
 // ── Build CLI arguments ─────────────────────────────────────────────────
 // Phase 6c port (2026-05-30): removed `-p` / `--output-format text`.
 // Now uses `--output-format stream-json --verbose --no-session-persistence
-// --system-prompt <OCP_SYSTEM_PROMPT_WRAPPER + client system messages>`.
+// --system-prompt-file <path to a 0600 temp file holding OCP_SYSTEM_PROMPT_WRAPPER + client
+// system messages>` (#453 moved that value out of argv).
 //
 // Authority: claude CLI § --output-format stream-json, § --verbose,
-//   § --no-session-persistence, § --system-prompt (ported from OLP, verified v2.1.104;
-//   behavior stable through v2.1.158).
+//   § --no-session-persistence (ported from OLP, verified v2.1.104; behavior stable through
+//   v2.1.158). --system-prompt-file is NOT covered by that verification and is dated separately
+//   at the write site below.
 // Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
 //
 // Session flags (--resume, --session-id) are dropped: they are incompatible
@@ -1353,14 +1535,22 @@ const authCheckInterval = setInterval(checkAuth, AUTH_CHECK_INTERVAL_MS);
 // CLAUDE_SYSTEM_PROMPT env var is absorbed into the system prompt via
 // extractSystemPrompt() at the caller level; APPEND_SYSTEM_PROMPT no longer used.
 // Note: ALLOWED_TOOLS / SKIP_PERMISSIONS / MCP_CONFIG are preserved as before.
-function buildCliArgs(cliModel, systemPrompt, opts = {}) {
+function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
   const args = [
     "--model", cliModel,
     "--output-format", "stream-json",
     "--verbose",
     "--no-session-persistence",
-    "--system-prompt", systemPrompt,
+    // --system-prompt-FILE, not --system-prompt. The value used to travel in argv, which put it
+    // under the OS argv ceiling AND on a channel other local users can read. Both were measured;
+    // see the block at the write site in spawnClaudeProcess for the numbers and the limits.
+    "--system-prompt-file", systemPromptFile,
   ];
+
+  // OpenAI `reasoning_effort` (Class B.1, ADR 0006), already mapped to a `claude --effort` level
+  // by cliEffort() in lib/unhonoured-fields.mjs. Absent => argv unchanged, and the CLI keeps
+  // whatever effort it would have used before. Before the toolBridge branch, which returns.
+  if (opts.effort) args.push("--effort", opts.effort);
 
   // Multimodal path (issue #110): images are fed as Anthropic content blocks over
   // a stream-json stdin stream. `--input-format stream-json` (§ --input-format,
@@ -1370,27 +1560,125 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
     args.push("--input-format", "stream-json");
   }
 
+  // ADR 0022: the client declared `tools`, so the model holds EXACTLY those and nothing else --
+  // that is what the OpenAI contract says it holds, and it is what makes the answer to "which tool
+  // did the model choose" unambiguous. Built-in schema emptied the way multi mode empties it;
+  // `--strict-mcp-config` so only the bridge is loaded (no account-level connectors); the bridge's
+  // tools pre-approved so no permission prompt can stall a headless spawn. This branch comes
+  // FIRST and returns, in every auth mode, because the tools it grants run on the CLIENT: a guest
+  // in multi mode calling its own tool touches nothing of the operator's. Any operator MCP_CONFIG
+  // is deliberately not merged in -- a client's tool surface and an operator's are different
+  // things, and a request that declares tools has asked for the former.
+  if (opts.toolBridge) {
+    args.push("--tools", "", "--mcp-config", opts.toolBridge.configFile, "--strict-mcp-config",
+      "--allowedTools", `${TOOL_PREFIX}*`);
+    // #478: --include-partial-messages, so the turn has a MESSAGE-END SIGNAL. Without it the CLI
+    // emits one `assistant` event per content block with `stop_reason: null` on every one of them
+    // (measured on 2.1.270 -- all three events of a two-call message share one `message.id` and
+    // none carries a stop reason), so the only way to end the turn was on the FIRST tool_use --
+    // which truncated a parallel call to one and dropped any text preamble. With the flag the
+    // stream carries `message_delta` with `stop_reason: "tool_use"` after the last content block,
+    // which is what callClaude now ends on.
+    //
+    // Added HERE and nowhere else: the plain and image paths are untouched, so the extra
+    // content_block_delta traffic is paid for only by requests that declared tools.
+    //
+    // EXPIRY: `claude --help` lists this flag on 2.1.270 ("Include partial message chunks as they
+    // ... --output-format=stream-json"). If a future CLI drops it, the boot capability probe below
+    // refuses the boot and names the flag, rather than every tool request failing at runtime --
+    // that gate covers this branch as of #478 and did not before.
+    args.push("--include-partial-messages");
+    return args;
+  }
+
   // Permissions
   // ADR 0007 B-path: in multi-tenant mode, suppress operator-FS tools so a guest
   // prompt cannot drive Bash/Read/Write/Edit/etc. on the operator's filesystem.
   // For AUTH_MODE !== "multi" (none/shared — single-operator/trusted), preserve
   // existing behaviour unchanged.
   if (AUTH_MODE === "multi") {
-    // Disallow the full operator-FS + web + agent surface. "--disallowedTools" may
-    // be repeated; claude accepts multiple occurrences (TUI path already uses it).
-    args.push(
-      "--disallowedTools", "Bash",
-      "--disallowedTools", "Read",
-      "--disallowedTools", "Write",
-      "--disallowedTools", "Edit",
-      "--disallowedTools", "Glob",
-      "--disallowedTools", "Grep",
-      "--disallowedTools", "WebFetch",
-      "--disallowedTools", "WebSearch",
-      "--disallowedTools", "Agent",
-      "--disallowedTools", "mcp__*",
-    );
-    // Do NOT push --allowedTools in multi mode.
+    // EMPTY THE SCHEMA; DO NOT ENUMERATE WHAT TO REMOVE.
+    //
+    // `--tools` is the tool-AVAILABILITY registry -- `claude --help`: "Specify the list of
+    // available tools from the built-in set. Use \"\" to disable all tools". `--disallowedTools`
+    // is a DENY LIST: it can only ever deny the tools whoever wrote it knew about, so it goes
+    // stale on every CLI release that adds one, silently and with no error.
+    //
+    // This branch used to be a hardcoded ten-entry deny-list (Bash/Read/Write/Edit/Glob/Grep/
+    // WebFetch/WebSearch/Agent/mcp__*), which is the shape ADR 0007 already ruled out. Grep it
+    // for "The B-path (multi-tenant isolation) requires:" -- item 1 of the 3 is `--tools ""`
+    // (:138 at the time of writing; the string is the citation, the number is decorative, per
+    // AGENTS.md on cross-file line references). The comment on this branch cited that B-path
+    // while the code did something else.
+    //
+    // MEASURED 2026-08-27 on claude 2.1.247. THE INSTRUMENT MATTERS MORE THAN THE NUMBER, so
+    // read this before quoting either. The authority is the `tools` array on the `system` init
+    // event of `--output-format stream-json --verbose` -- the schema the CLI actually built. An
+    // earlier pass asked the spawned model to name its own tools instead; the reviewer showed
+    // that instrument lies, in the direction that matters: under these very flags it answered
+    // "Read, Edit, Write, Glob, Grep, Bash, PowerShell" while the wire, same model same flags,
+    // answered [].
+    //
+    // What the wire says, varying ONE thing at a time from ONE BASELINE ON ONE HOST -- and the
+    // baseline's own conditions have to be named, because the table below is precisely a proof
+    // that they move the answer: default model (no --model), CLAUDE_CONFIG_DIR unset, cwd inside
+    // this repo's worktree, claude 2.1.247:
+    //
+    //   old deny-list, default model                        -> 20 tools
+    //   old deny-list, + --model haiku                      -> 24
+    //   old deny-list, + CLAUDE_CONFIG_DIR set              -> 16
+    //   old deny-list, baseline repeated                    -> 20   (deterministic, not flaky)
+    //   THIS branch's flags, default model AND haiku        ->  0
+    //
+    // Each row repeated identically is stable (baseline 4x, deny-list 3x, this branch 3x), so
+    // these are conditions, not noise. But the exposure is still not a number: it is a FUNCTION
+    // OF THE INVOCATION -- the model and the config dir move it without any CLI release, and
+    // those are merely the two knobs that turned up, not a claim that they are the only two.
+    // Do not "update the 20"; there is no single value to update, and that is the argument for
+    // emptying the schema rather than enumerating it. THE LAST ROW is the stable one -- the
+    // right-hand column is precisely what varies. (An earlier revision of this comment said
+    // "the right-hand column is the only stable one", which asserts the opposite of its table.)
+    //
+    // Why BOTH mcp-closing flags, when either alone would do. [measured] `--tools ""` governs
+    // built-ins ONLY: alone it leaves 49 tools in the schema, all of them mcp__* from
+    // account-level servers. [measured] Adding EITHER `--strict-mcp-config` OR
+    // `--disallowedTools mcp__*` takes that to 0 -- so on the SCHEMA axis they are
+    // interchangeable, not complementary. An earlier revision of this comment claimed they were
+    // "not redundant" and called that measured; the measurement cited (49 under `--tools ""`
+    // alone) does not discriminate between them at all, and the claim was wrong.
+    //
+    // They are BOTH kept because they are not interchangeable on a second axis -- `mcp_servers`,
+    // one field over in the same init event. WHERE that matters depends on the spawn's HOME, and
+    // an earlier revision of this comment got that wrong, so the conditions come first. All rows
+    // are `--tools "" --disallowedTools 'mcp__*'` versus adding --strict-mcp-config:
+    //
+    //   HOME = the operator's REAL home        deny-list alone: schema empty, but 3 account-level
+    //                                          connectors report "status":"connected".
+    //                                          --strict-mcp-config: mcp_servers [].
+    //   HOME = <realHome>/.ocp/spawn-home      deny-list ALONE already gives 0 connected.
+    //   HOME = a fresh empty directory         0 connected.
+    //
+    // The middle row is what THIS FILE hands the -p spawn by default (`env.HOME = decision.home`
+    // below, when an OAuth token is resolvable), so under the default configuration the deny-list
+    // alone already suffices and --strict-mcp-config costs nothing. It is load-bearing on the
+    // REAL-HOME path, which is not hypothetical: it is the documented fallback when no token is
+    // resolvable -- the boot banner then prints "Spawn home: real-home" -- and it is what
+    // OCP_SPAWN_REAL_HOME=1 selects.
+    //
+    // An earlier revision asserted the connectors were "ESTABLISHED inside a multi-tenant guest's
+    // session" full stop. That was measured under the real HOME and is FALSE for the default
+    // spawn home; it was the THIRD time this block claimed more than was observed, which is why
+    // the rows above lead with their HOME rather than with a number. Limits that remain: one
+    // host, one operator's account, and a guest REACHING a connected server was never measured.
+    // [measured, and the reason none of this can be reasoned from the flags] --disallowedTools is
+    // not a subtraction the CLI passively applies: `--disallowedTools Bash` yields 77 tools where
+    // the unrestricted baseline is 76, because removing Bash makes the CLI ADD Glob and Grep.
+    //
+    // Reported by an external fork (princelundgren/ocp, FLEET-32) that hit it on its own fleet
+    // and never opened a PR; reproduced here before adopting rather than taken on its word.
+    args.push("--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*");
+    // Do NOT push --allowedTools in multi mode: it is a PRE-APPROVAL list ("tool names to
+    // allow", per --help), not a restriction, so it could only ever widen this.
   } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
@@ -1481,16 +1769,28 @@ function contentToText(content) {
 // argument in practice — the default only exists so a future internal caller that has no model
 // in hand still gets the conservative fallback rather than an undefined (NaN) ceiling, which
 // would disable the guard entirely.
-function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
+function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS, opts = {}) {
+  // ADR 0022: an assistant message carrying `tool_calls` and a `tool` message carrying a result are
+  // rendered as text describing what happened, because a fresh spawn has no other way to learn
+  // it (injecting real tool_use/tool_result blocks over stream-json input was measured NOT to work;
+  // see lib/tool-calling.mjs). `callNames` pairs each result with the call that produced it.
+  const callNames = new Map();
   const full = messages.map((m) => {
+    const toolTurn = renderToolTurn(m, callNames);
+    if (toolTurn) return toolTurn.text;
     const text = contentToText(m.content);
     if (m.role === "system") return `[System] ${text}`;
     if (m.role === "assistant") return `[Assistant] ${text}`;
     return text;
   });
+  // Appended to the RESULT rather than pushed into `full`: the truncation path below partitions
+  // `full` by indexing `messages[i].role`, so the two must stay the same length.
+  // opts.continuationNote === false (#512): the -p path under MULTIBLOCK_INPUT, whose system prompt
+  // already carries the note. The TUI lane has no such system prompt and keeps the default.
+  const tail = opts.continuationNote !== false && endsWithToolResult(messages) ? `\n\n${TOOL_CONTINUATION_NOTE}` : "";
 
   const joined = full.join("\n\n");
-  if (joined.length <= maxChars) return joined;
+  if (joined.length + tail.length <= maxChars) return joined + tail;
 
   // Truncation: keep system messages, first user msg, and trim from the tail
   logEvent("warn", "prompt_truncated", {
@@ -1518,7 +1818,7 @@ function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
   }
 
   const truncNote = `[System] Note: ${rest.length - kept.length} older messages were truncated to fit context limit.`;
-  const result = [systemText, truncNote, ...kept].filter(Boolean).join("\n\n");
+  const result = [systemText, truncNote, ...kept].filter(Boolean).join("\n\n") + tail;
 
   logEvent("info", "prompt_after_truncation", {
     chars: result.length,
@@ -1555,37 +1855,105 @@ function getModelTier(cliModel) {
 // budget. releaseSlot is wired into the idempotent cleanup() so the slot is freed on EVERY exit
 // path (close/error/timeout/abort). Back-compat: releaseSlot defaults to a no-op so any future
 // internal caller that does its own gating still works.
-function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}, spawnDecision = null) {
+// #474: kill the child's ENTIRE process group, not just the direct child.
+//
+// Why a group: with spawnOpts.detached (set in spawnClaudeProcess below, POSIX only) the child
+// is a session leader, so proc.pid doubles as its pgid and process.kill(-pid) reaches every
+// process in that group — including a grandchild that inherited the stdout pipe. That grandchild
+// is the exact shape that kept 'close' (and with it the client request) open forever: the
+// timer's SIGTERM/SIGKILL landed on the parent, the parent died, the pipe stayed open, and the
+// request hung until the client gave up (issue #474, measured on v3.37.0: client silent past
+// 240 s while the log already showed request_timeout + claude_exit).
+//
+// A throw here means either the group was already fully reaped (the kill landed — nothing more
+// to do) or the group was never created (detached failed to apply). In BOTH cases we fall
+// through to the per-process kill below: in the first it is a harmless no-op, in the second it
+// still reaches the direct child instead of leaking it. win32: `detached` means something
+// different there and a negative pid is not killable, so the group path is POSIX-only and
+// win32 keeps the pre-#474 per-process behaviour.
+function killChildTree(proc, sig) {
+  if (proc.pid != null && process.platform !== "win32") {
+    try {
+      process.kill(-proc.pid, sig);
+      proc.killed = true; // honor the flag's contract: a signal WAS sent (see the #111 guard)
+      return;
+    } catch {
+      // ESRCH means EITHER the whole group was already reaped (the kill landed — nothing more to
+      // do) OR the group was never created (detached failed to take effect and the child is
+      // alive in its INHERITED group). In the second case giving up would be a silent leak, so
+      // fall through to the per-process kill below: at least it reaches the direct child.
+    }
+  }
+  try { proc.kill(sig); } catch { /* already gone */ }
+}
+
+function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}, spawnDecision = null, opts = {}) {
   const cliModel = MODEL_MAP[model] || model;
 
   // Circuit breaker: disabled (see comment at top of breaker section)
 
   // Phase 6c: always serialize full conversation via stdin (no session resume).
-  // System messages are extracted and passed via --system-prompt; the remaining
+  // System messages are extracted and passed via --system-prompt-file; the remaining
   // messages (user/assistant/tool) are serialized for stdin.
-  const systemPrompt = extractSystemPrompt(messages);
+  // ADR 0022: two more 0600 files for a tool-bridge spawn, same lifecycle as the prompt file --
+  // written one call before spawn(), removed in cleanup(). The tools file is what the bridge
+  // serves; the config file is what `--mcp-config` reads. Paths computed here, written below.
+  //
+  // Computed BEFORE the system prompt (#479), because the prompt's wrapper now depends on it: a
+  // spawn that carries the bridge must not be told it has no tools. The two were the other way
+  // round until the wrapper became per-spawn.
+  const toolBridge = Array.isArray(opts.tools) && opts.tools.length ? {
+    toolsFile: join(tmpdir(), `ocp-tools-${randomUUID()}.json`),
+    configFile: join(tmpdir(), `ocp-mcp-${randomUUID()}.json`),
+  } : null;
+
+  const systemPrompt = extractSystemPrompt(messages, { toolBridge });
+
+  // The path is computed here (a pure string) but the file is NOT written until immediately
+  // before spawn(), so the window in which an orphan can exist is one function call wide.
+  const systemPromptFile = join(tmpdir(), `ocp-sysprompt-${randomUUID()}.txt`);
 
   // messagesToPrompt / buildStreamJsonInput skip system messages (they go via
-  // --system-prompt). Filter them out first to avoid double-injection.
+  // --system-prompt-file). Filter them out first to avoid double-injection.
   const nonSystemMessages = messages.filter(m => m.role !== "system");
 
   // Multimodal (issue #110): when any message carries an OpenAI image_url part,
   // feed the conversation as Anthropic content blocks over --input-format
   // stream-json (images preserved and kept OUT of the text char budget).
-  // Otherwise the text path is byte-for-byte unchanged. buildStreamJsonInput may
+  // #512 extends the same path to text-only conversations (see below); with
+  // OCP_MULTIBLOCK_INPUT=0 the text path is as it was. buildStreamJsonInput may
   // throw MultimodalError on an invalid/oversized image; it runs BEFORE any stats
   // mutation so a validation failure never leaks counters or the concurrency slot
   // (handleChatCompletions validates first, so in practice it will not throw here).
-  const useStreamJson = hasImageContent(nonSystemMessages);
+  const hasImages = hasImageContent(nonSystemMessages);
   // Per-model ceiling (ADR 0011): resolved from cliModel, not a global max across the registry.
   const maxPromptChars = promptCharBudget(cliModel);
-  let stdinPayload, promptChars;
-  if (useStreamJson) {
+  // #512: under MULTIBLOCK_INPUT a text-only conversation also goes over stream-json, one block per
+  // message, append-only. It does so only while it FITS the budget: once text has to be dropped the
+  // start of the prompt shifts every turn and nothing can cache anyway, so an over-budget text-only
+  // conversation keeps the text path's whole-message truncation instead of the block path's
+  // mid-block cut. Images always take this path, exactly as before.
+  let built = null;
+  // Read once per spawn: noteCacheBreakpointRejection() may switch it off mid-flight for later spawns.
+  const bpTtl = MULTIBLOCK_INPUT ? cacheBreakpointTtl : null;
+  if (hasImages || MULTIBLOCK_INPUT) {
     // Pass the budget so the multimodal text is bounded by the same
     // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
-    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars });
+    built = buildStreamJsonInput(nonSystemMessages, {
+      ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars,
+      continuationNote: !MULTIBLOCK_INPUT, coalesceToolResults: MULTIBLOCK_INPUT,
+      cacheBreakpointTtl: bpTtl,
+    });
+    if (!hasImages && built.stats.truncated) built = null;
+  }
+  const useStreamJson = built !== null;
+  let stdinPayload, promptChars;
+  // #512: how many content blocks this request hands the prompt cache. The text path is one block.
+  let blockCount = 1;
+  if (useStreamJson) {
     stdinPayload = built.payload;
     promptChars = built.stats.textChars;
+    blockCount = built.stats.blockCount;
     if (built.stats.truncated) {
       logEvent("warn", "prompt_truncated", {
         originalChars: built.stats.originalTextChars,
@@ -1595,7 +1963,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
       });
     }
   } else {
-    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars);
+    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars, { continuationNote: !MULTIBLOCK_INPUT });
     promptChars = stdinPayload.length;
   }
 
@@ -1605,7 +1973,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${promptChars}`);
   }
 
-  const cliArgs = buildCliArgs(cliModel, systemPrompt, { streamJsonInput: useStreamJson });
+  const cliArgs = buildCliArgs(cliModel, systemPromptFile, { streamJsonInput: useStreamJson, toolBridge, effort: opts.effort });
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -1637,6 +2005,12 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // (belt-and-braces; mirrors the TUI path).
   const decision = spawnDecision || { isolated: false, releaseFallback: null };
   const spawnOpts = { env, stdio: ["pipe", "pipe", "pipe"] };
+  // #474: POSIX setsid — the child becomes a session leader, so its pid doubles as the pgid
+  // that killChildTree() addresses (process.kill(-pid)). Without this, a grandchild that
+  // inherited the stdout pipe (a real `claude` tool subprocess) survives the per-process kill
+  // and the client hangs. win32: `detached` means something different there; the group kill is
+  // POSIX-only (see killChildTree), so win32 keeps the pre-#474 per-process behaviour.
+  if (process.platform !== "win32") spawnOpts.detached = true;
   if (decision.isolated && decision.token) {
     env.HOME = decision.home;
     env.CLAUDE_CODE_OAUTH_TOKEN = decision.token; // env token is authoritative for -p
@@ -1645,7 +2019,106 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     spawnOpts.cwd = decision.home; // neutral cwd: no project CLAUDE.md/skills
   }
 
-  const proc = spawn(CLAUDE, cliArgs, spawnOpts);
+  // ── The system prompt travels as a FILE, not as argv (#453) ────────────────────────────────
+  //
+  // Written HERE, one call before spawn(), and removed in cleanup() below. Two things were wrong
+  // with argv, and only the first is the one that gets noticed:
+  //
+  // 1. SIZE. `--system-prompt <string>` put the whole value under the OS argv ceiling, while
+  //    nothing bounded the value itself -- promptCharBudget applies to messagesToPrompt, never to
+  //    extractSystemPrompt -- so the only gate was CLAUDE_MAX_BODY_SIZE (5 MiB default). MEASURED
+  //    single-argv ceiling: 131 071 bytes on Linux (MAX_ARG_STRLEN = 32 pages; note `getconf
+  //    ARG_MAX` reports 2 MiB there and is the WRONG number), ~1 045 424 bytes on macOS. A 200 KiB
+  //    system prompt therefore worked on a Mac and returned `spawn E2BIG` on a Pi, from the same
+  //    client. Reproduced end to end before fixing: 1.5 MiB system message -> HTTP 500
+  //    {"error":{"message":"spawn E2BIG"}}, with no counter leak and the server still healthy.
+  //
+  // 2. DISCLOSURE, which is the half that argues for a FILE rather than a bigger budget. argv is
+  //    world-readable on Linux: /proc/<pid>/cmdline is mode -r--r--r-- and the reference fleet's
+  //    /proc carries no hidepid, VERIFIED CROSS-USER on a real deployment (a non-owning local
+  //    account read the OCP service's own argv; the same host's /proc/<pid>/environ is -r-------- 
+  //    and refused). And the value really is there: a sentinel placed in a `system` message was
+  //    caught with `ps -ww` in the spawned child's command line during a live request. So this was
+  //    the one sensitive channel OCP had NOT already routed safely -- the conversation goes via
+  //    stdin and the OAuth token via env (protected by that same environ mode), and only the
+  //    system prompt sat in the open.
+  //
+  //    NOT MEASURED, and therefore not claimed: a capture from a PRODUCTION instance. The
+  //    mechanism was shown locally and the cross-user readability on the fleet host; composing
+  //    them is a short inference, not an observation.
+  //
+  // mode 0o600 is what makes the file a fix rather than a lateral move: tmpdir() is /tmp on Linux
+  // (mode 777) and writeFileSync's default is 0666 & ~umask = 644, so the naive form would have
+  // relocated the disclosure, not closed it. [measured] A umask sweep (000/002/022/027/077/177 ->
+  // 0600; 200/277/377 -> 0400; 777 -> 0000) confirms no umask can make this file MORE permissive
+  // than 0600, because umask only clears bits.
+  //
+  // `flag: "wx"` (O_CREAT|O_EXCL) does more than refuse a pre-planted symlink, which is how an
+  // earlier revision of this comment undersold it. [measured] With `flag: "w"` the `mode` is
+  // SILENTLY IGNORED on a path that already exists -- a pre-created 0666 file stayed 0666 -- so
+  // `wx` is what makes the 0600 guarantee TOTAL rather than conditional on the path being fresh.
+  // The name carries a randomUUID, so reaching that case requires guessing it.
+  //
+  // CLI VERSION. --system-prompt-file is NOT in `claude --help`'s option list (0 hits; positive
+  // controls: --append-system-prompt 2, --system-prompt 1), so a reader cannot confirm it from
+  // --help and the older `--system-prompt` verification 1400 lines up does NOT cover it.
+  // [measured] It works on 2.1.233, 2.1.243 and 2.1.247; the discriminator is the error text --
+  // an unknown flag gives `error: unknown option '<flag>'` while this one gives `Error: System
+  // prompt file not found: <path>`. NOT MEASURED: anything older, including the 2.1.104 / 2.1.158
+  // the comments above cite for the old flag. OCP still has no `claude` VERSION gate (setup.mjs
+  // only records `claude --version`; the only floor machinery in this repo is for Node) -- but
+  // since #455 it has a boot-time CAPABILITY gate, which is the better question to ask: it spawns
+  // the argv buildCliArgs actually produces and refuses to start if the CLI answers `unknown
+  // option`. See the block above server.listen(). That gate does NOT make the paragraph below
+  // obsolete: it is skippable (OCP_SKIP_CAPABILITY_PROBE=1) and it deliberately boots on any
+  // verdict it cannot classify, so the per-request failure below is still the fallback path.
+  // What makes that survivable rather than silent, and the SUBJECT of the measurement matters more
+  // than the result: [measured] against a STUB that rejects the flag the way commander does --
+  // no claude lacking the flag exists on this host to test -- every request 500s and the child's
+  // stderr reaches the caller, on the non-streaming path AND as a data: frame on the SSE path:
+  // {"error":{"message":"error: unknown option '--system-prompt-file'"}}. sanitizeError leaves it
+  // intact because its rewrite needs a leading `/` and this message carries no path, so "passed
+  // through" is accurate here and is NOT a general property of stderr. [reasoned, from three real
+  // binaries -- 2.1.233/2.1.243/2.1.247 -- all emitting commander's `error: unknown option '<x>'`
+  // format] a real older claude would say the same, so the failure names the flag and the remedy.
+  // Total outage, but not a mystery. See #455.
+  //
+  // RESIDUAL, stated rather than hidden: a SIGKILL of the server leaves the file behind, because
+  // cleanup() never runs. At 0600 that is litter, not a leak.
+  let proc;
+  try {
+    writeFileSync(systemPromptFile, systemPrompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    if (toolBridge) {
+      writeFileSync(toolBridge.toolsFile, JSON.stringify(opts.tools), { encoding: "utf8", mode: 0o600, flag: "wx" });
+      writeFileSync(toolBridge.configFile, JSON.stringify(buildBridgeConfig({
+        nodeBin: process.execPath, bridgeScript: MCP_BRIDGE_SCRIPT, toolsFile: toolBridge.toolsFile,
+      })), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    }
+    proc = spawn(CLAUDE, cliArgs, spawnOpts);
+  } catch (e) {
+    // Covers BOTH the write failing and spawn() throwing synchronously (the #193 shape). Every
+    // later exit path -- including a FAILED spawn, which emits 'error'/'close' -- reaches
+    // cleanup(). force:true makes this a no-op when the write itself is what failed.
+    //
+    // UNTESTED, and this is the SECOND untested guard here rather than the first (`flag: "wx"` is
+    // the other) -- an independent review found the count wrong by deleting this line and getting
+    // 5 passed / 0 failed. Only the write-failure arm is exercised (the TMPDIR test), where no
+    // file exists and this is a no-op; nothing reaches a SUCCESSFUL write followed by a
+    // synchronous spawn() throw. That is not for want of looking. The two levers this repo already
+    // owns are both closed: a NUL byte in argv does make spawn() throw synchronously
+    // (ERR_INVALID_ARG_VALUE, measured) but the model is validated and rejected as "Unknown model"
+    // long before the spawn, and #193's --stack-size spread throw fires inside buildCliArgs, which
+    // runs BEFORE the write. So NO LEVER IN THIS REPO REACHES IT and one would have to be built
+    // -- a production fault hook, which AGENTS.md says not to add. That is the scope actually
+    // established: two levers checked and closed, NOT a proof that no lever exists. Recorded so
+    // the next reader does not re-derive the two, and knows what is still open.
+    try { rmSync(systemPromptFile, { force: true }); } catch { /* never mask the real error */ }
+    if (toolBridge) {
+      try { rmSync(toolBridge.toolsFile, { force: true }); } catch { /* same */ }
+      try { rmSync(toolBridge.configFile, { force: true }); } catch { /* same */ }
+    }
+    throw e;
+  }
   // #365 (the other half of #359): decode the child's stdout/stderr as UTF-8 ONCE, here, at the
   // shared spawn boundary — this function is the SOLE spawn site for the -p/stream-json path and
   // callClaude + callClaudeStreaming are its only two callers, so these two lines cover all four
@@ -1706,7 +2179,11 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   function cleanup() {
     if (cleaned) return;
     cleaned = true;
-    clearTimeout(overallTimer);
+    // #474 + review P2: this deliberately does NOT clear overallTimer. 'exit' (this listener)
+    // means the PARENT died — not that the request settled. An abandoned grandchild can still be
+    // holding the stdout pipe, keeping 'close' — and the client — pending past the deadline. The
+    // watchdog must outlive 'exit'; the 'close' listener below clears it instead. A timer that
+    // survives 'exit' is harmless in every settled case: fireTimeout() bails on childClosed.
     stats.activeRequests--;
     // FIX ⑥: free the concurrency slot for a queued waiter. releaseSlot is itself idempotent,
     // and cleanup() is guarded by `cleaned`, so the slot is released exactly once on the first
@@ -1717,6 +2194,14 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // queued fallback waiter re-checks resolveSpawnToken() and proceeds ISOLATED with the now-fresh
     // token instead of piling into the real HOME. Idempotent; cleanup() is guarded by `cleaned`.
     try { if (decision.releaseFallback) decision.releaseFallback(); } catch { /* never throw out of cleanup */ }
+    // The --system-prompt-file temp file is single-use. cleanup() is the sole removal site for
+    // every path past a successful spawn, and it is reached on 'exit' (wired below) as well as on
+    // the 'close'/'error' the CALLERS wire -- which is why a failed spawn also removes it.
+    try { rmSync(systemPromptFile, { force: true }); } catch { /* a missing file is the success case */ }
+    if (toolBridge) {
+      try { rmSync(toolBridge.toolsFile, { force: true }); } catch { /* same */ }
+      try { rmSync(toolBridge.configFile, { force: true }); } catch { /* same */ }
+    }
   }
 
   // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
@@ -1727,6 +2212,16 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // beyond) the SIGKILL escalation actually reaped it. cleanup() is idempotent
   // so this listener is safe alongside the existing 'close'/'error' paths.
   proc.once("exit", cleanup);
+
+  // #474 + review P2: 'close' (child reaped AND every stdio pipe released) is the moment a
+  // request settles — 'exit' alone is not. Both lanes settle only on 'close', so a parent that
+  // exits while an abandoned grandchild still holds the stdout pipe leaves the request pending
+  // with no watchdog if the timer died with 'exit'. childClosed is therefore the one signal
+  // fireTimeout() bails on: by the deadline, "close delivered" means settled (success, a
+  // caller-handled failure, or a kill site's own close path), and "close NOT delivered" means
+  // the client is still hanging — act, regardless of whether the parent already exited.
+  let childClosed = false;
+  proc.on("close", () => { childClosed = true; clearTimeout(overallTimer); });
 
   function handleSessionFailure() {
     // Phase 6c: session resume (--resume/--session-id) is no longer used;
@@ -1754,28 +2249,83 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   proc.stdin.end();
 
   recordModelRequest(cliModel, promptChars);
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  // `effort` only when `--effort` is in argv: the one place an operator can confirm what level a
+  // client's `reasoning_effort` actually ran at. Absent => this line is unchanged.
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars, systemPromptChars: systemPrompt.length, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none", ...(opts.effort ? { effort: opts.effort } : {}),
+    // #512: prefix stability, observable without logging content. The prompt cache matches
+    // tools -> system -> messages in that order, so a sha that changes between two requests of one
+    // conversation names the layer that invalidated everything after it.
+    systemPromptSha: shortSha(systemPrompt), ...(toolBridge ? { toolsSha: shortSha(JSON.stringify(opts.tools)) } : {}), blockCount,
+    ...(useStreamJson && bpTtl ? { cacheBreakpoint: bpTtl } : {}) });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
   // making first-byte/idle timeouts unreliable. One generous timeout is simpler and correct.
-  const overallTimer = setTimeout(() => {
-    if (!cleaned) {
-      stats.timeouts++;
-      recordModelError(cliModel, true);
-      breakerRecordTimeout(cliModel);
-      logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT, elapsed: Date.now() - t0 });
-      try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+  // #474 + review P1: the decision is re-checked ONE TICK after the deadline, because libuv runs
+  // the timers phase BEFORE the poll phase that delivers a child's 'exit' (and its 'close'). A
+  // child that finishes in the same iteration as the deadline is still un-settled when this
+  // timer fires — acting immediately would convert a success into a 500 (and append a
+  // proxy_error frame to a finished stream) and pollute the one-failure-one-count accounting the
+  // timeout exists to protect. By the next tick the queued 'exit'+'close' have been delivered,
+  // childClosed is true, and fireTimeout() below bails. A genuine timeout costs exactly this one
+  // tick (~1 ms).
+  function fireTimeout() {
+    // Settled (or settling) ⇒ the deadline watchdog has nothing left to do. Note the deliberate
+    // asymmetry with `cleaned`: a parent that exited EARLIER while an abandoned grandchild still
+    // holds the stdout pipe is NOT finished — 'close' is still pending and the client is still
+    // hanging (the stuck-pipe shape of the #474 hang). Bailing on exitCode/cleaned there would
+    // re-create the exact defect this fix eliminates, so the guard is childClosed alone: by the
+    // deadline, a pending close means hang, and the group kill below is its answer (a no-op for
+    // the already-reaped parent, the fix for the orphan).
+    if (childClosed) return;
+    // A kill site (client disconnect / tool-quiesce / shutdown sweep) already owns this child.
+    // Its own close path keeps the accounting; settling here too would double-count a failure.
+    // (It also fixes the disconnect-just-before-deadline echo: without this skip the timer would
+    // set timedOut and suppress the close path's only usage record for a full-length failure.)
+    if (proc.killed) return;
+    stats.timeouts++;
+    recordModelError(cliModel, true);
+    breakerRecordTimeout(cliModel);
+    logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT, elapsed: Date.now() - t0 });
+    // #474: kill the whole group, not just the direct child — see killChildTree. The pre-#474
+    // per-process kill left a pipe-holding grandchild alive, which is what kept the request open.
+    killChildTree(proc, "SIGTERM");
+    scheduleKillEscalation(proc, killChildTree); // #500
+    // #474: the TIMER must answer the client, not just the stream. The stream may never close
+    // (a grandchild holding the stdout pipe keeps 'close' pending even after the parent dies),
+    // and both callers settle ONLY on 'close' — so without this the request hangs past the
+    // timeout indefinitely, which is the defect, not the timeout. onTimeout settles the request
+    // at the deadline: the buffered lane rejects (→ the caller's catch records usage and
+    // respondUpstreamError answers 500 proxy_error) and the streaming lane ends its SSE stream
+    // with an error frame + [DONE]. Kill first, then notify: if onTimeout throws, the process
+    // is already dying, and that is the resource that has to be reaped.
+    if (opts.onTimeout) {
+      try { opts.onTimeout(); } catch (e) { logEvent("error", "timeout_notify_failed", { model: cliModel, error: e.message }); }
     }
+  }
+  let deferredFire = null;
+  const overallTimer = setTimeout(() => {
+    // Same oracle as fireTimeout: skip the deferral only when settlement (close) or another
+    // kill site already owns the child. `cleaned` must NOT gate this — in the stuck-pipe shape
+    // the parent has already exited (cleaned=true) and the watchdog is precisely what is needed.
+    if (!childClosed && !proc.killed) deferredFire = setTimeout(fireTimeout, 0);
   }, TIMEOUT);
 
   // Clear ONLY the request timer (not the slot accounting) when the response has
   // semantically completed (result/[DONE]) but the child hasn't exited yet — prevents
-  // a spurious post-success timeout. cleanup() (on exit) still clears it idempotently. (issue #111)
-  function clearOverallTimer() { clearTimeout(overallTimer); }
+  // a spurious post-success timeout. The 'close' listener clears it idempotently too. (issue #111)
+  // It must ALSO cancel the deferred fireTimeout: the outer timer can fire in the same
+  // iteration as the completion (timers phase before poll phase) and schedule the deferral,
+  // and a deferral that survives the completion would SIGTERM a child that just delivered a
+  // success and record a timeout for it — the mislabel the deferral exists to prevent, in a
+  // ~1 ms window. Once the response is done, no watchdog may remain at all.
+  function clearOverallTimer() {
+    clearTimeout(overallTimer);
+    if (deferredFire) { clearTimeout(deferredFire); deferredFire = null; }
+  }
 
-  return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte };
+  return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte,
+           cacheBreakpoint: useStreamJson ? bpTtl : null };
 }
 
 // ── Call claude CLI (non-streaming) ─────────────────────────────────────
@@ -1790,7 +2340,27 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 // `res` (optional, F2) is the client's http.ServerResponse — passed through so a queued wait
 // can be cancelled the moment the client disconnects, instead of spawning claude for a dead
 // socket once a slot finally frees up.
-async function callClaude(model, messages, conversationId, keyName, res) {
+// `opts.tools` (ADR 0022) turns this into a tool turn: the spawn gets the MCP bridge, and the
+// promise resolves with `{ toolCalls, text }` instead of a string when the model calls one of
+// the client's tools. Every other caller passes no opts and sees a string, as before.
+async function callClaude(model, messages, conversationId, keyName, res, opts = {}) {
+  // #460: stats.errors must move by exactly ONE per failed request, and before this it moved by
+  // 0, 1 or 2 depending on HOW the request failed. trackError() is global and every arm of this
+  // lane calls it independently, so a failure that trips two arms counted twice -- MEASURED: a
+  // spawn that fails asynchronously fires both 'error' and 'close', and one request moved the
+  // counter by 2 (reproduced identically on v3.32.0, so it long predates #459). ADR 0018 defines
+  // the field as "any upstream failure on either lane" -- one failure, one count.
+  //
+  // The guard is per-REQUEST because that is the unit the field counts. A global flag would
+  // silence concurrent requests' errors; a per-arm flag would not compose across arms, which is
+  // exactly the bug. It is deliberately NOT inside trackError(): that function is also reached
+  // from callClaudeTui and from paths outside a request, and giving it hidden per-call-site state
+  // would make it lie to those callers.
+  let errorCounted = false;
+  const countError = (msg) => { if (errorCounted) return; errorCounted = true; trackError(msg); };
+  // Mirrors callClaudeStreaming's flag of the same name: an is_error result is a PROTOCOL
+  // failure with a zero exit code, so the close handler cannot see it from `code` alone.
+  let errored = false;
   // FIX ⑥: acquire a concurrency slot first (queues up to CLAUDE_MAX_QUEUE; rejects with a
   // ConcurrencyOverflowError → 429 when the queue is full, or a RequestDisconnectedError (F2)
   // if the client goes away first). The release fn is passed into the spawn so the idempotent
@@ -1808,25 +2378,117 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     spawnDecision = await resolveSpawnDecision();
   } catch (err) {
     releaseSlot();
+    // #458, same lane one step earlier. DEFENSIVE, AND UNREACHABLE IN THIS TREE -- it covers
+    // nothing today and no mutation can redden it, which is exactly why it has to say so. An
+    // earlier draft of this comment claimed resolveSpawnDecision "can throw", read straight off
+    // the rethrow arm: the AGENTS.md defect of describing a branch from its shape rather than
+    // from what can reach it. That rethrow is its only `throw`, and none of its five callees gets
+    // there -- getSpawnHomeMode wraps its one fallible call in try/catch, resolveSpawnToken is
+    // `try { ... } catch { return null }`, ensureSpawnHome delegates to prepareSpawnHome whose
+    // ENTIRE body is one try/catch, invalidateKeychainReadCache is `_keychainCache.clear()` --
+    // createTtlCache's clear (lib/spawn-auth.mjs), three closure-variable assignments, NOT a Map
+    // despite the `.clear()` shape, which is this file's own "read what assigns the value, not what
+    // it is called" applied to an enumeration meant to be re-derived -- and createSerialMutex's
+    // acquire() chains on a promise that is only ever RESOLVED.
+    //
+    // Negative control for the most plausible of the five, measured rather than argued: with
+    // $HOME/.ocp at 0500 and spawn-home deleted at runtime -- so prepareSpawnHome's mkdirSync
+    // takes EACCES -- the request gets PAST this catch and 500s downstream on `spawn ... ENOENT`.
+    // Kept because the rethrow exists so a FUTURE fallible call inside that try still releases the
+    // mutex; if one is ever added, this counts it.
+    countError(err.message);
     throw err;
   }
   return new Promise((resolve, reject) => {
     let ctx;
+    // #474: set by the overallTimer's onTimeout (below). When it is, the timer has ALREADY
+    // answered the client (this reject) and already counted the request as a TIMEOUT — the
+    // 'close' that eventually fires is a reap, not a second failure (see the close handler).
+    let timedOut = false;
     try {
-      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot, spawnDecision);
+      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot, spawnDecision, {
+        ...opts,
+        onTimeout: () => {
+          timedOut = true;
+          reject(new Error(`claude request timed out after ${TIMEOUT}ms`));
+        },
+      });
     } catch (err) {
       releaseSlot();
       // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
       try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
+      // #458: count it. trackError() is the ONLY place stats.errors++ happens. Of its six
+      // pre-existing call sites FIVE are child-process events on the -p lanes (two here, three in
+      // callClaudeStreaming); the sixth is callClaudeTui's catch, added by ADR 0018 -- which is
+      // also where the governing rule is written: stats.errors counts "any upstream failure on
+      // either lane". A SYNCHRONOUS throw here happens before any of those listeners exist, so the
+      // request 500s while stats.errors and recentErrors both stay silent, and that rule goes
+      // unmet. Measured: three requests under an unwritable TMPDIR gave totalRequests=3,
+      // oneOffRequests=3, errors=0 and recentErrors=[] -- /health read "three requests, no errors"
+      // for three requests that had all failed. #180/#193's activeRequests leak, one counter over.
+      //
+      // Counted HERE and not in the caller's catch: the child-process paths already call
+      // trackError and THEN reject (the `claude_exit` and proc.on("error") arms), so a trackError
+      // in the outer catch would double-count them -- proven by mutation, which reddens the
+      // control test rather than the main one.
+      //
+      // That is NOT the stronger claim that every child failure is counted exactly once today.
+      // #460 records three kinds where stats.errors is already wrong, all pre-existing and none of
+      // them touched here: an is_error result (child exits 0) counts 0 on this lane and 2 on the
+      // streaming one, and a spawn that fails ASYNCHRONOUSLY fires both 'error' and 'close', so
+      // one request counts 2 -- measured identically on v3.32.0, which is the attribution.
+      //
+      // RequestDisconnectedError cannot reach here -- acquireClaudeSlot runs before this try -- so
+      // no exclusion is needed; adding one would be dead code.
+      countError(err.message);
       return reject(err);
     }
 
-    const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
+    const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte, cacheBreakpoint } = ctx;
     let lineBuffer = "";
     let assembledText = "";
     let sawTextDelta = false;
     let resultEventSeen = false;
+    let resultUsage = null; // #512
     let stderr = "";
+    // ADR 0022: set when the model called a bridged tool. The spawn is ended on purpose at that
+    // point, so `close` must read this BEFORE treating a non-zero exit as a failure.
+    let toolCalls = null;
+    let toolText = "";
+    // #478: tool_use blocks ACCUMULATE and the turn ends on the message-end signal, not on the
+    // first call. The CLI emits one `assistant` event per content block, so a message carrying two
+    // parallel calls arrives as two events ~100 ms apart; ending on the first handed the client
+    // 1 of N and the model re-issued the rest next turn -- converging, at one wasted round trip
+    // each, with a history that diverged from what the model actually emitted.
+    const pendingToolUses = [];
+    let pendingToolText = "";
+    let toolQuiesceTimer = null;
+    // ONE ending, two triggers, so the two cannot drift apart. `reason` is logged because the
+    // difference is operationally load-bearing: "signal" is the healthy path, and a run of
+    // "quiescence" means the CLI stopped emitting the stop reason and this build is one release
+    // away from having no end signal at all.
+    //
+    // THE `toolCalls` CHECK BELOW IS NOT INDEPENDENTLY PINNED, and that is recorded rather than
+    // dressed up. Three things stop the timer double-counting a turn the signal already ended: this
+    // check, the clearTimeout on the next line, and a third clearTimeout in the close handler.
+    // Removing any ONE leaves the other two, so no single mutation reddens -- measured twice, and
+    // the second attempt instrumented the timer to find out why: with BOTH clears removed the timer
+    // still never fired, because ending the turn kills the spawn and the close handler clears it
+    // before the budget elapses. Keep it as the cheap third line; do not claim a row for it.
+    const endToolTurn = (reason) => {
+      if (toolCalls || !opts.tools || !pendingToolUses.length) return;
+      if (toolQuiesceTimer) { clearTimeout(toolQuiesceTimer); toolQuiesceTimer = null; }
+      toolCalls = pendingToolUses.slice();
+      toolText = pendingToolText || assembledText;
+      stats.toolCallsEmitted++;
+      logEvent(reason === "signal" ? "info" : "warn", "openai_tool_calls",
+        { model: cliModel, count: toolCalls.length, names: toolCalls.map((u) => u.name).slice(0, 8), endedOn: reason, signalMissing: reason !== "signal" });
+      // End the spawn rather than let it block on the bridge (which never answers tools/call --
+      // see lib/mcp-bridge.mjs). SIGTERM first, SIGKILL after the same 5 s the timeout path uses.
+      // #474: the whole group — a grandchild holding the pipe would otherwise keep 'close' pending.
+      killChildTree(proc, "SIGTERM");
+      scheduleKillEscalation(proc, killChildTree); // #500
+    };
 
     proc.stdout.on("data", (d) => {
       markFirstByte();
@@ -1842,6 +2504,48 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       for (const event of events) {
         const parsed = parseStreamJsonEvent(event, sawTextDelta);
         if (!parsed) continue;
+        if (parsed.toolUses) {
+          // Only a tool-bridge spawn acts on these. A spawn with no bridge cannot legitimately emit
+          // an mcp__ocp__ call, but the parser is shared and a fake can, so the guard is here where
+          // the decision is: on a non-bridge spawn the text half is kept and the calls are dropped.
+          if (!opts.tools) {
+            if (parsed.text && !sawTextDelta) {
+              if (assembledText && !assembledText.endsWith("\n")) assembledText += "\n\n";
+              assembledText += parsed.text;
+            }
+            continue;
+          }
+          // The turn is over: the model chose a tool the CLIENT owns. End the spawn now rather than
+          // let it block on the bridge (which never answers tools/call -- see lib/mcp-bridge.mjs),
+          // and hand the calls up. SIGTERM first, SIGKILL after the same 5 s the timeout path uses.
+          if (!toolCalls) {
+            pendingToolUses.push(...parsed.toolUses);
+            // BOUND THE WAIT. Name-gating the flag at boot proves the CLI ACCEPTS
+            // --include-partial-messages; it proves nothing about the CLI still EMITTING
+            // `message_delta.stop_reason: "tool_use"`. A build that accepts the flag and renamed
+            // the stop reason would send every tool request into the close-time fail-safe, which
+            // cannot end the spawn -- so each one would block on the silent bridge until
+            // CLAUDE_TIMEOUT. That is WORSE than the fast-but-truncated behaviour this change
+            // replaced, and it would not fail at boot. Found by review; the gate validated the
+            // flag's name and not the contract the flag exists for.
+            //
+            // So: once a call is in hand, the turn ends either on the signal or on quiescence,
+            // whichever comes first. The fallback then costs a bounded delay instead of a timeout,
+            // and delivers at least what 3.34.0 delivered.
+            if (!toolQuiesceTimer) {
+              toolQuiesceTimer = setTimeout(() => {
+                endToolTurn("quiescence");
+              }, TOOL_TURN_QUIESCE_MS);
+              if (typeof toolQuiesceTimer.unref === "function") toolQuiesceTimer.unref();
+            }
+            // The tool event's own text is empty whenever the preamble arrived as its own block
+            // (measured), so this is additive rather than an assignment, and `assembledText` is the
+            // fallback below -- between them the preamble survives either shape.
+            if (parsed.text) pendingToolText += parsed.text;
+          }
+          continue;
+        }
+        if (parsed.toolTurnEnd) { endToolTurn("signal"); continue; }
         if (parsed.text !== undefined) {
           if (parsed.fromDelta) {
             assembledText += parsed.text;
@@ -1854,8 +2558,39 @@ async function callClaude(model, messages, conversationId, keyName, res) {
           }
         } else if (parsed.stop) {
           resultEventSeen = true;
+          resultUsage = parsed.usage;
         } else if (parsed.error) {
-          // is_error result — treat as process error
+          // is_error result — treat as process error.
+          //
+          // #460: `errored` is set here for the same reason callClaudeStreaming sets it, and its
+          // absence on THIS lane was the whole defect. The child exits 0 (an is_error result is a
+          // PROTOCOL failure, not a process one), so without it the close handler below reads
+          // `code === 0` and takes the SUCCESS branch for a request that just 500'd. [measured]
+          // one such request left stats.errors at 0, logged `claude_ok`, recorded a per-model
+          // SUCCESS, and called noteAuthVerifiedByRequest() -- which is wire-visible: /health
+          // reported auth.ok=true, okSource="request", "verified by a completed request", for a
+          // request that returned 500. ADR 0014 is the authority and its rule is ONE SENTENCE with
+          // two halves: "A request that reaches the model AND SUCCEEDS proves the credential is
+          // valid. A request that FAILS proves something, and OCP already counts those
+          // (stats.errors, recentErrors)." This flag brings both halves into conformance at once.
+          //
+          // NOT a claim about the circuit breaker. breakerRecordSuccess is an EMPTY STUB
+          // (server.mjs, `function breakerRecordSuccess(_cliModel) {}`; the breaker was removed in
+          // v2.5.0 and /health reports circuitBreaker "disabled"), and there is no failure
+          // recorder at all -- so "this would never trip the breaker" is true of EVERY failure and
+          // says nothing about this one. An earlier revision of this comment claimed it as a
+          // consequence of the missing flag, stamped [measured], with no observable that would
+          // differ. Read what assigns the value, not what it is called.
+          errored = true;
+          // #460 F5: count it HERE, with the upstream's own message, mirroring
+          // callClaudeStreaming's parsed.error arm. Without this the close handler counts it
+          // instead and records `claude exit 0` -- an operator-facing string that carries no
+          // diagnostic and reads as a SUCCESSFUL exit, for the failure it is reporting. Free of
+          // double-counting precisely because of the per-request guard above: the close handler's
+          // countError becomes a no-op. That is the guard paying for itself rather than merely
+          // preventing a regression.
+          noteCacheBreakpointRejection(parsed.error, cacheBreakpoint);
+          countError(String(parsed.error).slice(0, 200));
           reject(new Error(String(parsed.error)));
         }
       }
@@ -1870,19 +2605,57 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       activeProcesses.delete(proc);
       const elapsed = Date.now() - t0;
       cleanup();
+      // #478 LAST-DITCH ARM: the process ended before EITHER trigger fired -- before the signal
+      // and before the quiescence timer. Deliver what the model did emit rather than drop it.
+      //
+      // WHAT IT DOES NOT COVER, stated because an earlier version of this comment claimed it did:
+      // a spawn that dies with a non-zero exit sets `errored`, and the send gate below is
+      // `toolCalls && !errored`, so those calls are dropped -- the same outcome as before #478.
+      // Extending delivery to an errored turn is a different decision (a partial or invalid call
+      // from a transport failure is not the same thing as a finished one) and is not made here.
+      if (toolQuiesceTimer) { clearTimeout(toolQuiesceTimer); toolQuiesceTimer = null; }
+      // #474: the overall timer fired first. It already answered the client (the reject in
+      // onTimeout above → 500 via the caller's catch + respondUpstreamError) and already counted
+      // this request as a TIMEOUT (stats.timeouts, recordModelError(true), breakerRecordTimeout
+      // in the timer). This close is that kill landing — a REAP, not a second failure. Falling
+      // through would double-record: recordModelError(false) + countError would move stats.errors
+      // for an event ADR 0018 classifies as a timeout (one failure, one count), and the
+      // last-ditch arm below would emit tool_calls for a request whose response is already gone.
+      if (timedOut) {
+        logEvent("info", "claude_reaped_after_timeout", { model: cliModel, code, signal: signal || "none", elapsed });
+        return;
+      }
+      if (!toolCalls && !errored && opts.tools && pendingToolUses.length) {
+        toolCalls = pendingToolUses.slice();
+        toolText = pendingToolText || assembledText;
+        stats.toolCallsEmitted++;
+        logEvent("warn", "openai_tool_calls", { model: cliModel, count: toolCalls.length, names: toolCalls.map((u) => u.name).slice(0, 8), endedOn: "close", signalMissing: true });
+      }
       // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
       // as OLP commit 2864275 — bwrap shell exits null after model completes).
-      if (code !== 0 && !resultEventSeen) {
+      if (toolCalls && !errored) {
+        // A deliberate end, not a failure: no error is recorded, no session failure is signalled,
+        // and the request completes normally with tool_calls. resultEventSeen is false here by
+        // construction (the spawn was killed before it could finish), which is why this check
+        // precedes the exit-code one.
+        recordModelSuccess(cliModel, elapsed);
+        breakerRecordSuccess(cliModel);
+        noteAuthVerifiedByRequest();
+        logEvent("info", "claude_ok", { model: cliModel, chars: toolText.length, elapsed, toolCalls: toolCalls.length, session: convId ? convId.slice(0, 12) + "..." : "none" });
+        resolve({ toolCalls, text: toolText });
+        return;
+      }
+      if ((code !== 0 && !resultEventSeen) || errored) {
         recordModelError(cliModel, false);
-        logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
-        trackError(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`);
+        logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
+        countError(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`);
         handleSessionFailure();
         reject(new Error(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`));
       } else {
         recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
         noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
-        logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+        logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none", ...(resultUsage || {}) });
         resolve(assembledText);
       }
     });
@@ -1890,7 +2663,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     proc.on("error", (err) => {
       console.error(`[claude] spawn error: ${err.message}`);
       cleanup();
-      trackError(err.message);
+      countError(err.message);
       handleSessionFailure();
       reject(err);
     });
@@ -2306,6 +3079,20 @@ function startHeartbeat(res, intervalMs, sessionId) {
 // The result event triggers the stop/[DONE] sequence.
 // Reference: OLP ADR 0009 Amendment 1 + commits 97e7d16, 65f945c.
 async function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}) {
+  // #460: stats.errors must move by exactly ONE per failed request, and before this it moved by
+  // 0, 1 or 2 depending on HOW the request failed. trackError() is global and every arm of this
+  // lane calls it independently, so a failure that trips two arms counted twice -- MEASURED: a
+  // spawn that fails asynchronously fires both 'error' and 'close', and one request moved the
+  // counter by 2 (reproduced identically on v3.32.0, so it long predates #459). ADR 0018 defines
+  // the field as "any upstream failure on either lane" -- one failure, one count.
+  //
+  // The guard is per-REQUEST because that is the unit the field counts. A global flag would
+  // silence concurrent requests' errors; a per-arm flag would not compose across arms, which is
+  // exactly the bug. It is deliberately NOT inside trackError(): that function is also reached
+  // from callClaudeTui and from paths outside a request, and giving it hidden per-call-site state
+  // would make it lie to those callers.
+  let errorCounted = false;
+  const countError = (msg) => { if (errorCounted) return; errorCounted = true; trackError(msg); };
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -2334,19 +3121,42 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     spawnDecision = await resolveSpawnDecision();
   } catch (err) {
     releaseSlot();
+    countError(err.message); // #458 — defensive and unreachable in this tree; see callClaude's twin.
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
   let ctx;
+  // #474: set by the overallTimer's onTimeout (below). When it is, the timer has ALREADY ended
+  // the client's SSE stream and already recorded this request — the 'close' that eventually
+  // fires is a reap, not a second failure (see the close handler).
+  let timedOut = false;
   try {
-    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot, spawnDecision);
+    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot, spawnDecision, {
+      effort: authInfo.effort,
+      onTimeout: () => {
+        timedOut = true;
+        if (res.writableEnded || res.destroyed) return;
+        const elapsed = Date.now() - t0;
+        // Usage continuity: the close branch records success:false for a failed request, and a
+        // timed-out request consumed its prompt — so the timer records it HERE, and the close
+        // handler (which sees timedOut) must not record it a second time.
+        try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+        // The eager headers (D4) make the status unchangeable — the failure rides in the frame,
+        // terminated by [DONE], exactly like the parsed.error arm.
+        sendSSE(res, { error: { message: `request timed out after ${Math.round(TIMEOUT / 1000)}s`, type: "proxy_error" } }, hb);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      },
+    });
   } catch (err) {
     releaseSlot();
     // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
     try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
+    // #458 — see the twin in callClaude for why this is counted here rather than in the caller.
+    countError(err.message);
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
-  const { proc, cliModel, conversationId: convId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte } = ctx;
+  const { proc, cliModel, conversationId: convId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte, cacheBreakpoint } = ctx;
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
@@ -2355,10 +3165,17 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   let lineBuffer = "";
   let sawTextDelta = false;
   let resultEventSeen = false;
+  let resultUsage = null; // #512
   // Separate flag for is_error result — must NOT be conflated with resultEventSeen.
   // If errored===true the close handler must not cache the response or record success
   // (mirrors callClaude which rejects and never caches on is_error).
   let errored = false;
+  // ONE request must move the counter by at most one. Both streaming error arms can fire for a
+  // single failure -- the is_error arm sets `errored`, which is exactly what makes the close
+  // handler take its error branch too -- so a wall that appears in the result event AND on stderr
+  // would otherwise be counted twice, and a counter that over-reports is no more usable than one
+  // that reads zero.
+  let rateLimitCounted = false;
 
   function ensureHeaders() {
     if (res.writableEnded || res.destroyed) return false;
@@ -2423,6 +3240,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       } else if (parsed.stop) {
         // result event — emit stop and [DONE] immediately
         resultEventSeen = true;
+        resultUsage = parsed.usage;
         if (!ensureHeaders()) continue;
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
@@ -2439,15 +3257,31 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         // cause the close handler to record success + write cache). Set errored instead.
         errored = true;
         const errStr = String(parsed.error);
+        noteCacheBreakpointRejection(errStr, cacheBreakpoint);
         logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
-        trackError(errStr.slice(0, 200));
+        countError(errStr.slice(0, 200));
+        // Classified and COUNTED here even though the status is already 200 -- see
+        // noteUpstreamRateLimit for why this lane cannot answer 429 and why counting it anyway is
+        // the point. The frame's `type` is deliberately left as it was; changing it is a separate
+        // question with its own issue, and it was MEASURED to buy the motivating consumer nothing
+        // (an agent framework fails over on this frame today, whatever the type says).
+        if (!rateLimitCounted) rateLimitCounted = noteUpstreamRateLimit(errStr, "streaming").rateLimit;
+        // UNREACHABLE ON THIS PATH, and a review had to ask, so: `ensureHeaders()` ran
+        // unconditionally above and returns false ONLY when the response is already ended or
+        // destroyed -- flags that do not un-set. So `!headersSent` implies ended-or-destroyed,
+        // which makes the rest of this condition false. Kept as the defensive shape the other
+        // handlers use; if it ever does become reachable it should classify like the buffered lane
+        // rather than hard-code 500, or the counter and the wire would disagree.
         if (!headersSent && !res.writableEnded && !res.destroyed) {
           jsonResponse(res, 500, { error: { message: sanitizeError(errStr), type: "provider_error" } });
         } else if (!res.writableEnded && !res.destroyed) {
           // Headers already sent (eager ensureHeaders) — can't send a JSON 500. Surface the
           // failure as an SSE error frame so the client can distinguish an upstream error
           // from a legitimately empty completion, instead of a success-looking finish_reason:"stop". (issue #110)
-          sendSSE(res, { error: { message: sanitizeError(errStr), type: "provider_error" } }, hb);
+          // #482: type the frame what the counter already says it is — rateLimitCounted was set
+          // from THIS message (errStr) above, so wire and /health agree by construction. The
+          // status stays 200 (it cannot be un-sent); only the type moves.
+          sendSSE(res, { error: { message: sanitizeError(errStr), type: rateLimitCounted ? "rate_limit_error" : "provider_error" } }, hb);
           res.write("data: [DONE]\n\n");
           res.end();
         }
@@ -2465,6 +3299,17 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     cleanup();
     const elapsed = Date.now() - t0;
 
+    // #474: the overall timer fired first. It already ended the client's stream (error frame +
+    // [DONE]), recorded usage (success:false) and counted the request as a TIMEOUT (stats.timeouts,
+    // recordModelError(true), breakerRecordTimeout in the timer). This close is that kill
+    // landing — a REAP, not a second failure. Falling through would double-record (recordUsage
+    // again, countError moving stats.errors for a timeout) and — worst — write a second error
+    // frame onto a stream the timer already ended.
+    if (timedOut) {
+      logEvent("info", "claude_reaped_after_timeout", { model: cliModel, code, signal: signal || "none", elapsed });
+      return;
+    }
+
     // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
     // as OLP commit 2864275 — bwrap shell exits null after model completes).
     // Also route to the error path when errored===true (is_error result received):
@@ -2473,7 +3318,8 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       recordModelError(cliModel, false);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
-      trackError(stderr.slice(0, 300) || `claude exit ${code}`);
+      countError(stderr.slice(0, 300) || `claude exit ${code}`);
+      if (!rateLimitCounted) rateLimitCounted = noteUpstreamRateLimit(stderr.slice(0, 300) || `claude exit ${code}`, "streaming").rateLimit;
       handleSessionFailure();
 
       // If the error was already sent inline (parsed.error branch above), the
@@ -2484,7 +3330,9 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         // Headers already sent — surface the failure as an SSE error frame instead of a
         // success-looking finish_reason:"stop", so the client can tell the upstream crashed
         // rather than returned empty. (issue #110 — sibling of the parsed.error branch above.)
-        sendSSE(res, { error: { message: sanitizeError(stderr.slice(0, 300) || `claude exit ${code}`), type: "proxy_error" } }, hb);
+        // #482: a wall that reached us via stderr is rate_limit_error, not proxy_error —
+        // rateLimitCounted was set from THIS string above, so the type matches the counter.
+        sendSSE(res, { error: { message: sanitizeError(stderr.slice(0, 300) || `claude exit ${code}`), type: rateLimitCounted ? "rate_limit_error" : "proxy_error" } }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -2493,7 +3341,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       breakerRecordSuccess(cliModel);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
-      logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+      logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none", ...(resultUsage || {}) });
       // Cache write-back for streaming — only on true success (not errored)
       if (CACHE_TTL > 0 && authInfo.cacheHash) {
         try { setCachedResponse(authInfo.cacheHash, model, cachedContent); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
@@ -2519,7 +3367,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     console.error(`[claude] spawn error: ${err.message}`);
     hb.stop();
     cleanup();
-    trackError(err.message);
+    countError(err.message);
     handleSessionFailure();
     if (!headersSent && !res.writableEnded && !res.destroyed) {
       jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
@@ -2536,10 +3384,12 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     // SIGTERM and the 5s kill-timer entirely (a post-exit proc.once("exit") never fires,
     // so the timer would otherwise leak a closure over proc for 5s per request). (issue #111)
     if (!proc.killed && proc.exitCode === null && proc.signalCode === null) {
-      try { proc.kill("SIGTERM"); } catch {}
+      // #474: the whole group — the client is gone, so nothing waits for 'close' on this lane,
+      // and a pipe-holding grandchild must not outlive the request either.
+      killChildTree(proc, "SIGTERM");
       // Mirror the overallTimer escalation (server.mjs ~818): a SIGTERM-resistant child would
       // otherwise hold its concurrency slot until the request timeout — #37 on the disconnect path. (issue #111)
-      const killTimer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+      const killTimer = setTimeout(() => killChildTree(proc, "SIGKILL"), 5000);
       killTimer.unref();
       proc.once("exit", () => clearTimeout(killTimer));
     }
@@ -2774,11 +3624,73 @@ function jsonResponse(res, status, data, extraHeaders = null) {
 // FIX ⑥: map an upstream error to the right HTTP response. A ConcurrencyOverflowError (the
 // wait-queue was full) becomes HTTP 429 + Retry-After + rate_limit_error; every other error
 // stays a 500 proxy_error (byte-for-byte the pre-fix behaviour for non-overflow errors).
+// Count and log an upstream rate limit, wherever it surfaced. Returns `{ rateLimit, retryAfter }`
+// rather than the seconds alone, because "this was not a rate limit" and "it was, and named no
+// reset time" are different answers that a bare `null` would merge -- and the streaming caller
+// needs the first one to decide whether it has already counted this request.
+//
+// TWO LANES REACH THIS, AND ONLY ONE OF THEM CAN STILL CHOOSE A STATUS CODE. The buffered lane
+// (respondUpstreamError) has sent nothing yet, so it answers 429. The STREAMING lane has already
+// sent `200 text/event-stream` -- deliberately, and before the spawn produces anything: the D4
+// heartbeat spec makes `ensureHeaders()` eager so the heartbeat covers the pre-first-byte silent
+// window (see the call above `startHeartbeat`). A status cannot be un-sent, so a streaming wall is
+// delivered as the SSE error frame #110 introduced and the status stays 200.
+//
+// What the streaming lane CAN do is be counted, and that is why this is a function rather than
+// three lines inside respondUpstreamError: `stats.upstreamRateLimits` answers the operator's
+// question "did we hit the wall, or did the proxy break", and a counter that is blind to the lane
+// most agent traffic uses answers "not the wall" on exactly the deployment that motivated it.
+// WHICH LANE REAL AGENT TRAFFIC TAKES -- CORRECTED, because the first version of this comment drew
+// the wrong conclusion from a correct measurement. Both halves are worth keeping:
+//
+//   OBSERVED, and still true: an agent framework (Hermes 0.21.1) pointed at OCP sends the turn as
+//   `stream: true`.
+//   INFERRED, and false: "so the streaming lane is the common case for agent traffic." That never
+//   checked WHICH HANDLER such a request reaches.
+//
+// The same framework's turn also declares `tools` (20 of them, measured). With tool calling on --
+// the default since 3.34.0 -- a request that declares tools is served by handleToolTurn, which
+// AWAITS callClaude and only renders SSE afterwards. So no headers have been sent when the failure
+// arrives, and it goes through respondUpstreamError with a real 429. Measured against a live
+// 3.35.0 instance whose spawn fails with a wall:
+//
+//   stream:true WITH tools  (the real agent shape) -> HTTP 429,     lane "buffered"
+//   stream:true WITHOUT tools                      -> HTTP 200 SSE, lane "streaming"
+//
+// Counting on the streaming lane is still right, and its justification is now the plain one: a
+// counter that is blind to a reachable lane cannot answer the question it exists for. What it is
+// NOT is the lane an agent lands on. The streaming lane is reached when the request declares no
+// tools, when OCP_TOOL_CALLING=0, or when the request is excluded from the tool path (image
+// content, response_format, legacy `functions`, `tool_choice: "none"`).
+function noteUpstreamRateLimit(message, lane) {
+  if (!isUpstreamRateLimit(message)) return { rateLimit: false, retryAfter: null };
+  stats.upstreamRateLimits++;
+  const retry = retryAfterSeconds(message);
+  logEvent("warn", "upstream_rate_limit", { lane, retryAfter: retry, message: String(sanitizeError(message)).slice(0, 200) });
+  return { rateLimit: true, retryAfter: retry };
+}
+
 function respondUpstreamError(res, err) {
   if (err instanceof ConcurrencyOverflowError) {
     return jsonResponse(res, 429, { error: { message: sanitizeError(err.message), type: "rate_limit_error" } }, { "Retry-After": String(err.retryAfter) });
   }
-  return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
+  // An UPSTREAM rate limit -- the Anthropic subscription wall, or a 429 the CLI surfaced -- is a
+  // 429 too, not a proxy_error. It used to be a 500, which is non-conformant with the OpenAI
+  // specification this endpoint implements and which no client can act on: a rate limit is the one
+  // upstream failure a caller is supposed to be able to wait out or fail over on. See
+  // lib/upstream-errors.mjs for the patterns and for what fails CLOSED (unmatched -> 500, as before).
+  //
+  // Deliberately reported as the SAME shape as the backpressure 429 above: a client should not have
+  // to tell "OCP is full" from "the account is out of quota" to decide what to do, and the message
+  // still carries which it was. Retry-After is attached only when the upstream text actually said
+  // when it resets.
+  const msg = sanitizeError(err.message);
+  if (isUpstreamRateLimit(err.message)) {
+    const { retryAfter } = noteUpstreamRateLimit(err.message, "buffered");
+    return jsonResponse(res, 429, { error: { message: msg, type: "rate_limit_error" } },
+      retryAfter === null ? {} : { "Retry-After": String(retryAfter) });
+  }
+  return jsonResponse(res, 500, { error: { message: msg, type: "proxy_error" } });
 }
 
 function sendSSE(res, data, hb) {
@@ -2800,6 +3712,34 @@ function completionResponse(res, id, model, content) {
 // assistant `refusal` field (content:null, refusal:<text>, finish_reason:"stop") — NOT an invented
 // error type. Structured-output exhaustion emits this so SDK clients take their written `refusal`
 // branch instead of throwing an opaque UnprocessableEntityError. (PR #153 review, finding 3.)
+// ADR 0022: the request ends with the model asking the CLIENT to run a tool. `content` is the
+// text the model wrote in the same message (or null), `toolCalls` is already in OpenAI shape
+// (arguments as a JSON string). finish_reason "tool_calls" is the whole point: it is the value a
+// client branches on, and the one that "stop" was silently standing in for before this ADR.
+function toolCallsResponse(res, id, model, content, toolCalls) {
+  jsonResponse(res, 200, {
+    id, object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content: content || null, tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}
+
+// Streaming form. OpenAI streams tool calls as deltas keyed by `index`, with `function.arguments`
+// permitted to arrive in pieces; one chunk carrying each call whole, with its index, is a valid
+// instance of that -- a client accumulates by index and sees exactly one piece. Text first, then
+// the calls, then the finish_reason, then [DONE]: the same order streamStringAsSSE uses.
+function streamToolCallsAsSSE(res, id, model, content, toolCalls) {
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant", content: content || null }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: toolCalls.map((c, i) => ({ index: i, ...c })) }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
 function refusalResponse(res, id, model, refusal) {
   jsonResponse(res, 200, {
     id, object: "chat.completion",
@@ -2882,6 +3822,18 @@ let oauthRefreshBackoff = { nextAttemptAt: 0, currentDelay: OAUTH_REFRESH_MIN_BA
 // short-TTL keychain cache + a per-use expiry check does not reintroduce the forever-stale bug.
 const KEYCHAIN_LABELS = ["claude-code-credentials", "Claude Code-credentials"];
 const KEYCHAIN_CACHE_TTL_MS = 30 * 1000;
+
+// #455: budget for the boot-time `claude` capability probe. MEASURED at 0.18-0.21s for the
+// success path and 0.11s for the unknown-option path (claude 2.1.250, all three argv shapes
+// buildCliArgs can produce), so this is ~50x the observed cost. Sized generously ON PURPOSE:
+// blowing the budget yields `inconclusive`, which WARNS AND BOOTS, so an over-tight value would
+// silently turn the gate off on a loaded host rather than failing visibly. EXPIRY: if the probe
+// ever starts a model turn -- i.e. if `claude` stops validating options before values -- this
+// budget is the wrong shape entirely and the probe needs rethinking, not a bigger number.
+// Env-configurable for the same reason the other *_TIMEOUT_MS here are: without it the `timeout`
+// verdict is unreachable from a test at any tolerable cost, and an unreachable branch is one this
+// repo has been bitten by twice (#324, ADR 0014).
+const CAPABILITY_PROBE_TIMEOUT_MS = parseIntEnv("CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS", 10000);
 const _keychainCache = createTtlCache({ ttlMs: KEYCHAIN_CACHE_TTL_MS });
 let _lastGoodKeychainLabel = null;
 
@@ -2913,21 +3865,55 @@ function invalidateKeychainReadCache() {
   _keychainCache.clear();
 }
 
+// #475: the three sources are READ, then the winner is CHOSEN -- previously the first source with
+// a token won outright, and the file step below (commented as Linux-only) is not platform-gated, so
+// on a Mac a stale ~/.claude/.credentials.json shadowed the live keychain. Measured: the file's
+// expiresAt six days past, the keychain's four hours ahead, and OCP signing /usage with the dead
+// one while the spawned `claude` used the live one. lib/credential-source.mjs holds the rule (an
+// expired source must not shadow a valid one) and its rows; this function only gathers.
+//
+// The env var keeps its precedence untouched: it carries no expiresAt, so it is never "known
+// expired", and an explicit operator override stays an override.
+//
+// Cost: the keychain is read only when the env var is unset AND the file is absent or expired --
+// the same short-circuit as before #475, plus the expiry check. When it is read it is TTL-cached
+// (30 s), so at most one `security` exec per 30 s. Review caught the first version reading every
+// source eagerly, which would have let a locked keychain block a spawn path that never used it.
+let _credentialSourceLastLogged = null;
 function getOAuthCredentials() {
-  // 1. Env var fallback — highest precedence for explicit overrides.
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    return { accessToken: process.env.CLAUDE_CODE_OAUTH_TOKEN };
+  // Thunks, read LAZILY in precedence order by selectCredential -- a lower source is touched only
+  // if every higher one was absent or expired. So with the env var set, neither the file nor the
+  // keychain is read, exactly as before #475; the keychain exec happens only when it can matter.
+  const candidates = [
+    { source: "env", read: () => (process.env.CLAUDE_CODE_OAUTH_TOKEN ? { accessToken: process.env.CLAUDE_CODE_OAUTH_TOKEN } : null) },
+    { source: "file", read: () => {
+      const credPath = join(homedir(), ".claude", ".credentials.json");
+      const creds = JSON.parse(readFileSync(credPath, "utf8")); // a missing/unreadable file throws; the selector treats that as "absent"
+      return creds?.claudeAiOauth?.accessToken ? creds.claudeAiOauth : null;
+    } },
+    { source: "keychain", read: () => readKeychainCreds() },
+  ];
+
+  const pick = selectCredential(candidates);
+  // Log ONCE per change of outcome, not per call -- this runs on every spawn. What is logged is
+  // the shape of the decision (which source won, which were passed over as expired), never a
+  // token. An operator reading `spawn.reason` stuck on "self-heals on next refresh" needs exactly
+  // this line to learn that the healing source was never the one being read.
+  const key = `${pick.source}|${pick.skipped.join(",")}|${pick.allExpired}`;
+  if (pick.source && key !== _credentialSourceLastLogged) {
+    _credentialSourceLastLogged = key;
+    if (pick.skipped.length || pick.allExpired) {
+      logEvent("warn", "credential_source_selected", { source: pick.source, skippedExpired: pick.skipped, allExpired: pick.allExpired });
+    } else if (pick.source === "env") {
+      // The env var is structurally unshadowable -- it carries no expiresAt, so it always wins --
+      // and review pointed out that makes an env-shadowed host exactly as silent as the file-
+      // shadowed one this change fixes: a stale CLAUDE_CODE_OAUTH_TOKEN in a shell profile next to
+      // a fresh keychain would 401 forever with no line saying why. So the env outcome is logged
+      // once too, at info: it is not a problem, it is the fact an operator needs to have seen.
+      logEvent("info", "credential_source_selected", { source: "env", note: "CLAUDE_CODE_OAUTH_TOKEN is set and takes precedence over the credentials file and the keychain; it is never expiry-checked" });
+    }
   }
-
-  // 2. Linux file-based credentials
-  try {
-    const credPath = join(homedir(), ".claude", ".credentials.json");
-    const creds = JSON.parse(readFileSync(credPath, "utf8"));
-    if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth;
-  } catch { /* fall through to macOS keychain */ }
-
-  // 3. macOS keychain (both label formats) — F5: label-memoized + 30s TTL cached (see above).
-  return readKeychainCreds();
+  return pick.creds;
 }
 
 async function refreshOAuthToken(refreshToken) {
@@ -3424,6 +4410,37 @@ async function runStructuredCompletion(upstreamCall, model, messages, conversati
   throw new StructuredOutputError(lastErr, lastRaw);
 }
 
+// ADR 0022: one tool turn. Spawns claude with the client's tools bridged in, and answers with
+// either `tool_calls` (the model chose a tool; the client runs it and calls back) or plain text
+// (the model answered). Deliberately outside the response cache -- a tool turn's answer depends on
+// tool results the cache key cannot see -- and outside the structured-output and TUI paths, which
+// the dispatch gate already excluded. Error handling mirrors the structured path's.
+async function handleToolTurn(req, res, model, messages, conversationId, parsed, stream) {
+  const t0 = Date.now();
+  const promptChars = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
+  const mintId = () => `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  try {
+    const r = await callClaude(model, messages, conversationId, req._authKeyName, res, { tools: parsed.tools, effort: cliEffort(parsed.reasoning_effort) });
+    const id = `chatcmpl-${randomUUID()}`;
+    if (r && typeof r === "object" && Array.isArray(r.toolCalls)) {
+      const calls = toolUsesToOpenAI(r.toolCalls, mintId);
+      if (stream) streamToolCallsAsSSE(res, id, model, r.text, calls);
+      else toolCallsResponse(res, id, model, r.text, calls);
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: JSON.stringify(calls).length, elapsedMs: Date.now() - t0, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      return;
+    }
+    const content = typeof r === "string" ? r : "";
+    if (stream) streamStringAsSSE(res, id, model, content);
+    else completionResponse(res, id, model, content);
+    try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+  } catch (err) {
+    if (err instanceof RequestDisconnectedError) { try { res.end(); } catch {} return; }
+    try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+    if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
+    return respondUpstreamError(res, err);
+  }
+}
+
 async function handleChatCompletions(req, res) {
   // #359: see handleSettings. Chunk boundaries are chosen by the kernel and the network, so a
   // multi-byte character in a prompt is split unpredictably rather than rarely; setEncoding makes
@@ -3656,6 +4673,192 @@ async function handleChatCompletions(req, res) {
     }
   }
 
+  // #467 / ADR 0021: the request is about to be SERVED, and any tools it declared are being
+  // dropped -- the client will get a text answer it cannot distinguish from a real one. That is the
+  // silent degradation, and until now it left no trace anywhere: HTTP 200, finish_reason "stop",
+  // /health ok, recentErrors empty, clean logs on both sides. It has cost hours twice; ADR 0013's
+  // own Context is the first occurrence, #467 the second.
+  //
+  // PLACED HERE, AFTER EVERY GATE THAT CAN REJECT, and that position is the whole correctness of
+  // the counter rather than a detail. The first version of this sat immediately after
+  // classifyToolRequest -- before model validation, messages validation, image validation and the
+  // quota gate -- so a `tools` request that 400'd for ANY of those reasons still incremented it.
+  // Measured: two malformed-but-tool-carrying requests gave `toolRequestsDropped: 2` with
+  // `totalRequests: 0`, an arithmetic contradiction visible on /health, while the control (same
+  // 400, no tools) stayed at 0. Those 400s are the LOUD case; counting them makes one number mean
+  // two things exactly when someone is trying to read it. Every gate above this line that can
+  // reject now does so BEFORE the count.
+  //
+  // WHAT THIS COUNTS, said positively -- the previous version of this paragraph tried to say it by
+  // enumerating what could still go wrong below, and got the enumeration wrong in two ways at once.
+  //
+  //   `toolRequestsDropped` = requests that DECLARED TOOLS and were therefore going to be answered
+  //   as text, counted at the point the request is accepted for service.
+  //
+  // It is NOT "requests that reached a model", and it is deliberately NOT comparable to
+  // `stats.totalRequests`. An independent review measured two ways that comparison fails, and both
+  // are correct behaviour under the definition above rather than defects to fix:
+  //
+  //   [measured] a plain CACHE HIT (CLAUDE_CACHE_TTL=60, two identical tools requests) gives
+  //     toolRequestsDropped 2 against totalRequests 1 -- both cache lookups are BELOW this line, so
+  //     a served-from-cache request is counted here and never spawns. Its tools really were
+  //     dropped, so the count is right and the comparison is the thing that is meaningless.
+  //   [measured] one `response_format` request took totalRequests 4 -> 7, because the
+  //     structured-output path RETRIES the spawn. totalRequests counts spawns, not requests.
+  //
+  // So `toolRequestsDropped <= totalRequests` was never an invariant, and an earlier revision of
+  // this comment, the CHANGELOG entry and the control test's assertion message all leaned on it.
+  //
+  // BACKPRESSURE BELOW THIS LINE: NOT ENUMERATED, DELIBERATELY. Several paths below can end a
+  // counted request without a spawn, and WHICH ones depends on the lane. The definition above is
+  // independent of that, which is the point -- it is a claim about the decision taken at this line,
+  // not about the outcome.
+  //
+  // This is the FOURTH revision of this paragraph and the first that does not try to list them.
+  // The three before it were each wrong in a new way, all found by review, never by re-reading:
+  //   1. "nothing below it can reject"                          -- false; there is backpressure.
+  //   2. "ONE rejection path remains: ConcurrencyOverflowError" -- one of two on that lane, under a
+  //      `[measured]` tag earned from a burst experiment that only ever exercised overflow.
+  //   3. "TWO throwing exits, both inside spawnClaudeProcess"   -- right count for the -p lane,
+  //      WRONG FUNCTION (acquireClaudeSlot is called from callClaude:2007 and
+  //      callClaudeStreaming:2610; `spawnClaudeProcess` takes `releaseSlot` as a PARAMETER because
+  //      its caller already acquired it -- and the comment at :2253 says so in as many words), and
+  //      not the whole story anyway: under CLAUDE_TUI_MODE the dispatch is callClaudeTui, which
+  //      never calls acquireClaudeSlot at all and has its own gate. [measured] in TUI mode a tools
+  //      request is counted while `concurrency_queue_full` never appears.
+  //
+  // The lesson is not "enumerate more carefully". A list of the ways a thing can go wrong needs
+  // re-deriving on every lane change and silently rots when one is added; the positive definition
+  // does not. Same move as #346, which replaced a CHANGELOG grep with a wire reading rather than
+  // widening the pattern a fourth time.
+  //
+  // The two measurements that motivated all this are kept, because they are what a reader needs:
+  // a disconnect-while-queued gives toolRequestsDropped 2 / totalRequests 1 / queueRejections 0
+  // (same pair without tools: 0), and a cache hit gives 2 / 1. Both are correct under the
+  // definition; what was wrong every time was a sentence about the machinery underneath it.
+  //
+  // NOT FIXED BY MOVING FURTHER DOWN, and that is a decision rather than an omission: the only
+  // position below the slot acquire is inside the spawn, which has two lanes (-p and TUI) and is
+  // retried by the structured-output path. Counting there would silently convert this from
+  // "requests whose tools were dropped" into "spawns" -- a worse defect than the one it fixes, and
+  // the same conflation the paragraph above warns the reader against.
+  //
+  // THE RESPONSE IS DELIBERATELY UNCHANGED. ADR 0013's Alternatives rejected "refuse whenever
+  // `tools` is present" because it would have taken down every OpenClaw agent on the fleet the day
+  // it shipped -- they all send tools and all accept text -- and ADR 0021 keeps that by name. So
+  // this makes the failure OBSERVABLE without making it a failure.
+  //
+  // Logged per request rather than latched: every one of these requests IS degraded, so per-request
+  // is the accurate volume, and it keeps the log and the counter agreeing.
+  const declaredTools = countDeclaredTools(parsed);
+
+  // ADR 0022: a request that declares `tools` is a TOOL TURN, served by its own path, when
+  //   * OCP_TOOL_CALLING is on (the default),
+  //   * the spawn lane is -p (the TUI lane composes its own prompt and has no MCP bridge),
+  //   * the tools are in the modern `tools` shape (the deprecated `functions` shape stays on the
+  //     counted-and-dropped path below; its response format differs and nobody has asked), and
+  //   * no response_format is set (structured output and tool calls are different contracts and
+  //     combining them was never measured).
+  // Everything the old path did before the spawn -- auth, model validation, message validation,
+  // image and quota gates, and classifyToolRequest's refusal of forcing tool_choice shapes -- has
+  // already run above this line and applies here unchanged.
+  //   * IMAGE CONTENT IS NO LONGER EXCLUDED (#477). It was, and the reason is worth keeping because
+  //     it is what the fix had to make false: the multimodal spawn path serialises history through
+  //     buildStreamJsonInput, which did not render tool turns -- so on turn 2 a vision agent saw the
+  //     bridge but not its own prior call or the client's result, and re-called the tool forever.
+  //     MEASURED by #476's independent reviewer with a real model (haiku, claude 2.1.270): turn 2
+  //     given a fresh nonce re-called with identical arguments, nonce absent; the text-only control
+  //     passed. buildImageBlocks now calls the SAME renderToolTurn / endsWithToolResult /
+  //     TOOL_CONTINUATION_NOTE the text path uses, emitting them as text blocks in the same order,
+  //     so the history a vision agent sees on turn 2 is the history a text agent sees.
+  //   * `tool_choice` is not "none". The spec says "none" means the model will not call any tool
+  //     and generates a message -- OCP satisfies that on the plain path, exactly as before, and does
+  //     not count it as a drop because text IS the mandated outcome.
+  const toolChoiceNone = parsed.tool_choice === "none";
+  const useToolCalling = declaredTools > 0 && TOOL_CALLING && !TUI_MODE
+    && Array.isArray(parsed.tools) && parsed.tools.length > 0 && !detectStructuredOutput(parsed)
+    && !toolChoiceNone;
+  // #470: `tools` was never the only field OCP accepts and does not act on. Same answer as #468
+  // gave for tools -- a counter and a log rather than a refusal -- for the same reason: a client
+  // that sends `temperature: 0` out of habit must still get an answer, and 400-ing it would break
+  // working integrations to make a point. What changes is that the silence is countable.
+  //
+  // PLACED HERE for the same reason the tools drop below is: after every gate that can reject, so a
+  // request that 400s is not counted as "served with fields ignored". And ABOVE the useToolCalling
+  // branch, which RETURNS -- a bridged tool request ignores `temperature` exactly as a plain one
+  // does, so counting only the non-tool lane would have made this number mean "requests without
+  // tools that sent an inert field", which is not what its name says.
+  //
+  // "AFTER EVERY GATE THAT CAN REJECT" WAS FALSE THE FIRST TIME, and review measured it: validateTools
+  // lived INSIDE the useToolCalling branch, one line below this count, so a tools request with an
+  // unnamed function and a `temperature` was counted as served and then 400'd --
+  // unhonouredFieldRequests 1 against totalRequests 0, the same arithmetic contradiction the
+  // toolRequestsDropped comment below records catching in its own first version. The validation is
+  // hoisted above the count now; the branch below only dispatches.
+  //
+  // What this deliberately still counts: a request that is ACCEPTED for service and then fails
+  // upstream. That is the sibling counter's definition too ("counted at the point the request is
+  // accepted for service", explicitly NOT "requests that reached a model"), and it is the right
+  // one -- the fields were ignored whether or not the spawn later succeeded.
+  //
+  // LOGGED AT `info`, NOT `warn`, and the difference is not timidity. A dropped `tools` kills an
+  // agent's loop; an ignored `temperature` degrades one answer. More concretely: many clients send
+  // `temperature` on every call, so `warn` here would fire on most traffic and drown the signal
+  // #304 made load-bearing (`warn_count` in the doctor shape). A guard that fires on everything is
+  // worth nothing, and this one is meant to be read as a rate, not an alarm.
+  // The last rejecting gate, hoisted from inside the useToolCalling branch (see the paragraph above).
+  if (useToolCalling) {
+    const bad = validateTools(parsed.tools);
+    if (bad) {
+      return jsonResponse(res, 400, { error: { message: bad, type: "invalid_request_error", param: "tools", code: "invalid_tools" } });
+    }
+  }
+
+  const unhonoured = listUnhonouredFields(parsed, { effortHonoured: !TUI_MODE });
+  // `reasoning_effort` -> `claude --effort`, on the -p lane only (see lib/unhonoured-fields.mjs).
+  const effort = TUI_MODE ? null : cliEffort(parsed.reasoning_effort);
+  if (unhonoured.length) {
+    stats.unhonouredFieldRequests++;
+    logEvent("info", "openai_fields_not_honoured", {
+      model,
+      // Field NAMES only -- never their values. `logit_bias` and `stop` carry client content, and
+      // this log has no rotation of its own (same reasoning as the tool_choice truncation below).
+      // The names are a closed set from lib/unhonoured-fields.mjs, so this line is bounded by that
+      // list rather than by anything the client sends.
+      fields: unhonoured,
+      // Of those, the ones that are not wholly inert: they feed cacheHash, so they partition the
+      // cache without steering the sampler. Named separately because "ignored" is too strong for
+      // them and a reader who greps the code will find the cacheHash use and distrust the rest.
+      cacheKeyOnly: unhonoured.filter((f) => CACHE_KEY_ONLY.has(f)),
+    });
+  }
+
+  if (useToolCalling) {
+    return handleToolTurn(req, res, model, messages, conversationId, parsed, stream);
+  }
+
+  if (declaredTools > 0 && !toolChoiceNone) {
+    stats.toolRequestsDropped++;
+    logEvent("warn", "openai_tools_dropped", {
+      model,
+      declaredTools,
+      // Bounded: this is verbatim client input and nothing upstream limits it. classifyToolRequest
+      // lets any non-forcing string, or any unknown object `type`, through -- a 100 000-character
+      // tool_choice was measured producing a 100 200-byte log line. 1:1 with the request body so
+      // there is no amplification, but this repo's log has no rotation of its own. String() first
+      // because an object's `type` need not be a string.
+      toolChoice: String(typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent")).slice(0, 64),
+      // Which gate kept this request off the tool path. One of: OCP_TOOL_CALLING=0, TUI lane,
+      // `functions` shape, or response_format present. Stated so an operator reading a non-zero
+      // toolRequestsDropped after ADR 0022 does not have to guess which.
+      reason: !TOOL_CALLING ? "OCP_TOOL_CALLING=0" : TUI_MODE ? "tui_lane"
+        : !(Array.isArray(parsed.tools) && parsed.tools.length) ? "legacy_functions_shape"
+        : detectStructuredOutput(parsed) ? "response_format_present"
+        : "unknown",
+      note: "declared tools were not bridged; answered as text",
+    });
+  }
+
   // Structured output (OpenAI response_format / json_mode): its own path — the response must be
   // schema-valid JSON, so it never shares the conversational cache slot. When caching is enabled it
   // uses a structured-keyed hash (isolated via cacheHash's `structured` marker) and writes back ONLY
@@ -3676,7 +4879,7 @@ async function handleChatCompletions(req, res) {
     // asymmetry. If you do deduplicate it, compute once under the WEAKER guard and derive the
     // cache lookup under the stronger one — and add a stampede test before you do.
     if (CACHE_TTL > 0 && !conversationId && !hasCacheControl(messages)) {
-      structuredHash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH });
+      structuredHash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, effort, structured, configEpoch: CONFIG_EPOCH });
       try {
         const cached = getCachedResponse(structuredHash, CACHE_TTL);
         if (cached) {
@@ -3688,7 +4891,7 @@ async function handleChatCompletions(req, res) {
         }
       } catch (e) { logEvent("error", "cache_check_failed", { error: e.message }); }
     }
-    const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
+    const upstreamCall = TUI_MODE ? callClaudeTui : (m, msgs, c, k, r) => callClaude(m, msgs, c, k, r, { effort });
     // Stampede protection (PR #153 review, finding 5): a structured request can cost up to
     // STRUCTURED_MAX_ATTEMPTS metered spawns, so N identical concurrent requests (Home Assistant
     // firing several AI Tasks at once) must NOT each pay N× — they share one flight. We dedup every
@@ -3697,7 +4900,7 @@ async function handleChatCompletions(req, res) {
     // Note the guard here is deliberately WEAKER than structuredHash's — no CACHE_TTL check. See the
     // do-not-collapse comment above (#200).
     const dedupKey = (!conversationId && !hasCacheControl(messages))
-      ? cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH })
+      ? cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, effort, structured, configEpoch: CONFIG_EPOCH })
       : null;
     const runStructured = async () => {
       const c = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
@@ -3746,7 +4949,7 @@ async function handleChatCompletions(req, res) {
     } else {
       // D1: include keyId in hash to isolate per-key cache pools (v2 format).
       // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
-      const hash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
+      const hash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, effort, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
       try {
         const cached = getCachedResponse(hash, CACHE_TTL);
@@ -3796,7 +4999,7 @@ async function handleChatCompletions(req, res) {
       }
     }
     // Default: real stream-json streaming, unchanged.
-    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash });
+    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash, effort });
   }
 
   const t0Usage = Date.now();
@@ -3804,7 +5007,7 @@ async function handleChatCompletions(req, res) {
 
   // Select upstream based on TUI_MODE flag. With TUI_MODE===false (default),
   // upstreamCall===callClaude — identical to the pre-TUI code path.
-  const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
+  const upstreamCall = TUI_MODE ? callClaudeTui : (m, msgs, c, k, r) => callClaude(m, msgs, c, k, r, { effort });
 
   // Non-streaming path with stampede protection: wrap the upstream call in singleflight
   // when cache is enabled and a hash is present. Concurrent identical requests share
@@ -4558,14 +5761,16 @@ function gracefulShutdown(signal) {
   } catch (e) { logEvent("error", "tui_turn_pane_kill_failed", { error: e.message }); }
 
   // 3. Kill all active child processes
+  // #474: whole process groups, not just the direct children — a pipe-holding grandchild would
+  // otherwise survive the server exit and hold its pipe (and the slot's bookkeeping) forever.
   for (const proc of activeProcesses) {
-    try { proc.kill("SIGTERM"); } catch {}
+    killChildTree(proc, "SIGTERM");
   }
 
   // Force-kill any remaining processes after 5s, then exit
   const forceExitTimer = setTimeout(() => {
     for (const proc of activeProcesses) {
-      try { proc.kill("SIGKILL"); } catch {}
+      killChildTree(proc, "SIGKILL");
     }
     logEvent("warn", "shutdown_forced", { remainingProcesses: activeProcesses.size });
     process.exit(1);
@@ -4592,6 +5797,129 @@ function gracefulShutdown(signal) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
+// ── Boot-time `claude` capability gate (#455) ────────────────────────────
+//
+// OCP had no version or capability gate for the binary it spawns on every request. #453 made
+// that sharper by depending on --system-prompt-file, which `claude --help` does not list. If a
+// host's claude lacks any flag OCP passes, every request 500s -- loudly and self-namingly, but
+// PER REQUEST. Nothing said so at boot, so the first person to notice was a user.
+//
+// THE ARGV IS BUILT BY buildCliArgs, NOT RETYPED HERE, and that is the load-bearing part of this
+// design rather than a tidiness choice. A hand-written flag list is the #339 shape: it would
+// drift from the call site silently, and it would test flags this instance does not actually
+// send while missing the ones it does. buildCliArgs reads AUTH_MODE and the tool settings at
+// call time, so the probe covers exactly what THIS instance will spawn -- add a flag there and
+// the probe picks it up with no second edit.
+//
+// streamJsonInput:true is passed so --input-format is included: it is conditional per request
+// (images only), so a probe without it would leave that flag ungated.
+//
+// The path is inside a directory that does not exist, so nothing can race it into existence and
+// turn the probe's own failure signal into a success.
+if (process.env.OCP_SKIP_CAPABILITY_PROBE !== "1") {
+  const probePath = join(tmpdir(), `ocp-capability-probe-${randomUUID()}`, "absent.txt");
+  // The model comes from the models.json SPOT via MODEL_MAP, not a literal (ADR 0003). Its VALUE
+  // is inert here -- the CLI rejects the missing prompt file before it resolves a model, which is
+  // the same ordering the probe relies on for its verdict -- but a hardcoded id would be a second
+  // place model names live, and this repo has exactly one.
+  const probeModel = MODEL_MAP["sonnet"] || MODELS[0]?.id || "sonnet";
+  // buildCliArgs' output VERBATIM, with nothing appended. An earlier revision added `-p x`,
+  // carried over by hand from the argv sketched in #455 -- into the one place this design argues
+  // nothing should be hand-carried. `grep -n '"-p"' server.mjs` returns only that line: OCP does
+  // NOT pass -p in production (buildCliArgs' header records its removal in the Phase 6c port), so
+  // the probe was depending on a flag the proxy never sends, and a CLI that renamed -p would have
+  // refused a boot over it -- the fail-closed direction this gate exists to avoid. [measured]
+  // without it the probe is unchanged: 174ms, same `System prompt file not found`, status 1, and
+  // an unknown flag still answers `unknown option` in 95ms.
+  // TWO ARGVS, because buildCliArgs has TWO SHAPES and this gate only ever saw one. The tool-bridge
+  // branch RETURNS EARLY, so `--tools ""`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools`
+  // and (as of #478) `--include-partial-messages` were never probed -- five flags on the path a
+  // request takes the moment it declares `tools`, gated by nothing, on a gate whose own comment
+  // says it covers "exactly what THIS instance will spawn". It did not. Found while adding the
+  // fifth; the other four have been ungated since #476.
+  //
+  // The bridge shape's file paths point inside the same non-existent directory as the plain one:
+  // the CLI parses options before validating their values, which is the ordering this whole probe
+  // rests on, so an unknown flag still answers `unknown option` and a known one still reaches the
+  // missing-file complaint.
+  const probeShapes = [
+    { label: "plain", args: buildCliArgs(probeModel, probePath, { streamJsonInput: true }) },
+    { label: "tool-bridge", args: buildCliArgs(probeModel, probePath, {
+      toolBridge: { configFile: join(dirname(probePath), "absent-mcp.json"), toolsFile: join(dirname(probePath), "absent-tools.json") },
+    }) },
+  ];
+  const probedOk = [];
+  for (const shape of probeShapes) {
+  const probeArgs = shape.args;
+  let probe;
+  try {
+    probe = spawnSync(CLAUDE, probeArgs, {
+      encoding: "utf8",
+      timeout: CAPABILITY_PROBE_TIMEOUT_MS,
+      // The budget is ~50x the observed cost (see CAPABILITY_PROBE_TIMEOUT_MS), so a loaded host
+      // warns rather than refusing. An earlier revision said "two orders of magnitude" here while
+      // the constant's own comment said ~50x -- two numbers for one ratio, in one commit, and the
+      // one here was the wrong one. stdin closed: the CLI must not wait on it, which
+      // --input-format stream-json otherwise would.
+      stdio: ["ignore", "pipe", "pipe"],
+      env: scrubInboundAuthEnv(process.env),
+    });
+  } catch (e) {
+    probe = { error: e };
+  }
+  // [measured] spawnSync reports a blown `timeout` as error.code === "ETIMEDOUT" (with signal
+  // SIGTERM and status null), and classifyCapabilityProbe checks `error` BEFORE `timedOut` -- so
+  // routing it through `error` would label every budget overrun `spawn-failed` and leave the
+  // `timeout` branch dead. An earlier revision did exactly that and then claimed the OPPOSITE in
+  // its coverage note. Separate them here, at the only place that can tell them apart.
+  const timedOut = probe?.error?.code === "ETIMEDOUT";
+  const verdict = classifyCapabilityProbe({
+    stdout: probe?.stdout || "",
+    stderr: probe?.stderr || "",
+    error: timedOut ? null : (probe?.error || null),
+    timedOut,
+  });
+  if (verdict.verdict === "absent") {
+    // THE TWO SHAPES FAIL DIFFERENTLY, and collapsing them was a review finding. The plain argv is
+    // what EVERY request spawns, so a missing flag there is fatal -- there is no reduced service to
+    // offer. The tool-bridge argv is reached only by a request that declared `tools`, so refusing
+    // the whole instance over it takes down the plain and image paths that never use the flag: a
+    // blast radius out of proportion to the loss, and out of line with this gate's own asymmetry
+    // (only observed absence refuses, and nothing that affects one lane takes down a fleet).
+    //
+    // So the bridge shape DEGRADES: tool calling turns off, loudly, and a request that declares
+    // tools is dropped-and-counted with a reason exactly as OCP_TOOL_CALLING=0 already does --
+    // a path that already exists, is already tested, and is already visible on /health as
+    // stats.toolRequestsDropped. That is a worse service than tool calling, and a far better one
+    // than no service.
+    if (shape.label === "tool-bridge") {
+      TOOL_CALLING = false;
+      // The message is written here rather than reusing capabilityBootError, whose first sentence
+      // says the flag is passed "on every request" -- true for the plain shape and FALSE for this
+      // one, where it is passed only by a request that declared tools. A warning that misstates
+      // the scope of what it is warning about is the shape this repo keeps correcting.
+      console.error(`WARNING: this build of \`claude\` does not support ${verdict.flag}, which OCP passes only on requests that declare \`tools\`.\n  Probed: ${CLAUDE}\n  Tool calling is DISABLED for this instance; every other path is unaffected.\n  A request that declares \`tools\` will be answered as text and counted in /health stats.toolRequestsDropped.`);
+      logEvent("warn", "claude_capability_probe_tool_calling_disabled", { flag: verdict.flag, bin: CLAUDE });
+      continue;
+    }
+    console.error(`FATAL: ${capabilityBootError({ flag: verdict.flag, bin: CLAUDE })}\n  (probe shape: ${shape.label})\n  Refusing to start.`);
+    process.exit(1);
+  }
+  if (verdict.verdict === "inconclusive") {
+    // NOT fatal, and the asymmetry is the design: only OBSERVED absence refuses a boot. A missing
+    // binary, a slow host, or an upstream rewording of the message must not take a fleet down.
+    logEvent("warn", "claude_capability_probe_inconclusive", { shape: shape.label, reason: verdict.reason, detail: verdict.detail });
+  } else {
+    probedOk.push(shape.label);
+  }
+  }
+  // ONE event per boot, not one per shape. An alert or dashboard keyed on
+  // `claude_capability_probe_ok` counted one per successful boot before this change and must keep
+  // counting one; the shapes are a field, not a multiplier. (Review finding: log cardinality is a
+  // contract too.)
+  if (probedOk.length) logEvent("info", "claude_capability_probe_ok", { bin: CLAUDE, shapes: probedOk });
+}
+
 // ── Start ───────────────────────────────────────────────────────────────
 server.listen(PORT, BIND_ADDRESS, () => {
   _listening = true;
@@ -4615,12 +5943,41 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT / 1000}s | Max concurrent: ${MAX_CONCURRENT} | Queue: ${CLAUDE_MAX_QUEUE} (429 on overflow)`);
   console.log(`Circuit breaker: disabled`);
-  console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
+  // Multi-tenant is its own arm because ALLOWED_TOOLS is NOT what that mode passes: the branch in
+  // buildCliArgs pushes `--tools ""` and never `--allowedTools`, so printing the ALLOWED_TOOLS
+  // list here told an operator running a multi-tenant instance that guests had Bash/Read/Write.
+  // Console banner only. The B.2 field is the `allowedTools` member of the `config` object in
+  // the /health response body; find the /health handler and read its config block. NO GREP STRING
+  // IS GIVEN ON PURPOSE: two earlier revisions of this comment named one, and each time the
+  // comment itself became a second hit, falsifying its own "the sole hit" claim. A locator that
+  // must not appear in the locator is not a string, it is a place. That field is deliberately
+  // NOT touched: it is a
+  // grandfathered Class B.2 response field, and changing the rule that determines its value is a
+  // contract change needing its own ADR (CLAUDE.md § Class B.2), not a truthfulness fix.
+  // An earlier revision of this comment said `/status`. It was wrong, and wrong in the way
+  // AGENTS.md names as its own defect class: the reasoning survived (both endpoints are equally
+  // grandfathered) while the NAME it rested on did not, so a maintainer following the instruction
+  // would have grepped /status, found nothing, and been unable to tell whether it applied.
+  console.log(`Tools: ${AUTH_MODE === "multi" ? 'none (multi-tenant: --tools "" empties the built-in schema)'
+                      : SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  // Which of the three system-prompt wrappers this boot selected. Operator-facing because the
+  // choice is invisible otherwise (the prompt travels in a 0600 temp file, #453) and because the
+  // defect it replaces was exactly a mismatch between what the operator believed the model was
+  // told and what it was actually handed. Reads the SELECTED value, not the inputs, so a wrong
+  // selection shows up here rather than being re-derived correctly for the banner.
+  console.log(`Prompt wrapper: ${SYSTEM_PROMPT_WRAPPER === OCP_SYSTEM_PROMPT_WRAPPER ? "denies local tools (schema is empty)"
+                              : SYSTEM_PROMPT_WRAPPER === OCP_NEUTRAL_TOOLS_WRAPPER ? "neutral (tools granted, use not invited)"
+                              : "invites local tools (OCP_LOCAL_TOOLS=1)"}`);
+  // ADR 0022. Reads the constant the dispatch gate reads, and says which lane, because the TUI lane
+  // never bridges regardless of the switch.
+  console.log(`Tool calling: ${!TOOL_CALLING ? "OFF (OCP_TOOL_CALLING=0) — declared tools are dropped and counted"
+    : TUI_MODE ? "OFF on the TUI lane — declared tools are dropped and counted"
+    : "ON — client tools are bridged into the -p spawn (ADR 0022)"}`);
   if (LOCAL_TOOLS_ACTIVE) console.log(`Local tools: ON (OCP_LOCAL_TOOLS=1) — model told it may use local tools; single-user/loopback only`);
   else if (LOCAL_TOOLS) console.warn(`⚠ OCP_LOCAL_TOOLS=1 is ignored in TUI mode (the -p system-prompt wrapper is not used). The TUI tool surface is governed by OCP_TUI_FULL_TOOLS.`);
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);

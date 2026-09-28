@@ -7,10 +7,18 @@
 import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
-import { classifyToolRequest } from "./lib/tool-support.mjs";
+import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
+import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
+import { summarizeResultUsage, summarizeRateLimitEvent } from "./lib/cli-usage.mjs";
+import { selectCredential, isExpired } from "./lib/credential-source.mjs";
+import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_CONTINUATION_SYSTEM_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
+import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
+import { scheduleKillEscalation, makeKillEscalation } from "./lib/child-tree.mjs";
+import { EventEmitter } from "node:events";
 import { parseAuthority, isRebindSafe, matchesDeclared, parseAllowedHosts, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
@@ -532,6 +540,58 @@ test("updateKeyQuota partial update preserves existing values", () => {
   assert.equal(quota.weekly.limit, 20);
 });
 
+// Regression tests for the PR #498 discussion: the flagged template literal only ever
+// interpolates a fixed set of hard-coded column fragments (never attacker-reachable data),
+// and the SELECT-then-UPDATE rewrite proposed there loses a non-targeted row's untouched
+// columns on a multi-match idOrName. These pin the data-flow claim and the multi-match
+// behavior directly, rather than trusting either description.
+
+test("updateKeyQuota treats a SQL-metacharacter idOrName as literal data, not SQL", () => {
+  const before = listKeys().length;
+  const ok = updateKeyQuota("x' OR '1'='1", { daily: 5 });
+  assert.equal(ok, false, "a payload matching no real key must not match every row");
+  assert.equal(listKeys().length, before, "no keys created or removed");
+  // key1's quota set by the previous two tests must be unaffected.
+  const quota = getKeyQuota(key1.id);
+  assert.equal(quota.daily.limit, 5);
+  assert.equal(quota.weekly.limit, 20);
+});
+
+test("updateKeyQuota stores a malicious quota value as bound data, not executable SQL", () => {
+  const key = createKey("sql-value-test");
+  const injected = "5; DROP TABLE api_keys; --";
+  const ok = updateKeyQuota(key.id, { daily: injected });
+  assert.ok(ok);
+  // The table must still exist and be fully queryable — a real injection would have dropped it.
+  const keys = listKeys();
+  assert.ok(keys.some(k => k.name === "sql-value-test"));
+  assert.ok(keys.some(k => k.name === "test-user-1"));
+  // SQLite's dynamic typing stores the string verbatim; it was bound, never concatenated.
+  assert.equal(getKeyQuota(key.id).daily.limit, injected);
+});
+
+test("updateKeyQuota with a multi-match idOrName does not clobber the non-targeted row's untouched columns", () => {
+  const keyB = createKey("clobber-b");
+  updateKeyQuota(keyB.id, { weekly: 5 });
+  // keyC's name collides with keyB's numeric id: `id = ? OR name = ?` matches both rows.
+  const keyC = createKey(String(keyB.id));
+  updateKeyQuota(keyC.id, { monthly: 7 });
+
+  const idOrName = String(keyB.id);
+  const preMatches = db.prepare("SELECT id FROM api_keys WHERE id = ? OR name = ?").all(idOrName, idOrName);
+  assert.equal(preMatches.length, 2, "fixture must produce a genuine multi-match");
+
+  const ok = updateKeyQuota(idOrName, { daily: 99 });
+  assert.ok(ok);
+
+  const quotaB = getKeyQuota(keyB.id);
+  const quotaC = getKeyQuota(keyC.id);
+  assert.equal(quotaB.daily.limit, 99);
+  assert.equal(quotaB.weekly.limit, 5, "keyB's own weekly quota must be untouched");
+  assert.equal(quotaC.daily.limit, 99);
+  assert.equal(quotaC.monthly.limit, 7, "keyC's monthly quota must survive an update aimed at a field it never set");
+});
+
 test("checkQuota passes when under limit", () => {
   // Record 3 usages (limit is 5 daily)
   for (let i = 0; i < 3; i++) {
@@ -630,6 +690,14 @@ test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identicall
   // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
   assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
   assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
+});
+
+test("cacheHash: each reasoning_effort level gets its own slot; absent effort hashes as before", () => {
+  const low = cacheHash("sonnet", msgs1, { effort: "low" });
+  const max = cacheHash("sonnet", msgs1, { effort: "max" });
+  assert.notEqual(low, max, "an answer at low effort must not be served to a max-effort request");
+  assert.notEqual(low, cacheHash("sonnet", msgs1));
+  assert.equal(cacheHash("sonnet", msgs1, { effort: null }), cacheHash("sonnet", msgs1));
 });
 
 test("cacheHash includes max_tokens in hash", () => {
@@ -2742,15 +2810,41 @@ test("appendOperatorPrompt: operator value is trimmed before appending", () => {
 console.log("\nOCP_LOCAL_TOOLS wrapper + safety gate:");
 
 const NEG = "You do NOT have access to any local filesystem";
+const NEU = "Use only the tools actually provided to you in this session";
 const POS = "you may use your available local tools";
+const W = { negative: NEG, neutral: NEU, positive: POS };
 
-test("selectPromptWrapper: default (disabled) returns the negative wrapper BYTE-IDENTICAL", () => {
-  // Mutation-proof: flip the ternary and the default path leaks the positive wrapper.
-  assert.equal(selectPromptWrapper(false, NEG, POS), NEG);
+// Three surfaces, three wrappers. One test per row rather than one test with three assertions:
+// a single mutation to the selection (say, dropping the `localToolsInvited` arm) breaks more than
+// one row, and co-located claims that ONE mutation breaks can only ever produce one mutation row —
+// leaving the others shipped-but-unproven (AGENTS.md, the "Mutual" case).
+test("selectPromptWrapper: schema empty (multi) → the negative wrapper, BYTE-IDENTICAL", () => {
+  assert.equal(selectPromptWrapper({ toolsGranted: false, localToolsInvited: false }, W), NEG);
 });
 
-test("selectPromptWrapper: enabled returns the positive (local-tools) wrapper", () => {
-  assert.equal(selectPromptWrapper(true, NEG, POS), POS);
+test("selectPromptWrapper: tools granted, not invited → the NEUTRAL wrapper", () => {
+  // The row this change exists for. Before it, this surface got NEG — a denial measured false
+  // against a NON-EMPTY schema (lib/prompt.mjs § selectPromptWrapper, which states the two measured
+  // figures and why neither is quotable as a count).
+  assert.equal(selectPromptWrapper({ toolsGranted: true, localToolsInvited: false }, W), NEU);
+});
+
+test("selectPromptWrapper: OCP_LOCAL_TOOLS invitation wins over the neutral wrapper", () => {
+  assert.equal(selectPromptWrapper({ toolsGranted: true, localToolsInvited: true }, W), POS);
+});
+
+test("selectPromptWrapper: a stale POSITIONAL call THROWS rather than silently choosing", () => {
+  // The old signature was (localToolsEnabled, negative, positive). A call site left un-migrated
+  // would pass `false` as `surface`; destructuring a boolean does NOT throw in JS, so it would
+  // have returned the negative wrapper on every surface — the exact silent-wrong-answer this
+  // change removes. Made unreachable by construction rather than prohibited in a comment.
+  assert.throws(() => selectPromptWrapper(false, NEG, POS), /must be an object/);
+  assert.throws(() => selectPromptWrapper(true, NEG, POS), /must be an object/);
+});
+
+test("selectPromptWrapper: a missing wrapper THROWS rather than prepending \"undefined\"", () => {
+  assert.throws(() => selectPromptWrapper({ toolsGranted: true }, { negative: NEG, positive: POS }),
+    /all three of/);
 });
 
 test("localToolsSafetyError: disabled → null regardless of an otherwise-unsafe deploy", () => {
@@ -2803,6 +2897,7 @@ const LT_SERVER = _ltF2P(new URL("./server.mjs", import.meta.url));
 const LT_POSIX = process.platform !== "win32"; // fake is a /bin/sh script; CI is POSIX
 const LT_NEG_MARK = "You do NOT have access to any local filesystem";
 const LT_POS_MARK = "you may use your available local tools";
+const LT_NEU_MARK = "Use only the tools actually provided to you in this session";
 // Fake claude: record the --system-prompt it was spawned with, bump an optional spawn counter,
 // then emit a minimal valid stream-json response so the request completes (and caches).
 //
@@ -2827,12 +2922,120 @@ fi
 # (secrets "absent" because cut off). Measured by an independent reviewer: 4/25 partial reads at a
 # 4794-byte environment, 18/40 at 10938. rename(2) is atomic, so the reader sees all or nothing.
 if [ -n "$ENV_CAPTURE" ]; then env > "$ENV_CAPTURE.tmp" && mv "$ENV_CAPTURE.tmp" "$ENV_CAPTURE"; fi
+# Capture this spawn's COMPLETE argv, one element per record, so a test can assert on what was
+# actually passed rather than on what server.mjs's source says it passes. Additive: every
+# pre-existing call site leaves ARGV_CAPTURE unset and gets a byte-identical fake.
+#
+# Records are <<ARG>>-PREFIXED rather than newline-separated because an element legitimately
+# contains newlines -- the --system-prompt value always does, and it is spawned BEFORE the tool
+# flags, so a line-oriented reader would mis-index every element after it. Write-then-rename for
+# the reason the ENV_CAPTURE line above already records: a plain redirect is chunked, and a reader
+# that unblocks on "non-empty" can read a TRUNCATED argv, which makes an absence assertion pass
+# VACUOUSLY.
+# NOTE: no backticks anywhere in this heredoc -- it is a JS template literal, and one backtick
+# ends the string, which is exactly how this block failed the first time it was written.
+if [ -n "$ARGV_CAPTURE" ]; then
+  : > "$ARGV_CAPTURE.tmp"
+  for a in "$@"; do printf '<<ARG>>%s' "$a" >> "$ARGV_CAPTURE.tmp"; done
+  mv "$ARGV_CAPTURE.tmp" "$ARGV_CAPTURE"
+fi
+# --system-prompt-FILE (#453): the value is no longer in argv, so the capture reads the file the
+# server wrote and ALSO records its octal mode -- the mode is the whole point of the change on a
+# multi-user host, and a test cannot stat the file itself because cleanup() removes it as soon as
+# this fake exits. Every pre-existing SP_CAPTURE consumer keeps asserting on the same CONTENT and
+# thereby becomes a wiring pin: drop the flag, or pass a path that was never written, and they red.
 prev=""
 for a in "$@"; do
-  if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
+  if [ "$prev" = "--system-prompt-file" ]; then
+    [ -n "$SP_CAPTURE" ] && cat "$a" > "$SP_CAPTURE"
+    [ -n "$SP_MODE_CAPTURE" ] && ls -l "$a" | cut -c1-10 > "$SP_MODE_CAPTURE"
+    [ -n "$SP_PATH_CAPTURE" ] && printf '%s' "$a" > "$SP_PATH_CAPTURE"
+  fi
   prev="$a"
 done
 if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+# ADR 0022 captures. STDIN_CAPTURE records the prompt the server piped in (write-then-rename, same
+# reason as ENV_CAPTURE). TOOLS_CAPTURE copies the tools file the --mcp-config points at, BEFORE the
+# server's cleanup removes it -- a test cannot read that file itself. TOOL_USE_NAME makes this fake
+# behave like a claude that chose a bridged tool: it emits the tool_use and then BLOCKS, exactly as
+# the real CLI blocks on lib/mcp-bridge.mjs, so the test proves the server ends the spawn rather
+# than waiting for a result that will never come.
+if [ -n "$STDIN_CAPTURE" ]; then cat > "$STDIN_CAPTURE.tmp" && mv "$STDIN_CAPTURE.tmp" "$STDIN_CAPTURE"; fi
+if [ -n "$TOOLS_CAPTURE" ]; then
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--mcp-config" ]; then
+      tf=$(node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const s=c.mcpServers&&c.mcpServers.ocp;process.stdout.write((s&&s.env&&s.env.OCP_TOOLS_FILE)||"")' "$a")
+      [ -n "$tf" ] && cp "$tf" "$TOOLS_CAPTURE"
+    fi
+    prev="$a"
+  done
+fi
+if [ -n "$FAKE_REJECT_CACHE_CONTROL" ]; then
+  # #512: a claude/API that refuses a client prompt-cache breakpoint, with the real error text the
+  # CLI reported on 2026-09-25. Only when stdin carries one, so a run without it answers normally.
+  if [ -n "$STDIN_CAPTURE" ]; then fin=$(cat "$STDIN_CAPTURE"); else fin=$(cat); fi
+  case "$fin" in
+    *cache_control*)
+      printf '%s\\n' '{"type":"result","is_error":true,"result":"API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5."}'
+      exit 1;;
+  esac
+fi
+if [ -n "$UPSTREAM_ERROR" ]; then
+  # A failing spawn whose message is whatever the test wants, delivered the way a real failure
+  # arrives: a result event with is_error, which server.mjs turns into a rejection.
+  printf '%s\\n' '{"type":"result","is_error":true,"error_message":"'"$UPSTREAM_ERROR"'"}'
+  # Optionally ALSO on stderr. A real wall can arrive both ways at once, and that is precisely the
+  # case where the streaming lane's two error arms both fire for one failure -- the is_error arm
+  # sets the errored flag, which is what makes the close handler take its error branch too. With
+  # this set, the counter is only right because of the at-most-once guard.
+  if [ -n "$UPSTREAM_ERROR_ON_STDERR" ]; then printf '%s\\n' "$UPSTREAM_ERROR" >&2; fi
+  exit 1
+fi
+if [ -n "$UPSTREAM_ERROR_STDERR_ONLY" ]; then
+  # #482: a wall that arrives ONLY on stderr, with NO result event on stdout — the close
+  # handler's stderr arm is the only arm that sees it. Exits non-zero, like a CLI that
+  # prints the wall and bails without a result event.
+  printf '%s\\n' "$UPSTREAM_ERROR_STDERR_ONLY" >&2
+  exit 1
+fi
+if [ -n "$TOOL_USE_NAME" ]; then
+  # ONE event carrying text + one tool_use: the shape this fixture always emitted, kept because two
+  # shipped tests describe it. The real CLI emits one event PER CONTENT BLOCK -- see
+  # TOOL_USE_PARALLEL below, which is the measured shape.
+  printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look that up."},{"type":"tool_use","id":"toolu_fake01","name":"mcp__ocp__'"$TOOL_USE_NAME"'","input":{"project":"alpha"}}]}}'
+  # #478: the message-end signal, emitted exactly as claude --include-partial-messages emits it
+  # on 2.1.270. Without it the server no longer ends the turn (it stopped ending on the FIRST
+  # tool_use), so this line is what keeps the two pre-#478 tests measuring what they say.
+  if [ -z "$TOOL_USE_NO_END_SIGNAL" ]; then
+    printf '%s\\n' '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}}'
+  fi
+  # exec, not a child: a sleep GRANDCHILD would keep the stdout pipe open after the server kills
+  # this shell, and the request would hang until it exited -- the #474 shape. With exec the server's
+  # signal lands on the process that holds the pipe.
+  exec sleep 120
+fi
+if [ -n "$TOOL_USE_PARALLEL" ]; then
+  # THE MEASURED SHAPE, claude 2.1.270 with --include-partial-messages: one assistant event per
+  # content block, stop_reason: null on every one of them, all three sharing one message.id, and
+  # the stop reason arriving only in a trailing message_delta. Text preamble as DELTAS, because
+  # that is what the flag makes the CLI do -- which is also why the tool events' own text is empty.
+  printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Looking both up."}}}'
+  printf '%s\\n' '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeA","name":"mcp__ocp__lookup_build_id","input":{"project":"alpha"}}]}}'
+  printf '%s\\n' '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeB","name":"mcp__ocp__lookup_deploy_id","input":{"project":"alpha"}}]}}'
+  if [ -z "$TOOL_USE_NO_END_SIGNAL" ]; then
+    printf '%s\\n' '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}}'
+  fi
+  exec sleep 120
+fi
+if [ -n "$FAKE_USAGE_EVENTS" ]; then
+  # #512: the two events that carry what a spawn cost, in the shape claude 2.1.280 emits them
+  # (captured 2026-09-25 from a real -p call; numbers kept, uuids and session ids dropped).
+  printf '%s\\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1790323200,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.05,"resetsAt":1790323200},"seven_day":{"utilization":0.47,"resetsAt":1790506800}}}}'
+  printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+  printf '%s\\n' '{"type":"result","usage":{"input_tokens":10,"cache_creation_input_tokens":20294,"cache_read_input_tokens":13673,"output_tokens":39,"output_tokens_details":{"thinking_tokens":33},"service_tier":"standard"}}'
+  exit 0
+fi
 printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
 printf '%s\\n' '{"type":"result"}'
 exit 0
@@ -2840,6 +3043,29 @@ exit 0
 
 function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
 function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
+
+// Read back what LT_FAKE's ARGV_CAPTURE recorded: the spawned argv, one element per `<<ARG>>`
+// record. Returns [] when the file is absent, so a caller MUST assert non-empty before trusting
+// any absence claim -- a fake that never ran and a fake that ran with no args are the same [].
+// Caveat, stated rather than guarded: an argv element containing the literal `<<ARG>>` would
+// split wrong. Every caller here spawns a prompt it wrote itself, so that is reachable only by a
+// test author who put the marker in on purpose.
+// #512: the spawn's stdin as blocks. Under OCP_MULTIBLOCK_INPUT (the default) stdin is ONE stream-json
+// user envelope, and this returns its content blocks; plain-text stdin (the kill switch, or an
+// over-budget conversation) returns null. Callers assert which one they expected before using it.
+function ltStdinBlocks(raw) {
+  const t = String(raw).trim();
+  if (!t.startsWith("{")) return null;
+  const env = JSON.parse(t);
+  return Array.isArray(env?.message?.content) ? env.message.content : null;
+}
+
+function ltArgvCalls(file) {
+  if (!_ltExists(file)) return [];
+  const raw = _ltRead(file, "utf8");
+  if (!raw) return [];
+  return raw.split("<<ARG>>").slice(1);
+}
 
 // ── #384: the harness's own `tmux` ───────────────────────────────────────────────────────
 // `lib/tui/session.mjs:54` resolves `process.env.OCP_TUI_TMUX_BIN || "tmux"` at module load,
@@ -3788,7 +4014,15 @@ async function ltDrain(cond, where, ms = 5000) {
   return ok;
 }
 function ltBoot(env, dir, nodeArgs = []) {
+  // #455: the boot capability probe is OFF for the harness by default, and deliberately BEFORE
+  // the `...env` spread rather than after it -- unlike OCP_TUI_TMUX_BIN below, which is pinned
+  // after. The two want opposite things. The tmux pin exists so a test CANNOT reach the
+  // operator's real tmux, so it must win. This one exists only to keep an extra fake-claude
+  // spawn out of every other test's argv capture, and the tests that PIN the gate have to be
+  // able to turn it back on -- an unconditional pin here would make the gate untestable, which
+  // is the failure this repo cares about more.
   const childEnv = { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
+           OCP_SKIP_CAPABILITY_PROBE: "1",
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env };
   // #384: pinned here, in the BASE env, and applied AFTER the `...env` spread — deliberately,
   // on both counts.
@@ -4218,7 +4452,7 @@ ltTest("integration (#328): the AUTH PROBE child does not inherit them either �
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
+ltTest("integration: flag OFF, tools GRANTED -> the -p spawn receives the EXACT neutral wrapper (byte-for-byte)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
@@ -4227,8 +4461,43 @@ ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapp
     await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
     assert.ok(await ltWait(() => _ltExists(cap)), "fake claude captured --system-prompt");
     const sp = _ltRead(cap, "utf8");
-    // No system messages + no CLAUDE_SYSTEM_PROMPT → the wrapper is passed verbatim.
-    assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`);
+    // No system messages + no CLAUDE_SYSTEM_PROMPT -> the wrapper is passed verbatim, so this is an
+    // exact-equality pin on the text rather than a substring check.
+    //
+    // THIS TEST USED TO PIN THE NEGATIVE WRAPPER HERE, and it is the test that caught ADR 0021 item 2
+    // changing behaviour -- which is what it was for. The default path PRE-APPROVES nine tool NAMES:
+    // the deepEqual in "the non-multi path still passes --allowedTools" pins nine FLAG ARGUMENTS,
+    // which is not the same thing -- --allowedTools "could only ever widen this" per buildCliArgs'
+    // own comment. What it leaves is a NON-EMPTY built-in schema including Bash, Edit, Glob and Grep,
+    // which is what made the old prompt false. The measurement and its expiry live in lib/prompt.mjs
+    // § selectPromptWrapper and are deliberately NOT restated as a number here: the first version of
+    // this comment said 27, and an independent review re-measured 82 on the same host -- exactly what
+    // that expiry predicts. What is pinned now is that a tools-granting spawn gets the wrapper that
+    // makes no capability claim.
+    // #512: under OCP_MULTIBLOCK_INPUT (the default) the tool-continuation note follows the wrapper,
+    // byte-constant, on every -p spawn. Pinned here in full so neither half can drift unseen.
+    assert.equal(sp, `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.\n\n${TOOL_CONTINUATION_SYSTEM_NOTE}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The byte-for-byte pin on the NEGATIVE wrapper moved here, to the one branch where its claim is
+// TRUE. Its own test rather than an assertion added above, because it needs a different server
+// config -- and because that is the point: the wrappers are now selected by the tool surface, so a
+// mutation that collapses them must redden a branch rather than a substring.
+ltTest("integration: AUTH_MODE=multi -> the EXACT negative wrapper, unchanged by ADR 0021 item 2", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake, SP_CAPTURE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude captured --system-prompt");
+    const sp = _ltRead(cap, "utf8");
+    // Byte-identical to what shipped before ADR 0021 item 2. multi mode passes `--tools ""`, which
+    // was measured to leave 0 tools in the schema, so here the denial is accurate -- and this is the
+    // untrusted-caller path, which that change deliberately did not touch.
+    // #512: the tool-continuation note follows the wrapper on every -p spawn (OCP_MULTIBLOCK_INPUT).
+    assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.\n\n${TOOL_CONTINUATION_SYSTEM_NOTE}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -4285,6 +4554,820 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
         // a false "two at once".
         await ltDrain(() => buf.closed, "boot-gate-loop", 5000);
       }
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nstats.errors moves by exactly one per failed request (#460):");
+
+// ── #460: the counter was wrong in BOTH directions, depending on HOW the request failed ───────
+//
+// ADR 0018 defines stats.errors as "any upstream failure on either lane". Measured before this
+// change, one failed request moved it by 0, 1 or 2:
+//
+//   is_error result, non-streaming  -> 0   the close handler saw code===0 and took the SUCCESS
+//                                          branch, so it also logged claude_ok, recorded a
+//                                          per-model success, and marked the credential verified
+//                                          (ADR 0014) for a request that returned 500
+//   is_error result, streaming      -> 2   parsed.error counted, then close re-entered on errored
+//   spawn fails asynchronously      -> 2   'error' and 'close' both fired
+//
+// All three predate #459 (kind 3 reproduces identically on v3.32.0). The fix is one `errored`
+// flag on the non-streaming lane -- which the streaming lane already had -- plus a PER-REQUEST
+// counting guard so no failure is counted twice.
+
+// A fake that emits an is_error RESULT and exits 0: a PROTOCOL failure, not a process one. That
+// distinction is the whole of kinds 1 and 2, and it is why #459's tests (which drive a non-zero
+// EXIT code) could not see them.
+const LT460_FAKE = `#!/bin/sh
+cat >/dev/null
+printf '%s\\n' '{"type":"result","is_error":true,"result":"deliberate is_error"}'
+exit 0
+`;
+
+ltTest("integration (#460): an is_error result counts ONCE on the non-streaming lane (was 0)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-iserr"); _ltWrite(fake, LT460_FAKE); _ltChmod(fake, 0o755);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const before = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(before.stats.errors, 0, `premise: the counter must start at 0`);
+
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 500, `the is_error result must 500 — got ${r.status}: ${r.text.slice(0, 160)}`);
+
+      const after = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(after.stats.errors, 1,
+        `an is_error result left stats.errors at ${after.stats.errors}. The child exits 0, so ` +
+        `without the 'errored' flag the close handler reads code===0 and takes the SUCCESS ` +
+        `branch: ${JSON.stringify(after.stats)}`);
+      assert.equal((after.recentErrors || []).length, 1, `recentErrors: ${JSON.stringify(after.recentErrors)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-nonstream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// SEPARATE BODY, and not for tidiness. The missing `errored` flag broke more than the counter:
+// the same close handler took the whole SUCCESS branch. But co-located with the counter assertion
+// above, these could never report -- the mutation that breaks them (dropping `errored`) breaks the
+// counter too, the counter's assert throws first, and execution never reaches here. AGENTS.md's
+// "Mutual" case, whose stated remedy is separate test() bodies, because ordering cannot help when
+// ONE mutation breaks both claims.
+ltTest("integration (#460): a request that 500s must not ALSO be recorded as a success", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-iserr"); _ltWrite(fake, LT460_FAKE); _ltChmod(fake, 0o755);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 500,
+        `— ${ltDiag(buf)}`);
+      // The two events land on DIFFERENT streams, because logEvent routes by level: claude_exit is
+      // level "error" -> console.error -> stderr; claude_ok is level "info" -> console.log ->
+      // stdout. Asserting both against buf.out reports "claude_exit missing" for a run where it
+      // fired correctly -- which is what this test's first draft did.
+      //
+      // Wait for the POSITIVE line first: the response returns before the close handler has
+      // necessarily reached the parent's pipe, and "no claude_ok" is satisfied by an empty buffer,
+      // so the negative assertion below means nothing without it.
+      assert.ok(await ltWait(() => /"event":"claude_exit"/.test(buf.err)),
+        `the close handler never logged claude_exit — ${ltDiag(buf)}`);
+      assert.ok(!/"event":"claude_ok"/.test(buf.out),
+        `a request that returned 500 also logged claude_ok, so the close handler took the SUCCESS ` +
+        `branch: it recorded a per-model success and marked the credential verified — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-success", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#460): an is_error result counts ONCE on the streaming lane (was 2)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-iserr"); _ltWrite(fake, LT460_FAKE); _ltChmod(fake, 0o755);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      const after = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      // 2 was the pre-fix value: parsed.error counted, then the close handler re-entered on
+      // `errored` and counted the same failure again.
+      assert.equal(after.stats.errors, 1,
+        `one streaming failure moved stats.errors by ${after.stats.errors}, not 1: ${JSON.stringify(after.stats)}`);
+      assert.equal((after.recentErrors || []).length, 1, `recentErrors: ${JSON.stringify(after.recentErrors)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-stream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#460): an ASYNCHRONOUSLY-failing spawn counts ONCE, not once per handler (was 2)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    // The third kind, and until this test it was claimed fixed and pinned by nothing: neutering
+    // callClaude's guard alone left the whole suite green. It is also the most reachable kind in
+    // production -- it needs only a `claude` that is not where OCP expects it -- and it is the one
+    // that reproduces identically on v3.32.0, i.e. it long predates #459.
+    //
+    // LEVER: force the isolated spawn HOME (a resolvable token does that), let one request create
+    // it, then delete it and make its parent unwritable. ensureSpawnHome's mkdir then fails and is
+    // swallowed by prepareSpawnHome, so the spawn goes ahead with a cwd that does not exist ->
+    // node emits 'error' AND 'close', and both handlers used to call trackError.
+    const fake = join(dir, "claude-ok");
+    _ltWrite(fake, `#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'\nprintf '%s\\n' '{"type":"result"}'\nexit 0\n`);
+    _ltChmod(fake, 0o755);
+    const { child, buf, port } = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-fake-forces-isolated-spawn-home" }, dir);
+    const health = () => fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const pre = await health();
+      // Premise, and it is not ceremony: if isolation is OFF this fixture cannot arm the lever at
+      // all, and every assertion below would be measuring a different failure.
+      assert.equal(pre.spawn?.isolated, true, `the fixture must run isolated to arm this lever: ${JSON.stringify(pre.spawn)}`);
+      assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 200,
+        `the warm-up request must succeed — ${ltDiag(buf)}`);
+      assert.equal((await health()).stats.errors, 0, "premise: the warm-up left the counter at 0");
+
+      const spawnHome = pre.spawn.home;
+      assert.ok(_ltExists(spawnHome), `the warm-up should have created ${spawnHome}`);
+      _ltRmRetry(spawnHome);
+      _ltChmod(join(spawnHome, ".."), 0o500);
+      try {
+        assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 500,
+          `the spawn should fail with an unusable cwd — ${ltDiag(buf)}`);
+        const after = await health();
+        assert.equal(after.stats.errors, 1,
+          `one asynchronously-failing spawn moved stats.errors by ${after.stats.errors}. Two means ` +
+          `'error' and 'close' each counted the same failure: ${JSON.stringify((after.recentErrors || []).map(e => e.message.slice(0, 40)))}`);
+        assert.equal((after.recentErrors || []).length, 1, `recentErrors: ${JSON.stringify(after.recentErrors)}`);
+      } finally {
+        // Restore the mode before the fixture teardown tries to remove the tree.
+        try { _ltChmod(join(spawnHome, ".."), 0o700); } catch { /* best effort */ }
+      }
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-spawnfail", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// THE CONTROL, and it is the one that matters most. A GLOBAL "already counted" flag would pass
+// all three tests above and then silence every subsequent request's error for the life of the
+// process -- a far worse bug than the one being fixed, and invisible to any single-request test.
+// Two failures must count two; a success in between must count nothing.
+ltTest("integration (#460 control): the guard is per-REQUEST — two failures count TWO, and a success counts none", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    // One fake, two behaviours by system-prompt content: FAIL-ME yields an is_error result,
+    // anything else succeeds. Selected on the prompt FILE's content, not the model name, because
+    // an invalid model is rejected before any spawn (the #458 control's own first-draft defect).
+    const fake = join(dir, "claude-dual");
+    _ltWrite(fake, `#!/bin/sh
+cat >/dev/null
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--system-prompt-file" ] && grep -q FAIL-ME "$a"; then
+    printf '%s\\n' '{"type":"result","is_error":true,"result":"deliberate"}'
+    exit 0
+  fi
+  prev="$a"
+done
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`);
+    _ltChmod(fake, 0o755);
+    const bad = { model: "sonnet", messages: [{ role: "system", content: "FAIL-ME" }, { role: "user", content: "hi" }] };
+    const good = { model: "sonnet", messages: [{ role: "user", content: "hi" }] };
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    const errs = async () => (await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json())).stats.errors;
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.equal(await errs(), 0, "premise: starts at 0");
+
+      assert.equal((await ltPostStatus(port, bad)).status, 500, `first failure — ${ltDiag(buf)}`);
+      assert.equal(await errs(), 1, "the first failure must count 1");
+
+      assert.equal((await ltPostStatus(port, good)).status, 200, `the success must succeed — ${ltDiag(buf)}`);
+      assert.equal(await errs(), 1, "a SUCCESSFUL request must not move the counter");
+
+      assert.equal((await ltPostStatus(port, bad)).status, 500, `second failure — ${ltDiag(buf)}`);
+      assert.equal(await errs(), 2,
+        "the SECOND failure did not count. A global (rather than per-request) guard passes every " +
+        "single-request test and then silences errors for the life of the process.");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nboot-time `claude` capability gate (#455):");
+
+// ── #455: OCP spawns `claude` on every request and had no gate for the flags it passes ────────
+//
+// The pure classifier is unit-tested first (cheap, and every verdict gets a row), then the WIRING
+// is pinned by live boots -- because #343's sweep is exactly about a correct helper whose call
+// site silently stops consulting it, and a classifier nobody calls would pass every unit test.
+
+import { classifyCapabilityProbe, capabilityBootError } from "./lib/claude-capability.mjs";
+
+test("#455 classifier: an observed `unknown option` is ABSENT, and names the flag", () => {
+  const v = classifyCapabilityProbe({ stderr: "error: unknown option '--no-session-persistence'\n" });
+  assert.equal(v.verdict, "absent");
+  // The flag NAME is the whole value of the gate: the operator has to learn WHICH flag at boot
+  // instead of a user learning it per request. A verdict without it would be no better than the
+  // per-request 500 this replaces.
+  assert.equal(v.flag, "--no-session-persistence");
+  assert.match(capabilityBootError({ flag: v.flag, bin: "/x/claude" }), /--no-session-persistence/);
+});
+
+test("#455 classifier: the success message is PRESENT", () => {
+  assert.equal(classifyCapabilityProbe({ stderr: "Error: System prompt file not found: /a/b.txt\n" }).verdict, "present");
+});
+
+test("#455 classifier: a blown BUDGET is reported as a timeout, not as a generic spawn failure", () => {
+  // The distinction is not cosmetic: `spawn-failed` and `timeout` mean different things to an
+  // operator, and spawnSync reports a blown budget as error.code === "ETIMEDOUT" -- which
+  // classifyCapabilityProbe checks BEFORE `timedOut`. Routing it through `error` would make every
+  // overrun read as a spawn failure and leave this branch dead. server.mjs separates them at the
+  // call site; this pins the classifier half.
+  assert.equal(classifyCapabilityProbe({ timedOut: true }).reason, "timeout");
+  assert.equal(classifyCapabilityProbe({ error: new Error("spawn ENOENT") }).reason, "spawn-failed");
+});
+
+ltTest("integration (#455): a probe that OVERRUNS its budget warns and boots, reported as a timeout", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-slow");
+    _ltWrite(fake, `#!/bin/sh\nsleep 30\n`);
+    _ltChmod(fake, 0o755);
+    // The budget is env-configurable precisely so this branch is reachable at a tolerable cost;
+    // at the 10s default this test would dominate the suite.
+    const { child, buf } = await ltBootFresh(
+      { CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0", CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS: "400" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `a slow probe must not block the boot — ${ltDiag(buf)}`);
+      const log = buf.out + buf.err;
+      assert.match(log, /claude_capability_probe_inconclusive/, `— ${ltDiag(buf)}`);
+      // The REASON is the claim: "timeout", not "spawn-failed". An earlier revision of this change
+      // routed ETIMEDOUT through `error` and would have logged the latter.
+      assert.match(log, /"reason":"timeout"/, `a budget overrun must be reported as a timeout — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "capability-slow", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+test("#455 classifier: an EMPTY world is inconclusive, never present", () => {
+  // The one that matters most. A probe that never ran produces empty output, and empty output
+  // must not be readable as "the flags are fine" -- AGENTS.md's negative-checks rule, at the
+  // exact place where a wrong answer would disarm the gate silently.
+  for (const [label, r] of [
+    ["no output at all", { stdout: "", stderr: "" }],
+    ["spawn failed", { error: new Error("spawn ENOENT") }],
+    ["timed out", { timedOut: true }],
+    ["a fake claude's canned JSON", { stdout: '{"type":"result"}\n' }],
+    ["a future rewording", { stderr: "the system prompt file could not be located\n" }],
+  ]) {
+    const v = classifyCapabilityProbe(r);
+    assert.equal(v.verdict, "inconclusive", `${label} should be inconclusive, got ${JSON.stringify(v)}`);
+    assert.notEqual(v.verdict, "present", `${label} must never read as present`);
+  }
+});
+
+test("#455 classifier: ABSENT wins over PRESENT when both strings appear", () => {
+  // Ordering is load-bearing: `absent` is the only verdict that refuses a boot, so it must not be
+  // reachable only by falling through the success check.
+  const v = classifyCapabilityProbe({ stderr: "error: unknown option '--tools'\nError: System prompt file not found: /x\n" });
+  assert.equal(v.verdict, "absent");
+  assert.equal(v.flag, "--tools");
+});
+
+ltTest("integration (#455): a `claude` that REJECTS a flag OCP passes refuses the boot and names it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-absent");
+    _ltWrite(fake, `#!/bin/sh\necho "error: unknown option '--system-prompt-file'" >&2\nexit 1\n`);
+    _ltChmod(fake, 0o755);
+    // OCP_SKIP_CAPABILITY_PROBE is "1" in ltBoot's base env; this test turns the gate back ON.
+    const { child, buf } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.closed || /FATAL/.test(buf.err)), `no verdict — ${ltDiag(buf)}`);
+      await ltDrain(() => buf.closed, "capability-absent", 5000);
+      assert.notEqual(buf.exit, 0, `must exit non-zero — ${ltDiag(buf)}`);
+      assert.match(buf.err, /FATAL[\s\S]*--system-prompt-file/, `the FATAL must NAME the flag — ${ltDiag(buf)}`);
+      assert.match(buf.err, /Refusing to start/, `— ${ltDiag(buf)}`);
+      assert.ok(!/listening on/.test(buf.out), `it must not have served anything — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#455 control): an UNRECOGNISED probe result warns and BOOTS — only observed absence refuses", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-weird");
+    _ltWrite(fake, `#!/bin/sh\necho "some future wording nobody planned for" >&2\nexit 1\n`);
+    _ltChmod(fake, 0o755);
+    const { child, buf } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `it must still boot — ${ltDiag(buf)}`);
+      // Positive evidence that the probe RAN and reached the inconclusive arm, not merely that
+      // nothing went wrong: an assertion satisfied by a gate that never executed would be the
+      // same silence as one that passed.
+      assert.match(buf.out + buf.err, /claude_capability_probe_inconclusive/, `— ${ltDiag(buf)}`);
+      assert.match(buf.out + buf.err, /some future wording/, `the warning must carry the unrecognised text — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "capability-weird", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#455): the probe reads the REAL buildCliArgs, so a flag added there is gated with no second edit", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    // The fake echoes its own argv and then answers as a capable claude would. That pins the
+    // WIRING rather than the classifier: it proves the probe spawns the argv production builds,
+    // including the AUTH_MODE-conditional tool flags and the image-path --input-format, instead
+    // of a hand-written list that would drift from the call site (the #339 shape).
+    const fake = join(dir, "claude-argv");
+    const log = join(dir, "argv.log");
+    _ltWrite(fake, `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(log)}\necho "Error: System prompt file not found: /x" >&2\nexit 1\n`);
+    _ltChmod(fake, 0o755);
+    const { child, buf } = await ltBootFresh(
+      { CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0", CLAUDE_AUTH_MODE: "multi", PROXY_ANONYMOUS_KEY: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => _ltExists(log)), `the probe never spawned the binary — ${ltDiag(buf)}`);
+      const argv = _ltRead(log, "utf8").split("\n").filter(Boolean);
+      // Premise first: the capture must be non-empty, or every absence assertion below is
+      // satisfied by an empty world.
+      assert.ok(argv.length > 0, `empty argv capture — ${ltDiag(buf)}`);
+      assert.ok(argv.includes("--system-prompt-file"), `argv: ${JSON.stringify(argv)}`);
+      // The two that prove it came from buildCliArgs rather than a literal list: --input-format
+      // is the per-request image path, and --tools is AUTH_MODE-conditional. A hand-written
+      // probe would have had to know about both.
+      assert.ok(argv.includes("--input-format"), `--input-format missing, so streamJsonInput was not requested: ${JSON.stringify(argv)}`);
+      assert.ok(argv.includes("--tools"), `--tools missing, so the AUTH_MODE=multi branch was not consulted: ${JSON.stringify(argv)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "capability-argv", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\na synchronous pre-spawn throw is COUNTED (#458):");
+
+// ── #458: every failure of the -p lane must reach stats.errors ────────────────────────────────
+//
+// stats.errors++ happens in exactly one place, trackError(). Of its six pre-existing call sites
+// FIVE are child-process events on the -p lanes; the sixth is callClaudeTui's catch, added by
+// ADR 0018 -- which is also where the rule these tests enforce is written down: stats.errors counts
+// "any upstream failure on either lane". A synchronous throw before those listeners exist -- the
+// #180/#193 shape, one counter over -- 500s the request and increments totalRequests while errors
+// and recentErrors both stay silent. An operator's /health then reads "N requests, 0 errors, no
+// recent errors" for requests that all failed.
+//
+// The lever is the same unwritable TMPDIR the #453 tests use: os.tmpdir() honours TMPDIR, so the
+// --system-prompt-file write throws ENOENT before spawn(). No production fault hook.
+
+ltTest("integration (#458): a 500 from a synchronous pre-spawn throw increments stats.errors and recentErrors", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TMPDIR: join(dir, "no-such-dir") }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const before = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      // Premise: the counter must START at 0, or "it went up" proves nothing about this request.
+      assert.equal(before.stats.errors, 0, `errors was already ${before.stats.errors} before any request`);
+
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 500, `expected the unwritable TMPDIR to fail the spawn — got ${r.status}: ${r.text.slice(0, 160)}`);
+      // Premise: the 500 must be the write failing, not something incidental, or the counter claim
+      // below is attached to an unknown event.
+      assert.match(r.text, /ENOENT|no such file/i, `the 500 is not the temp-file write failing: ${r.text.slice(0, 160)}`);
+
+      const after = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(after.stats.totalRequests, 1, `totalRequests should have counted the attempt: ${JSON.stringify(after.stats)}`);
+      assert.equal(after.stats.errors, 1,
+        `the request 500'd but stats.errors is ${after.stats.errors}. Five of trackError's six ` +
+        `pre-existing call sites are child-process events and the sixth is callClaudeTui's catch, ` +
+        `so a synchronous throw on THIS lane happens before any listener exists — /health then ` +
+        `reports "1 request, 0 errors" for a request that failed. Stats: ` +
+        JSON.stringify(after.stats));
+      assert.equal((after.recentErrors || []).length, 1,
+        `recentErrors is the other half of trackError and is also empty: ${JSON.stringify(after.recentErrors)}`);
+
+      // The SAME lever on the streaming lane. callClaudeStreaming's spawn catch is a separate
+      // site, and while this test drove only the non-streaming lane a mutation deleting that
+      // site's trackError produced no red anywhere -- an unproven claim wearing a green suite
+      // (AGENTS.md: "an assertion that never EXECUTED is indistinguishable from one that passed").
+      // The spawn throws before any header is written, so this 500s as JSON rather than as SSE.
+      const rs = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(rs.status, 500, `the streaming lane should fail on the same unwritable TMPDIR — got ${rs.status}: ${rs.text.slice(0, 160)}`);
+      assert.match(rs.text, /ENOENT|no such file/i, `the streaming 500 is not the temp-file write failing: ${rs.text.slice(0, 160)}`);
+      const afterStream = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(afterStream.stats.errors, 2,
+        `the streaming lane's pre-spawn throw did not reach trackError: errors is ` +
+        `${afterStream.stats.errors}, expected 2 (one per lane). Stats: ${JSON.stringify(afterStream.stats)}`);
+      assert.equal((afterStream.recentErrors || []).length, 2,
+        `recentErrors did not follow the streaming lane: ${JSON.stringify(afterStream.recentErrors)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "prespawn-counted", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The control, and it is not ceremony: a fix that counted EVERY request, or counted twice, would
+// pass the test above. It gets its own test body because ONE mutation -- counting in the outer
+// handler's catch, which double-counts the child-process paths -- breaks a claim in each of them.
+// Co-located, the first assert to throw would end the body and the second claim would never run:
+// AGENTS.md's "Mutual" case, where ordering cannot help and only separate test() bodies can. The
+// measured M2 row is TWO failures rather than one, and that is the evidence for the separation.
+// (An earlier revision of this comment said the mutation "leaves the one above green". That was
+// true before the streaming lane and the exact-count assertions were added to it, and carrying it
+// forward would have been a rationale describing a superseded predicate.)
+ltTest("integration (#458 control): a SUCCESSFUL request leaves stats.errors at 0, and a NON-ZERO-EXIT child failure counts exactly once", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  // One fake, two behaviours by argv: the default spawn succeeds, but a request naming the
+  // sentinel model exits non-zero — which is the OTHER path to trackError, the one that already
+  // worked. Counting it twice is the failure mode a caller-side fix would introduce.
+  // Selected by the SYSTEM PROMPT's content, not by the model name: a bogus model name is rejected
+  // by model validation BEFORE any spawn, so the child never runs and the assertion below would be
+  // satisfied by a 400 from a request that never reached the lane under test. That is exactly what
+  // the first draft of this test did -- `assert.notEqual(status, 200)` passed on an empty world.
+  const fake = join(dir, "claude-dual");
+  _ltWrite(fake, `#!/bin/sh
+cat >/dev/null
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--system-prompt-file" ] && grep -q FAIL-ME "$a"; then
+    echo "deliberate child failure" >&2
+    exit 3
+  fi
+  prev="$a"
+done
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`);
+  _ltChmod(fake, 0o755);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+
+      const ok = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(ok.status, 200, `the success path must succeed — ${ok.status}: ${ok.text.slice(0, 160)}`);
+      const afterOk = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(afterOk.stats.errors, 0,
+        `a SUCCESSFUL request incremented stats.errors to ${afterOk.stats.errors} — the counter is ` +
+        `counting requests, not failures.`);
+
+      // Now the child-process failure path, which already reached trackError before #458.
+      //
+      // "NON-ZERO-EXIT" in this test's name is a deliberate scope limit, not filler. #460 measured
+      // two OTHER child failure kinds that this fake does not produce and that do NOT count once:
+      // a child that exits 0 while emitting {"type":"result","is_error":true} counts 0 here and 2
+      // on the streaming lane, and a spawn that fails asynchronously fires both 'error' and
+      // 'close' so one request counts 2. Both are pre-existing -- reproduced on v3.32.0 -- and
+      // neither is touched by #458. A control named "a child-process failure counts exactly once"
+      // would be asserting something false about the field it guards.
+      const bad = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: "FAIL-ME" }, { role: "user", content: "hi" }] });
+      // 500 specifically, not merely "not 200": a 400 would mean the request was rejected before
+      // the spawn and this lane was never exercised at all.
+      assert.equal(bad.status, 500, `expected the CHILD to fail — got ${bad.status}: ${bad.text.slice(0, 160)}`);
+      const afterBad = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(afterBad.stats.errors, 1,
+        `a child-process failure must count EXACTLY once, got ${afterBad.stats.errors}. Two means ` +
+        `the fix was placed in the caller's catch, where the child-process paths already called ` +
+        `trackError and then rejected.`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "prespawn-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nsystem prompt travels as a FILE, not in argv (#453):");
+
+// ── #453: the system prompt is written to a 0600 temp file and passed by path ─────────────────
+//
+// TWO defects, one change. The first is the one that gets noticed and the second is the one that
+// argues for a file rather than a bigger budget:
+//
+//   SIZE  `--system-prompt <string>` sat under the OS argv ceiling while nothing bounded the
+//         value -- promptCharBudget applies to messagesToPrompt, never to extractSystemPrompt --
+//         so CLAUDE_MAX_BODY_SIZE (5 MiB) was the only gate. Measured single-argv ceiling:
+//         131 071 bytes on Linux, ~1 045 424 on macOS. Same client, 200 KiB system message:
+//         fine on a Mac, `spawn E2BIG` on a Pi.
+//   READ  argv is world-readable on Linux (/proc/<pid>/cmdline is -r--r--r--, no hidepid on the
+//         reference fleet, verified cross-user on a real deployment). The conversation already
+//         went via stdin and the OAuth token via env; the system prompt was the one sensitive
+//         thing still in the open.
+//
+// The mode is the half a naive fix misses: tmpdir() is /tmp on Linux (777) and writeFileSync
+// defaults to 644, so a file without `mode: 0o600` RELOCATES the disclosure instead of closing it.
+//
+// Every pre-existing SP_CAPTURE test is now also a wiring pin for this: the fakes read the FILE,
+// so dropping the flag or passing an unwritten path reddens them too.
+
+ltTest("integration (#453): the system prompt is passed by PATH — argv carries --system-prompt-file and never the value", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt"); const cap = join(dir, "sp.txt");
+  const MARK = "SYSPROMPT-SENTINEL-453";
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: cap }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: MARK }, { role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran — ${ltDiag(buf)}`);
+      // Anchor by INDEX before reading the neighbour (#347): indexOf returns -1 and argv[1] is a
+      // real, wrong-looking element rather than an error.
+      const i = argv.indexOf("--system-prompt-file");
+      assert.ok(i > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 10))}`);
+      assert.ok(argv.length > i + 1, `--system-prompt-file is the last argv element, so no path followed: ${JSON.stringify(argv)}`);
+      assert.ok(!argv.includes("--system-prompt"), `the old value-in-argv flag is still passed: ${JSON.stringify(argv)}`);
+      // The point of the change: the VALUE must not be anywhere in argv. Asserted over the whole
+      // argv rather than over the one neighbouring element, because a partial revert could put it
+      // back somewhere else.
+      assert.ok(!argv.some(x => x.includes(MARK)),
+        `the system prompt's CONTENT is still in argv, which is what this change exists to stop: ${JSON.stringify(argv.filter(x => x.includes(MARK)))}`);
+      // ...and it did arrive, via the file. Without this the assertion above passes vacuously on a
+      // build that simply stopped passing the system prompt at all.
+      assert.ok(await ltWait(() => _ltExists(cap)), "the fake never wrote SP_CAPTURE, so nothing proves the file reached it");
+      assert.ok(_ltRead(cap, "utf8").includes(MARK), `the file the child read does not contain the system message: ${_ltRead(cap, "utf8").slice(0, 120)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-argv", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#453): that file is mode 0600 — a 644 file in a 777 /tmp would only MOVE the disclosure", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const modeFile = join(dir, "mode.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_MODE_CAPTURE: modeFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+      // The fake stats the file while it still exists; cleanup() removes it the moment the fake
+      // exits, so the TEST cannot stat it afterwards and must not try.
+      assert.ok(await ltWait(() => _ltExists(modeFile)), `the fake never recorded a mode — ${ltDiag(buf)}`);
+      const mode = _ltRead(modeFile, "utf8").trim();
+      assert.equal(mode, "-rw-------",
+        `the system-prompt file is not owner-only. On Linux tmpdir() is /tmp (mode 777) and the ` +
+        `default write mode is 0666 & ~umask = 644, so anything but -rw------- means any local ` +
+        `user can read every system prompt this proxy handles. Got: ${JSON.stringify(mode)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-mode", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#453): the file is removed when the turn ends — no accumulation in tmp", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const pathFile = join(dir, "path.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_PATH_CAPTURE: pathFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(pathFile)), `the fake never recorded the path — ${ltDiag(buf)}`);
+      const spPath = _ltRead(pathFile, "utf8").trim();
+      // Premise first: a path the fake never saw would make the absence below vacuous.
+      assert.ok(spPath.length > 0, "the recorded path is empty, so its absence proves nothing");
+      assert.ok(await ltWait(() => !_ltExists(spPath), 6000),
+        `the temp system-prompt file survived the turn: ${spPath}. cleanup() is the sole removal ` +
+        `site and is reached on 'exit' plus the callers' 'close'/'error'; if it is still here, one ` +
+        `file per request accumulates for the life of the process.`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-unlink", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The regression this change exists for. Sized ABOVE BOTH measured ceilings (131 071 B Linux,
+// ~1 045 424 B macOS) so the pre-fix build fails on either platform rather than only on CI, and
+// below CLAUDE_MAX_BODY_SIZE's 5 MiB default so the body gate is not what is being tested.
+ltTest("integration (#453): a system prompt larger than the OS argv ceiling no longer returns spawn E2BIG", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const BIG = "A".repeat(1_500_000);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: BIG }, { role: "user", content: "hi" }] });
+      assert.equal(r.status, 200,
+        `a ${BIG.length}-char system prompt still fails. Before #453 this was HTTP 500 ` +
+        `{"error":{"message":"spawn E2BIG"}} — the value went in argv, and nothing bounded it. ` +
+        `Got ${r.status}: ${r.text.slice(0, 200)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-big", 8000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The new failure mode the change introduces: the write itself can fail. It must answer 500 and
+// leave stats.activeRequests where it found it -- the #180/#193 counter-drift shape, one call site
+// earlier. TMPDIR is what os.tmpdir() reads, so an unwritable value reaches writeFileSync without
+// any production fault hook.
+ltTest("integration (#453): a temp-file write failure answers 500 and does not leak stats.activeRequests", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TMPDIR: join(dir, "no-such-dir") }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 500, `expected the unwritable TMPDIR to fail the spawn — got ${r.status}: ${r.text.slice(0, 200)}`);
+      // The premise: the failure must be the WRITE, not something incidental. Without this the
+      // 500 above could come from any unrelated breakage and the counter claim would be untethered.
+      assert.match(r.text, /ENOENT|no such file/i, `the 500 is not the temp-file write failing: ${r.text.slice(0, 200)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.activeRequests, 0,
+        `activeRequests leaked to ${h.stats.activeRequests} on a pre-spawn throw. The write must ` +
+        `stay ahead of the increment (#180, #193): nothing is attached yet that could undo it.`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-writefail", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nAUTH_MODE=multi tool surface (ADR 0007 B-path requirement 1):");
+
+// ── AUTH_MODE=multi must EMPTY the tool schema, not enumerate what to remove ──────────────────
+//
+// ADR 0007:138 lists `--tools ""` as requirement 1 of 3 for the multi-tenant B-path, and
+// server.mjs's own comment on this branch cites that B-path. What it shipped instead was a
+// hardcoded ten-entry `--disallowedTools` enumeration, and NOTHING in this suite read the argv,
+// so the divergence between the ADR and the code could not go red.
+//
+// Why an enumeration cannot hold: `--disallowedTools` names tools to deny, so it can only ever
+// deny the tools its author knew about. MEASURED 2026-08-27 against `claude 2.1.247` by asking a
+// child spawned under this exact flag set to name its own tools:
+//
+//   the ten-entry deny-list        -> 20 tools still available (Monitor, Workflow, NotebookEdit,
+//                                     CronCreate, SendMessage, EnterWorktree, Skill, LSP, ...)
+//   --tools "" --strict-mcp-config -> NONE
+//
+// That 20 is a MEASUREMENT, not a constant: it is whatever `claude` shipped that day minus ten
+// names, so it moves with every CLI release -- which is the whole point, and the reason the fix
+// is structural rather than a longer list. Do not update the number here; it is a dated reading.
+//
+// This is behavioural: it reads the argv a REAL server.mjs child really spawned, via LT_FAKE's
+// ARGV_CAPTURE. A source grep would pass on code that computes the right flags and then never
+// pushes them -- the #339 call-site shape this repo keeps re-finding.
+ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schema is EMPTY, not enumerated", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-multi.txt");
+  const spFile = join(dir, "sp-multi.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: spFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      // AUTH_MODE=multi admits an un-tokened caller as anonymous (server.mjs:4036 "if not, allow
+      // as anonymous"), so no key setup is needed to reach the spawn path.
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      // Vacuity guard FIRST: [] would satisfy every absence claim below. #405's rule -- require a
+      // POSITIVE count before trusting anything negative.
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran, so nothing below means anything — ${ltDiag(buf)}`);
+      assert.ok(argv.includes("--model"), `argv has no --model, so this is not the spawn we think it is: ${JSON.stringify(argv.slice(0, 8))}`);
+
+      // Anchor BY INDEX before slicing (#347): indexOf returns -1 on a miss and slice(-1+2) is a
+      // valid, non-empty, wrong-looking slice rather than an error. #453 renamed this flag from
+      // --system-prompt to --system-prompt-file, and this guard is what caught it: the anchor
+      // simply stopped matching and the test said so, where a length floor or a substring check
+      // would have sliced from -1 and asserted on garbage.
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system-prompt file path; no tool flags were pushed at all: ${JSON.stringify(argv)}`);
+
+      // ONE total assertion over the whole tool tail rather than several narrow ones. Two reasons,
+      // both from AGENTS.md: a deepEqual strictly implies every `includes` check it replaces, so
+      // keeping both would leave the broader one permanently unprovable; and two narrow assertions
+      // in one body that a SINGLE mutation breaks can only ever produce one mutation row, leaving
+      // the second claim shipped-but-unproven.
+      const tail = argv.slice(spIdx + 2);
+      // #512: the default input path is stream-json for every request, so its flag leads the tail.
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
+        `multi-mode tool flags are not the empty-schema form: ${JSON.stringify(tail)}`);
+
+      // The operator-facing half of the same defect: the boot banner printed the ALLOWED_TOOLS
+      // list in EVERY mode, so a multi-tenant instance announced "Tools: Bash, Read, Write, ..."
+      // while passing none of them. Asserted AFTER the deepEqual deliberately -- the two are
+      // killed by DIFFERENT mutations (one in buildCliArgs, one in the banner), so neither hides
+      // the other; co-locating claims is only unsafe when ONE mutation breaks both.
+      const banner = buf.out.split("\n").find(l => l.startsWith("Tools: "));
+      assert.ok(banner, `no "Tools:" banner line at all — ${ltDiag(buf)}`);
+      assert.equal(banner, 'Tools: none (multi-tenant: --tools "" empties the built-in schema)',
+        `the multi-mode boot banner still advertises a tool set: ${banner}`);
+
+      // THE WIRING PIN FOR ADR 0021 item 2: the prompt and the tool flags, read from the SAME
+      // spawn. Two separate tests would pass on a build where each is individually right but they
+      // came from different configurations — and drifting apart IS the defect this pins: the
+      // denial below shipped for months against a NON-empty schema on every other branch. Here
+      // the schema really is empty (the deepEqual above), so this is the one branch where it is
+      // true, and it must stay byte-identical.
+      //
+      // Co-located deliberately: killed by a DIFFERENT mutation than the deepEqual (the wrapper
+      // selection vs buildCliArgs), so both stay provable — the same reasoning the banner
+      // assertion above already records.
+      assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
+      const sp = _ltRead(spFile, "utf8");
+      assert.ok(sp.includes(LT_NEG_MARK), `multi mode must keep the DENYING wrapper — its schema is empty, so this is the one branch where the denial is true. Got: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEU_MARK), `multi mode must not use the neutral (tools-granted) wrapper: ${sp.slice(0, 120)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "multi-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The other side of the same fix: the single-user path must be untouched. Its own test rather than
+// a second assertion above, because it needs a different server config -- and because a mutation
+// that wrongly applied `--tools ""` to EVERY mode would leave the test above green.
+// buildCliArgs has THREE arms, and until an independent review of #473 pointed it out only two
+// were booted here — `CLAUDE_SKIP_PERMISSIONS` appeared ZERO times in this file. The comment in
+// lib/prompt.mjs claimed a missing wrapper case "reddens rather than drifting"; the reviewer
+// falsified that with a mutation giving this arm an empty schema and no matching wrapper case,
+// which left the whole co-location set 9 passed / 0 failed. This is the third boot, so the claim
+// is true of every arm rather than of the two that happened to have tests.
+ltTest("integration: the skip-permissions arm passes --dangerously-skip-permissions, and its prompt matches", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-skip.txt");
+  const spFile = join(dir, "sp-skip.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_SKIP_PERMISSIONS: "true", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: spFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran, so nothing below means anything — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system-prompt file path; no tool flags were pushed: ${JSON.stringify(argv)}`);
+      const tail = argv.slice(spIdx + 2);
+      // #512: the default input path is stream-json for every request, so its flag leads the tail.
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--dangerously-skip-permissions"],
+        `the skip-permissions arm's tool flags changed: ${JSON.stringify(tail)}`);
+
+      // The prompt half, from the SAME spawn. This arm grants MORE than the default one — it
+      // pre-approves every tool rather than nine names — so the denying wrapper would be at its
+      // most wrong here, and the inviting one is still gated behind OCP_LOCAL_TOOLS.
+      assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
+      const sp = _ltRead(spFile, "utf8");
+      assert.ok(sp.includes(LT_NEU_MARK), `a skip-permissions spawn must carry the NEUTRAL wrapper. Got: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEG_MARK), `the spawn pre-approved every tool and was handed a prompt denying it has any: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_POS_MARK), `the neutral wrapper must not become the INVITING one; that stays behind OCP_LOCAL_TOOLS' boot gate: ${sp.slice(0, 120)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "skip-perms-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: the non-multi path still passes --allowedTools and never --tools", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-none.txt");
+  const spFile = join(dir, "sp-none.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: spFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt: ${JSON.stringify(argv)}`);
+
+      // The default CLAUDE_ALLOWED_TOOLS set, spelled out. Pinning the exact list is deliberate:
+      // this is the surface a single-user instance actually grants, and a silent change to it
+      // should redden something.
+      const tail = argv.slice(spIdx + 2);
+      // #512: the default input path is stream-json for every request, so its flag leads the tail.
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"],
+        `the non-multi tool flags changed: ${JSON.stringify(tail)}`);
+
+      // The other half of the pin, and the row that CHANGED. The deepEqual immediately above pins nine
+      // FLAG ARGUMENTS, which is not nine granted tools: --allowedTools is a pre-approval list that
+      // "could only ever widen this" per buildCliArgs' own comment, and the schema it leaves is
+      // NON-EMPTY and includes Bash, Edit, Glob and Grep. That is what made the old prompt false -- it
+      // told the model it had "no local filesystem, working directory, shell". The measurement and its
+      // expiry live in lib/prompt.mjs § selectPromptWrapper, and are not restated as a number here: the
+      // first version said 27 and an independent review re-measured 82 on the same host.
+      //
+      // The two NEGATIVE assertions need the POSITIVE one first (#405): an unwritten or empty
+      // capture file satisfies every `!includes(...)` vacuously.
+      assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
+      const sp = _ltRead(spFile, "utf8");
+      assert.ok(sp.includes(LT_NEU_MARK), `a tools-granting spawn must carry the NEUTRAL wrapper. Got: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEG_MARK), `the spawn was left a NON-EMPTY tool schema and a prompt denying it has any — the drift ADR 0021 item 2 removes: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_POS_MARK), `the neutral wrapper must not become the INVITING one; that stays behind OCP_LOCAL_TOOLS' boot gate: ${sp.slice(0, 120)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "none-tools", 5000);
     }
   } finally { _ltRmRetry(dir); }
 });
@@ -4975,6 +6058,2280 @@ ltTest("integration (#310): a body over the cap in characters is still rejected,
 // The narrowness is the safety property, not a compromise: refusing on `tools` alone would have
 // broken every OpenClaw agent on this project's own fleet the day it shipped, because every
 // OpenClaw turn carries a tool list and accepts a text answer. That case is pinned below.
+console.log("\ndropped tools are COUNTED and LOGGED, and the response is unchanged (#467, ADR 0021):");
+
+// ── #467: the silent degradation, made observable without being made a failure ────────────────
+//
+// ADR 0013 refuses the four shapes the spec OBLIGES a tool call for. Everything else is served as
+// text, and the declared tools are dropped with no trace: HTTP 200, finish_reason "stop", /health
+// ok, recentErrors empty, clean logs on both sides. That is the case ADR 0013 declined to answer,
+// and it has cost hours twice.
+//
+// The hard constraint, from ADR 0013's own Alternatives and kept by ADR 0021: this must NOT become
+// a refusal. "Refuse whenever `tools` is present" would have taken down every OpenClaw agent on
+// the fleet the day it shipped -- they all send tools and all accept text. So the control below is
+// not ceremony: it is the half of this change that could do real damage if it regressed.
+
+test("#467 countDeclaredTools: counts both the current and the DEPRECATED form", () => {
+  assert.equal(countDeclaredTools({ tools: [1, 2, 3] }), 3);
+  // The deprecated `functions` array. Counted for the same reason classifyToolRequest checks
+  // `function_call`: a client on the old spelling has the identical silent failure, and leaving it
+  // out would read 0 on exactly the setup least likely to have been updated.
+  assert.equal(countDeclaredTools({ functions: [1, 2] }), 2);
+  assert.equal(countDeclaredTools({ tools: [1], functions: [1, 2] }), 3);
+});
+
+test("#467 countDeclaredTools: absent or malformed is 0, never a throw", () => {
+  // A counter that throws on a malformed body would turn a silent degradation into a 500 -- worse
+  // than the bug. Each of these is a shape a real client has sent at some point.
+  for (const [label, r] of [
+    ["absent", {}], ["null", null], ["undefined", undefined],
+    ["empty array", { tools: [] }], ["not an array", { tools: "read_file" }],
+    ["object", { tools: { a: 1 } }], ["functions not an array", { functions: 7 }],
+  ]) {
+    assert.equal(countDeclaredTools(r), 0, `${label} should count 0`);
+  }
+});
+
+ltTest("integration (#467, OCP_TOOL_CALLING=0): a dropped-tools request is COUNTED and LOGGED — and still answered", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_TOOL_CALLING: "0" }, dir); // ADR 0022: the DROPPED path is now the kill-switch path
+    const health = () => fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const before = await health();
+      assert.equal(before.stats.toolRequestsDropped, 0, "premise: the counter must start at 0");
+
+      const r = await ltPostStatus(port, {
+        model: "sonnet", tool_choice: "auto",
+        tools: [{ type: "function", function: { name: "read_file", parameters: {} } },
+                { type: "function", function: { name: "write_file", parameters: {} } }],
+        messages: [{ role: "user", content: "hi" }],
+      });
+
+      // THE CONSTRAINT, asserted before anything else: ADR 0013's Alternatives rejected refusing
+      // these, and ADR 0021 keeps that. A 400 here is the regression that would break every agent
+      // on the fleet, so it is checked first and by exact status, not by `!== 500`.
+      assert.equal(r.status, 200,
+        `a tools+auto request must still be ANSWERED, not refused — got ${r.status}: ${r.text.slice(0, 200)}`);
+
+      const after = await health();
+      assert.equal(after.stats.toolRequestsDropped, 1,
+        `the dropped tools were not counted: ${JSON.stringify(after.stats)}`);
+      // logEvent routes by level: "warn" -> console.error -> stderr. Wait for the line rather than
+      // assert on an unflushed buffer.
+      assert.ok(await ltWait(() => /"event":"openai_tools_dropped"/.test(buf.err)),
+        `the drop was never logged — ${ltDiag(buf)}`);
+      assert.match(buf.err, /"declaredTools":2/, `the log must carry HOW MANY were dropped — ${ltDiag(buf)}`);
+      assert.match(buf.err, /"toolChoice":"auto"/, `and which tool_choice reached it — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tools-dropped", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#467 control, OCP_TOOL_CALLING=0): a request with NO tools counts nothing, and a REFUSED one is not counted either", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_TOOL_CALLING: "0" }, dir); // ADR 0022: the DROPPED path is now the kill-switch path
+    const dropped = async () => (await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json())).stats.toolRequestsDropped;
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+
+      assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 200);
+      assert.equal(await dropped(), 0, "a request declaring NO tools must not move the counter");
+
+      // EVERY rejection path, not just the one I thought of. The first version of this test checked
+      // only the forcing `tool_choice`, and that is exactly why it missed the defect an independent
+      // reviewer found: the counter sat BEFORE model, messages, image and quota validation, so a
+      // `tools` request that 400'd for any of those still incremented it. Measured then:
+      // `toolRequestsDropped: 2` with `totalRequests: 0` — an arithmetic contradiction on /health.
+      //
+      // A refused request is the LOUD case. Counting it makes one number mean two things exactly
+      // when someone is trying to read it.
+      const TOOL = { type: "function", function: { name: "read_file", parameters: {} } };
+      for (const [label, body] of [
+        ["forcing tool_choice (ADR 0013)", { model: "sonnet", tool_choice: "required", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }],
+        ["unknown model", { model: "gpt-9-turbo", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }],
+        ["malformed messages element", { model: "sonnet", tools: [TOOL], messages: ["not-an-object"] }],
+        ["empty messages", { model: "sonnet", tools: [TOOL], messages: [] }],
+      ]) {
+        const r = await ltPostStatus(port, body);
+        assert.equal(r.status, 400, `[${label}] must be refused — got ${r.status}: ${r.text.slice(0, 140)}`);
+        assert.equal(await dropped(), 0,
+          `[${label}] a REFUSED request must not be counted as a silent drop. It is the LOUD case ` +
+          `— the client got a 400 and knows — and the counter exists to measure the quiet one. ` +
+          `(Deliberately NOT justified by "counting it would let toolRequestsDropped exceed ` +
+          `totalRequests": an earlier revision of this message said exactly that, and an ` +
+          `independent review measured it false on the HAPPY path — a plain cache hit is counted ` +
+          `here and never spawns, and totalRequests counts spawns rather than requests. The two ` +
+          `numbers are not comparable at all; see the counting site's comment.)`);
+      }
+
+      // The positive control for the whole loop above: a request that IS served must still count,
+      // or the four assertions are satisfied by a counter that never increments at all.
+      const served = await ltPostStatus(port, {
+        model: "sonnet", tool_choice: "auto", tools: [TOOL], messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(served.status, 200, `the served request must succeed — ${served.status}`);
+      assert.equal(await dropped(), 1, "a SERVED tools request must count — otherwise the four checks above prove nothing");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tools-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nAn upstream rate limit is 429, not 500 (#475-adjacent, OpenAI spec conformance):");
+
+test("upstream rate limit: quota/rate NOUNS match, transient advice alone does NOT", () => {
+  // Positive: the phrases an Anthropic wall or a surfaced 429 actually carries.
+  for (const m of [
+    "Claude usage limit reached — resets at 7:00",
+    "usage_limit_reached",
+    // OBSERVED FROM A LIVE 500, not invented: on 2026-09-15 a v3.36.0 instance hit the 5-hour
+    // subscription wall and returned exactly this string in a `500 proxy_error` body, while OCP's
+    // own log carried the originating `rate_limit_event` frame (`rateLimitType: "five_hour"`, with
+    // a `resetsAt` epoch). The frame is not what this classifier receives -- the caller-visible
+    // message is -- which is why the phrase has to match on its own.
+    "You've hit your session limit · resets 5am (UTC)",
+    "API error: rate limit exceeded",
+    "429 Too Many Requests",
+    "quota exceeded for this organization",
+    "RESOURCE_EXHAUSTED",
+    "insufficient_quota",
+    // A 429 IN A STATUS CONTEXT. These are the positive half of the number rows below: a
+    // narrowing that killed the false positives by also killing these would be a silent loss, and
+    // only a positive row can tell the two apart.
+    "status: 429",
+    "HTTP 429: slow down",
+    "API Error: 429",
+    '{"code":429}',
+    // An incidental filesystem note must not overrule an EXPLICIT status. Its control is the
+    // EDQUOT negative row below: the veto still fires when a QUOTA PHRASE is all there is.
+    "HTTP 429; disk quota exceeded",
+    // Via the PHRASE, not the status regex -- "429 Too Many Requests" has nothing before the
+    // number saying it is a status. Asserted from the outside so the division of labour between
+    // the phrase list and the regex cannot silently invert.
+    "429 Too Many Requests",
+  ]) assert.equal(isUpstreamRateLimit(m), true, `should be a rate limit: ${m}`);
+
+  // THE NEAR-MISSES FOR THE SESSION-LIMIT PATTERN, all four taken VERBATIM out of the `claude`
+  // 2.1.270 binary this proxy spawns. The original version of that pattern was the bare noun
+  // "session limit", and every one of these classified as a rate limit under it -- measured, not
+  // reasoned. The first is the one that matters: a failed RESET is an operation failure, and
+  // answering it 429 tells a fallback-capable client to leave the vendor over something that never
+  // concerned quota. Same shape as the "heap limit exceeded" row below, one phrase later.
+  //
+  // They were FOUND, not invented: the negative corpus for a phrase matched against an upstream's
+  // output is that upstream's own strings. The PR that added the pattern looked for plausible
+  // neighbours instead ("session not found", "session expired") and neither of those is what bites.
+  // Byte-faithful, including the U+00B7 separator the CLI uses. The first transcription of these
+  // rows carried an ASCII hyphen and, worse, PARAPHRASED two of them ("one is already in progress"
+  // for "one moment"; "You will get priority" for "Continue now at lower priority") -- while the
+  // comment above called them VERBATIM. Caught in review. A corpus labelled verbatim is only worth
+  // anything if it is a transcript: the moment the pattern is extended past the noun, a paraphrase
+  // validates it against text the upstream never emits.
+  for (const m of [
+    "Couldn't reset your session limit right now \u00b7 try again in a moment",
+    "Your session limit is already being reset \u00b7 one moment",
+    "Upgrade to Max 20x for higher session limits every month",
+    "Continue now at lower priority after reaching your session limit; run again to stop",
+  ]) assert.equal(isUpstreamRateLimit(m), false, `a non-wall mention of the noun must NOT be a rate limit: ${m}`);
+
+  // ...and the wall itself still is, in both phrasings. These two are the control for the four
+  // above: a narrowing that killed the false positives by also killing the wall would pass the rows
+  // above and fail here.
+  for (const m of [
+    "You've hit your session limit \u00b7 resets 5am (UTC)",
+    "you have hit your session limit",
+  ]) assert.equal(isUpstreamRateLimit(m), true, `the wall must still classify: ${m}`);
+
+  // #493: the FIVE sibling wall phrasings, added on the owner's decision of 2026-09-19 after the
+  // negative sweep. All five are VERBATIM out of the `claude` 2.1.277 binary this proxy spawns --
+  // transcribed, not paraphrased, which is the correction this file's session-limit rows above
+  // record the hard way. The em dash is U+2014 and the middle dot U+00B7, as the CLI emits them.
+  for (const m of [
+    "You've hit your fast limit",
+    "You've hit your monthly spend limit.",
+    "You've hit your channel's monthly spend limit.",
+    "You've hit your team's shared budget. /model to switch models.",
+    "You've hit your team's shared budget. Switch to another model",
+    "You've hit your monthly limit \u2014 raise it below, or it resets next month.",
+    // The runtime-template form, where the limit's name and reset time are substituted in.
+    "You've hit your monthly spend limit \u00b7 your Max 20x limit resets 5am (UTC)",
+  ]) assert.equal(isUpstreamRateLimit(m), true, `a sibling wall must classify (#493): ${m}`);
+
+  // #505: the rest of the limit-name set, taken from the WALL BUILDER's own constants rather than
+  // from a string sweep -- `Ry(name, suffix)` returns `You've hit your ${name}${suffix}`, so its
+  // argument table is the authoritative source a grep can only approximate:
+  //     oPr = "individual usage limit"        iPr = "channel's monthly usage limit"
+  //     QFt = "individual spend limit"        sPr = "channel's monthly spend limit"
+  //
+  // THE FIRST THREE ARE THE POINT OF THIS BLOCK. They classify only because of the BARE
+  // `usage limit` pattern, which #493's comment called a "pre-existing false positive" and
+  // proposed narrowing. It is not a false positive -- these are real walls -- and narrowing that
+  // pattern would silently return all three to 500. Nothing pinned them until now, so the
+  // narrowing would have passed quietly. These rows are what makes it redden.
+  for (const m of [
+    "You've hit your individual usage limit",
+    "You've hit your org's monthly usage limit",
+    "You've hit your channel's monthly usage limit",
+    // The two that were still 500 on v3.37.2, now covered by their own verb-anchored entries.
+    "You've hit your individual spend limit",
+    "You've hit your org's monthly spend limit",
+  ]) assert.equal(isUpstreamRateLimit(m), true, `a builder-rendered wall must classify (#505): ${m}`);
+
+  // #493 THE NEGATIVE CORPUS. Every string here is verbatim out of the same 2.1.277 binary. The
+  // first eight are SETTINGS-UI labels, and under the bare nouns (`monthly spend limit`,
+  // `monthly limit`) each classifies as a rate limit -- the fail-OPEN direction, which tells a
+  // fallback-capable client to leave the vendor over a menu item. `monthly spend limit` alone
+  // occurs 23 times in that binary and most of the occurrences are these.
+  //
+  // WHICH ANCHORS THESE ROWS PROVE, precisely, because five rows are not five measurements:
+  // the FOUND rows above prove `monthly spend limit` and `monthly limit` -- those two have real
+  // settings labels in the binary, and widening either pattern to its bare noun reddens by name.
+  // The other two, `fast limit` and `team's shared budget`, occur ONLY inside walls in this
+  // binary, so no found string can catch their widening. They carry the verb because the wall
+  // BUILDER is `return \`You've hit your ${e}${n}${g}\`` -- the verb is structural, present in
+  // every wall by construction -- rather than because a near-miss was measured.
+  //
+  // The two CONSTRUCTED rows below close that gap as a regression guard. They are labelled
+  // constructed and are deliberately NOT presented as upstream output: this file's rule that a
+  // corpus must be FOUND rather than invented is about POSITIVE rows, where a paraphrase
+  // validates a pattern against text the upstream never emits. A negative row makes the strictly
+  // safer claim -- that the pattern does not match -- and its job here is to redden when someone
+  // later "simplifies" the anchor away. They follow the UI grammar the binary does use
+  // (`Adjust monthly limit`, `Set monthly spend limit`).
+  //
+  // The last row is the one that also kills the TEMPLATE option #493 proposed (matching `hit your `
+  // plus a limit noun): it is prose ABOUT the behaviour, and a bare `hit your ` or `hit your limit`
+  // matches it.
+  for (const m of [
+    "Adjust monthly spend limit: ",
+    "Set your monthly spend limit to",
+    "Increased monthly spend limit to ",
+    "Removed monthly spend limit",
+    "Set monthly spend limit",
+    "/usage-credits to adjust your monthly spend limit.",
+    "Adjust monthly limit",
+    "client composes its own \"You've hit your limit\" line and drops your message;",
+    // CONSTRUCTED (not from the binary) -- see the note above. Without these, widening
+    // `hit your fast limit` or `hit your team's shared budget` to its bare noun reddens nothing.
+    "Adjust fast limit",
+    "Set team's shared budget",
+  ]) assert.equal(isUpstreamRateLimit(m), false, `a settings label must NOT be a rate limit (#493): ${m}`);
+
+  // #505 CORRECTION. `org's monthly spend limit` used to sit in the list above, called a settings
+  // label. It is not one -- it is a limit NAME passed to the wall builder, so the rendered wall
+  // `You've hit your org's monthly spend limit` is pinned as a POSITIVE row above. What stays true
+  // is narrower: for the SPEND family, the bare name on its own does not classify, because those
+  // patterns carry the verb. We match what the builder RENDERS, not the fragment it interpolates.
+  //
+  // THE USAGE FAMILY IS DELIBERATELY ABSENT FROM THIS LOOP, and the asymmetry is the honest part.
+  // `channel's monthly usage limit` as a bare fragment DOES classify, because `usage limit` is a
+  // bare pattern and the fragment contains it. A first draft of this row asserted otherwise and
+  // reddened -- correctly. That is the standing cost of the bare `usage limit` entry, accepted
+  // rather than hidden: it is the only thing classifying three real walls (pinned above), and a
+  // bare limit-name fragment arriving as an upstream error body is not a shape anyone has seen.
+  for (const m of [
+    "org's monthly spend limit",
+    "individual spend limit",
+  ]) assert.equal(isUpstreamRateLimit(m), false, `a bare spend-limit NAME is not a wall (#505): ${m}`);
+
+  // Negative: ordinary failures, INCLUDING ones carrying retry advice. This is the row that keeps
+  // the guard from firing on everything — transient phrases alone must not promote a 500 to a 429,
+  // or every flaky spawn would hand the client a false "you are out of quota" and, downstream, a
+  // needless provider failover.
+  for (const m of [
+    "claude exit 1",
+    "spawn ENOENT",
+    "connection reset by peer, try again in a moment",
+    "the model is temporarily unavailable, please wait and retry",
+    "processed 1429 tokens",           // 429 as a substring is not a status
+    // 429 AS THE LAST GROUP OF A NUMBER. The row above passed under a separator class of
+    // [^0-9a-z] purely because it had no separator, so the guard read as sound while all three of
+    // these returned 429 from a live server. Found by review, not by the row that was supposed to
+    // cover it — which is the reason they are listed one per shape instead of folded into one.
+    "claude exited after 12.429 seconds",   // decimal point
+    "processed 1,429 tokens",               // thousands separator
+    "completed in 429.5 seconds",           // 429 on the LEFT of the point
+    "node v4.429 crashed",                  // version-shaped
+    // A BARE 429 WITH NOTHING SAYING IT IS A STATUS. The first of these is the one that matters:
+    // a stack trace is what an ORDINARY PROXY CRASH looks like, so a delimiter-based guard reported
+    // "we hit the wall" on exactly the failure the counter exists to tell apart FROM the wall.
+    "Error: socket hang up\n    at handler (/srv/ocp/server.mjs:429:15)",
+    "TypeError: x is not a function\n    at foo (/srv/code/bar.mjs:429:7)",
+    "processed 429 tokens",
+    "pid=429",
+    '{"elapsedMs":429}',
+    // GIVEN UP DELIBERATELY to reach the row above: neither carries anything saying "status", and
+    // admitting them means admitting the stack trace. Both fail CLOSED (500). A real upstream 429
+    // almost always prints a body carrying rate_limit_error or Too Many Requests, which the PHRASE
+    // list matches without this regex being involved.
+    "(429)",
+    "upstream returned 429.",
+    // THE SAME STACK-TRACE CLASS, ONE KEYWORD FURTHER IN. `node:internal/errors` is in essentially
+    // every Node error trace, and `:429:15` is a line and a column -- so `:` had to join the
+    // digit-continuation set alongside `.` and `,`. Found by review AFTER the fix that was supposed
+    // to have killed this class, which is why the row names the module rather than the shape.
+    "Error: boom\n    at new NodeError (node:internal/errors:429:15)",
+    "TypeError: x\n    at handler (/srv/code:429:1)",
+    // A keyword ABUTTING the number is a token, not a status and its value.
+    "code429",
+    "status429",
+    "errors429",
+    // A DOCUMENTED GAP, pinned so it stays visible rather than becoming accidental: the keyword
+    // must be standalone, so camelCase compounds miss. Left open deliberately -- every observed
+    // upstream string carries a phrase the pattern list already matches, so this costs nothing on
+    // known traffic and fails CLOSED, while widening to allow a prefix would admit every word
+    // ENDING in a keyword (`stderr: 429 bytes`). If a vendor is ever OBSERVED emitting one of
+    // these bare, move it to the positive list and say what was observed.
+    "APIError: 429",
+    '{"errorCode":429}',
+    '{"httpStatus":429}',
+    "",
+    // EACH OF THE FOUR BELOW WAS MEASURED RETURNING 429 FROM A LIVE SERVER before an independent
+    // review of this PR, and each is an ordinary failure, not a wall. They are the reason the
+    // pattern list now requires a qualified noun; a row per cause so a widening reddens here.
+    "request req_011CT429kLmN failed",  // a request id is the commonest decoration on an API error
+    "FATAL ERROR: heap limit exceeded - JavaScript heap out of memory",   // not a QUOTA limit
+    "EDQUOT: disk quota exceeded, write",                                 // not an API quota
+    "x-ratelimit-remaining: 0",         // the HEADER spelling; the wire type is rate_limit_error
+    // Overload is a real upstream condition and still NOT this one: the same OpenAI specification
+    // this endpoint is bounded by gives it 503 `service_unavailable_error`, separately from 429.
+    // Calling it 429 would also tell a fallback-capable client to leave the vendor over a
+    // few-second blip.
+    "overloaded_error",
+  ]) assert.equal(isUpstreamRateLimit(m), false, `should NOT be a rate limit: ${m}`);
+
+  // THE FILESYSTEM VETO IS SCOPED, and these two rows are each other's control. Run first and
+  // unconditionally, it suppressed a genuine wall that merely mentioned a disk quota.
+  assert.equal(isUpstreamRateLimit("EDQUOT: disk quota exceeded, write"), false);
+  assert.equal(isUpstreamRateLimit("rate_limit_error: request rejected (EDQUOT on journal)"), true);
+  assert.equal(isUpstreamRateLimit("usage limit reached; disk quota exceeded"), true);
+
+  assert.equal(isUpstreamRateLimit(null), false);
+  assert.equal(isUpstreamRateLimit(undefined), false);
+});
+
+test("upstream rate limit: Retry-After is read from the message or omitted, never invented", () => {
+  const now = 1_800_000_000_000;
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) + 600}`, now), 600);
+  assert.equal(retryAfterSeconds(`"resetsAt":${Math.floor(now / 1000) + 120}`, now), 120);
+  // Case-insensitive. isUpstreamRateLimit lowercases its input and this function does not, so the
+  // two used to disagree: these produced a 429 with NO Retry-After, and the client retried straight
+  // into the same wall.
+  assert.equal(retryAfterSeconds(`ResetsAt: ${Math.floor(now / 1000) + 600}`, now), 600);
+  assert.equal(retryAfterSeconds(`RESETS_AT: ${Math.floor(now / 1000) + 600}`, now), 600);
+  // The relative shape is an ACCOMMODATION FOR OTHER UPSTREAMS, not something observed from
+  // `claude`: a review searched the 2.1.270 bundle and every one of its 34 "try again in"
+  // occurrences is non-numeric ("in a moment"), which the row below pins as null. Do not cite
+  // these two as measured behaviour of the upstream this proxy actually spawns.
+  assert.equal(retryAfterSeconds("try again in 5 minutes", now), 300);
+  assert.equal(retryAfterSeconds("try again in 30 seconds", now), 30);
+  assert.equal(retryAfterSeconds("overloaded, try again in a moment", now), null);
+  // No readable reset -> null, so no header. An invented number is worse than none: a client that
+  // trusts it retries into the same wall.
+  assert.equal(retryAfterSeconds("usage limit reached", now), null);
+  // A reset already in the past, or absurdly far out, is not usable either.
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) - 60}`, now), null);
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) + 200000}`, now), null);
+  // An UNUSABLE epoch must not veto a usable relative reset in the same message. It used to return
+  // null here, shipping a 429 with no Retry-After while the message said when.
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) - 9999}; try again in 10 minutes`, now), 600);
+});
+
+// The whole point, end to end: a real server.mjs, a spawn that fails with a wall message, and the
+// STATUS a client would branch on. A source-level check would not catch respondUpstreamError being
+// bypassed on one of the two paths that reach it.
+ltTest("integration: an upstream quota wall reaches the client as 429 rate_limit_error, not 500", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 429, `a quota wall must be 429 so a client can wait or fail over — got ${r.status}: ${r.text.slice(0, 200)}`);
+      const body = JSON.parse(r.text);
+      assert.equal(body.error.type, "rate_limit_error", JSON.stringify(body));
+      assert.match(body.error.message, /usage limit/i, "the message must still say what happened");
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "the wall must be counted separately from errors");
+      assert.ok(await ltWait(() => /"event":"upstream_rate_limit"/.test(buf.err)), `and logged — ${buf.err.slice(-300)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-429", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The control. Without it the test above passes on a build that returns 429 for EVERY failure,
+// which would fail a client over to its backup provider on an ordinary crash.
+ltTest("integration (control): an ordinary spawn failure is still 500 proxy_error, and not counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "claude exited unexpectedly" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 500, `an ordinary failure must stay 500 — got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).error.type, "proxy_error");
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 0, "an ordinary failure must NOT be counted as a rate limit");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-500", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// THE STREAMING LANE CANNOT ANSWER 429, AND THAT IS NOT A BUG TO BE HIDDEN -- it is a consequence
+// of the D4 heartbeat spec making `ensureHeaders()` eager, so `200 text/event-stream` is on the
+// wire before the spawn has produced anything. These three tests pin what the lane DOES do, so the
+// claim in the PR body and the CHANGELOG is checkable rather than prose: status stays 200, the
+// failure still surfaces, and the COUNTER is truthful. It matters which lane this is: an agent
+// framework pointed at OCP sends `stream: true` for the turn itself (measured, Hermes 0.21.1), so
+// a counter blind here would read 0 on the traffic that motivated the field.
+ltTest("integration: a streaming wall keeps 200 (headers are already sent) but IS counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      // Positive anchors first: this really was the streaming lane, and it really did carry the
+      // failure. Asserting the status alone would pass on a response that never streamed at all.
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /usage limit/i, `the failure must still surface — got ${r.text.slice(0, 300)}`);
+      assert.equal(r.status, 200, "a status cannot be un-sent once the eager SSE headers went out");
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "the wall must be counted on the streaming lane too");
+      assert.ok(await ltWait(() => /"event":"upstream_rate_limit"/.test(buf.err)), `and logged — ${buf.err.slice(-300)}`);
+      assert.match(buf.err, /"lane":"streaming"/, "the log must say which lane, so an operator can tell why there was no 429");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-429-count", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (control): an ordinary STREAMING failure is not counted as a rate limit", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "claude exited unexpectedly" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 0, "an ordinary streaming failure must NOT be counted");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-500-count", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: one streaming failure seen by BOTH error arms still counts once", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am", UPSTREAM_ERROR_ON_STDERR: "1" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      // The premise: BOTH arms really did see this failure. Without it the test would still pass on
+      // a build where only one arm ever fires, and would prove nothing about the guard.
+      assert.ok(await ltWait(() => /"event":"claude_result_error"/.test(buf.err) && /"event":"claude_exit"/.test(buf.err)),
+        `both arms must have fired, or this proves nothing — ${buf.err.slice(-400)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "one request must move the counter by exactly one");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-429-once", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// #482: #481 classified, counted and logged the streaming wall — but the SSE frame itself still
+// said provider_error. A mid-stream failure typed provider_error when it is a rate limit is
+// mislabelled: an operator reading the frame cannot tell the wall from a crash without
+// correlating /health. These tests pin the TYPE on the wire. Deliberately they assert nothing
+// about client behaviour: the issue MEASURED (Hermes 0.21.1, 2026-09-14, via a stub) that the
+// type makes no difference to that consumer's failover, so any test implying a capability
+// change would be false.
+ltTest("integration: a streaming wall frame is typed rate_limit_error (#482)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      // Positive anchors first: really the streaming lane, really carrying the failure.
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /usage limit/i, `the failure must still surface — got ${r.text.slice(0, 300)}`);
+      assert.equal(r.status, 200, "the status stays 200 — it cannot be un-sent once the eager headers went out");
+      assert.match(r.text, /"type":"rate_limit_error"/, `the wall frame must be typed rate_limit_error — got ${r.text.slice(0, 400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-482-wall", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (control): an ordinary streaming failure frame stays provider_error (#482)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "claude exited unexpectedly" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      // The negative side of the same claim: only a WALL moves the type. A test asserting the
+      // positive side alone would pass on a build that types EVERYTHING rate_limit_error.
+      assert.match(r.text, /"type":"provider_error"/, `an ordinary failure must stay provider_error — got ${r.text.slice(0, 400)}`);
+      assert.ok(!/"type":"rate_limit_error"/.test(r.text), "an ordinary failure must NOT be typed rate_limit_error");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-482-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: a wall arriving only on stderr is typed rate_limit_error on the close arm (#482)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    // The verbatim observed wall (2026-09-15, live v3.36.0) — matches the wire-added pattern.
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR_STDERR_ONLY: "You've hit your session limit · resets 5am (UTC)" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.equal(r.status, 200, "the status stays 200");
+      assert.match(r.text, /session limit/i, `the wall text must still surface — got ${r.text.slice(0, 300)}`);
+      assert.match(r.text, /"type":"rate_limit_error"/, `the close arm must type the wall rate_limit_error — got ${r.text.slice(0, 400)}`);
+      // The counter already moved on this arm since #481 — the type must now AGREE with it,
+      // not the reverse.
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "the close arm counts the wall; the frame type must match the counter");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-482-stderr", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// THE LANE SPLIT IS NOT STREAM-VS-NON-STREAM, and a shipped comment, a shipped README section and
+// a shipped CHANGELOG entry all said it was. `stream: true` WITH `tools` -- which is the shape an
+// agent actually sends (Hermes 0.21.1 was measured sending exactly that, 20 tools) -- is served by
+// the tool path, which AWAITS the spawn and only writes SSE afterwards, so a wall still gets a real
+// 429. Only `stream: true` WITHOUT tools has already sent its headers.
+//
+// These two are each other's control and must stay in ONE pair: the claim is a DIFFERENCE between
+// them, so a test that asserted either alone would pass on a build where both behave the same.
+ltTest("integration: stream+tools keeps a real 429 — only a TOOL-LESS stream loses the status", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const tools = [{ type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: { q: { type: "string" } } } } }];
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+
+      const withTools = await ltPostStatus(port, { model: "sonnet", stream: true, tools, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(withTools.status, 429, `the shape agents send must still carry a status — got ${withTools.status}: ${withTools.text.slice(0, 200)}`);
+      // Assert the raw text BEFORE parsing it. A regression that answered 429 with an SSE body would
+      // otherwise throw a bare SyntaxError out of JSON.parse and take the diagnostic with it.
+      assert.match(withTools.text, /^\s*\{/, `a buffered 429 must be a JSON body, not SSE — got ${withTools.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(withTools.text).error.type, "rate_limit_error", withTools.text.slice(0, 200));
+
+      const noTools = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(noTools.status, 200, "a tool-less stream has already sent its headers, so it cannot");
+      assert.match(noTools.text, /data: /, `and answers as SSE — got ${noTools.text.slice(0, 200)}`);
+      // ...carrying the WALL, not merely some SSE. Without this a regression that replaced the error
+      // frame with any other `data:`-bearing payload would keep this test green while the documented
+      // behaviour was gone.
+      assert.match(noTools.text, /usage limit/i, `the SSE frame must carry the failure — got ${noTools.text.slice(0, 300)}`);
+
+      // Both were walls, so both are counted; the lanes are what differ. Asserting the lanes is what
+      // stops this from passing on a build where the split moved but the statuses happened to match.
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      // EXACTLY two, not "at least". A weaker bound here would stop this from noticing a request
+      // counted twice, which is a separate live claim (#481's at-most-once guard) and the one thing
+      // that makes this counter usable. The two claims are independently reachable -- no single
+      // mutation breaks both -- so co-locating them costs no mutation row.
+      assert.equal(h.stats.upstreamRateLimits, 2, `both walls counted, exactly once each — got ${h.stats.upstreamRateLimits}`);
+      assert.match(buf.err, /"lane":"buffered"/, `the tools request must log the buffered lane — ${buf.err.slice(-400)}`);
+      assert.match(buf.err, /"lane":"streaming"/, `the tool-less one must log the streaming lane — ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "lane-split", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// #479 / ADR 0021 item 2. In AUTH_MODE=multi the boot-time wrapper is the NEGATIVE one -- correct
+// for a spawn whose schema is emptied, and false for a spawn that carries the client's tools
+// through the bridge. The two assertions are each other's control and must stay in one test: the
+// claim is that the SAME instance sends different wrappers depending on the spawn, so a test that
+// checked either alone would pass on a build that sends one wrapper to everything.
+ltTest("integration (#479): in multi mode a BRIDGE spawn gets the neutral wrapper, a plain one still gets the denial", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const cap = join(dir, "sp.txt");
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({
+      CLAUDE_BIN: fake, SP_CAPTURE: cap, ARGV_CAPTURE: argvFile,
+      CLAUDE_AUTH_MODE: "multi", PROXY_API_KEY: "test-multi-key",
+    }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const auth = { Authorization: "Bearer test-multi-key" };
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+
+      // A) a spawn WITH tools: the bridge is wired, so the prompt must not deny tools.
+      const r1 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }, auth);
+      assert.equal(r1.status, 200, `${r1.status} ${r1.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").includes("OCP HTTP proxy")), "no system prompt captured for the bridge spawn");
+      const argv1 = ltArgvCalls(argvFile);
+      // Premise: this really was a bridge spawn. Without it the wrapper assertion below proves
+      // nothing -- a build that dropped the bridge entirely would also stop denying tools.
+      assert.ok(argv1.includes("--mcp-config"), `premise: the bridge must be wired — ${JSON.stringify(argv1.slice(-8))}`);
+      const spBridge = _ltRead(cap, "utf8");
+      assert.match(spBridge, /Use only the tools actually provided to you in this session/,
+        `a bridge spawn must get the NEUTRAL wrapper — ${spBridge.slice(0, 300)}`);
+      assert.ok(!spBridge.includes("You do NOT have access to any local filesystem"),
+        `…and must not also carry the denial — ${spBridge.slice(0, 300)}`);
+
+      // B) a spawn WITHOUT tools, same instance, same auth mode: the denial is still correct there,
+      // because that spawn's schema really is empty.
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] }, auth);
+      assert.equal(r2.status, 200, `${r2.status} ${r2.text.slice(0, 200)}`);
+      // The wait is on a B-ONLY marker: only the plain spawn writes the denial, so this cannot
+      // unblock on A's capture. And reading argv after it is safe by the fake's own write ORDER --
+      // ARGV_CAPTURE is written (truncate + rename, per call, NOT cumulative) BEFORE the
+      // --system-prompt-file loop that writes SP_CAPTURE, so by the time the denial is visible the
+      // same invocation's argv already is. Checked in the fixture rather than assumed, because a
+      // reviewer read it the other way round.
+      assert.ok(await ltWait(() => _ltRead(cap, "utf8").includes("You do NOT have access")),
+        `a plain multi-mode spawn must STILL get the denial — ${_ltRead(cap, "utf8").slice(0, 300)}`);
+      const plainPrompt = _ltRead(cap, "utf8");
+      // ...and NOT the neutral one. Without this, a build that sent the neutral wrapper to every
+      // spawn AND the denial to plain ones would pass both halves, which is the "each other's
+      // control" property only half-enforced.
+      assert.ok(!plainPrompt.includes("Use only the tools actually provided to you in this session"),
+        `a plain multi-mode spawn must not ALSO carry the neutral wrapper — ${plainPrompt.slice(0, 300)}`);
+      const argv2 = ltArgvCalls(argvFile);
+      assert.ok(!argv2.includes("--mcp-config"), `premise: no bridge on the plain spawn — ${JSON.stringify(argv2.slice(-8))}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multi-wrapper", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nCredential source selection: an expired source must not shadow a valid one (#475):");
+
+test("#475: selectCredential passes over an expired source in favour of a valid lower-precedence one", () => {
+  const now = 1_800_000_000_000, past = now - 1, future = now + 3_600_000;
+  const T = "test-placeholder-not-a-token";
+  const v = (creds) => ({ read: () => creds });
+  // THE MEASURED CASE: the file six days dead, the keychain four hours ahead. File is higher
+  // precedence and must lose.
+  const r = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: past }) },
+    { source: "keychain", ...v({ accessToken: T, expiresAt: future }) },
+  ], now);
+  assert.equal(r.source, "keychain");
+  assert.deepEqual(r.skipped, ["file"], "the source passed over must be NAMED, so the operator can see why the usual winner lost");
+  assert.equal(r.allExpired, false);
+
+  // CONTROL: both valid -> precedence is untouched. Without this row, "always pick the keychain"
+  // would pass the row above.
+  // LAZINESS, as a claim the suite checks: the keychain thunk RECORDS whether it was called. A
+  // valid file must win without the keychain ever being read -- review found the first version
+  // reading every source eagerly, which let a locked keychain block a spawn path that never used
+  // to touch it. A thunk that THROWS does not pin this: an eager implementation that catches (as
+  // any sane one does) swallows the throw as "absent" and the file still wins -- measured, the
+  // eager mutation stayed green against a throwing thunk. A flag cannot be swallowed.
+  let keychainRead = false;
+  const c = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: future }) },
+    { source: "keychain", read: () => { keychainRead = true; return { accessToken: T, expiresAt: future }; } },
+  ], now);
+  assert.equal(keychainRead, false, "the keychain must not be read when a higher-precedence source is valid");
+  assert.equal(c.source, "file", "a valid higher-precedence source must still win");
+  assert.deepEqual(c.skipped, []);
+
+  // The env var carries no expiresAt: never "known expired", keeps its override precedence.
+  let fileRead = false;
+  const e = selectCredential([
+    { source: "env", ...v({ accessToken: T }) },
+    { source: "file", read: () => { fileRead = true; return { accessToken: T, expiresAt: future }; } },
+  ], now);
+  assert.equal(e.source, "env");
+  assert.equal(fileRead, false, "the file must not be read when the env var is set");
+
+  // ALL expired: the first is returned anyway (its refresh token gets the attempt), nobody was
+  // passed over in favour of anybody, and the caller is told.
+  const x = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: past }) },
+    { source: "keychain", ...v({ accessToken: T, expiresAt: past }) },
+  ], now);
+  assert.equal(x.source, "file");
+  assert.deepEqual(x.skipped, [], "an all-expired pick passed over nothing IN FAVOUR OF the winner");
+  assert.equal(x.allExpired, true);
+  // ...and among all-expired sources, one that CAN refresh beats one that cannot, whatever the
+  // precedence. Review caught "the first, so its refresh token is tried" promising more than it
+  // delivered when the first had no refresh token.
+  const y = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: past }) },
+    { source: "keychain", ...v({ accessToken: T, refreshToken: T, expiresAt: past }) },
+  ], now);
+  assert.equal(y.source, "keychain", "an expired source WITH a refresh token beats an expired one without");
+  assert.equal(y.allExpired, true);
+
+  // Nothing present, and sources with no token, are not candidates.
+  assert.equal(selectCredential([{ source: "file", ...v(null) }, { source: "keychain", ...v({}) }], now).source, null);
+  // A thunk that throws (a missing file) is "absent", not an error.
+  assert.equal(selectCredential([{ source: "file", read: () => { throw new Error("ENOENT"); } }, { source: "keychain", ...v({ accessToken: T, expiresAt: future }) }], now).source, "keychain");
+  assert.equal(selectCredential([], now).source, null);
+  assert.equal(selectCredential(null, now).source, null);
+
+  // isExpired on its own: boundary and non-number.
+  assert.equal(isExpired({ expiresAt: now }, now), true, "expiring exactly now is expired");
+  assert.equal(isExpired({ expiresAt: now + 1 }, now), false);
+  assert.equal(isExpired({ expiresAt: "soon" }, now), false, "a non-numeric expiresAt is not KNOWN expired");
+  assert.equal(isExpired({}, now), false);
+});
+
+// THE WIRING, on a real server.mjs: a scratch HOME carrying an EXPIRED credentials file, a
+// `security` stub on PATH answering with a VALID keychain-shaped credential, and no env token. The
+// old behaviour read the file, saw it expiring on every spawn, and fell back to real-HOME forever
+// -- which is the `spawn.reason` string this asserts is ABSENT. Placeholder tokens throughout.
+ltTest("integration (#475): an expired credentials file no longer shadows a valid keychain entry", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltFake(dir);
+  const shimDir = join(dir, "kc"); _ltMkdirSync(shimDir, { recursive: true });
+  const T = "test-placeholder-not-a-token";
+  const past = Date.now() - 6 * 24 * 3600 * 1000, future = Date.now() + 4 * 3600 * 1000;
+  _ltMkdirSync(join(home, ".claude"), { recursive: true });
+  _ltWrite(join(home, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: T, refreshToken: T, expiresAt: past } }));
+  _ltWrite(join(shimDir, "security"), `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ claudeAiOauth: { accessToken: T, refreshToken: T, expiresAt: future } })}'\n`);
+  _ltChmod(join(shimDir, "security"), 0o755);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, HOME: home, PATH: `${shimDir}:${process.env.PATH}`, CLAUDE_CODE_OAUTH_TOKEN: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // Force a spawn so resolveSpawnToken runs and /health's spawn.reason is populated.
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      const reason = String(h.spawn?.reason ?? "");
+      // POSITIVE anchor first: the spawn block exists and says something.
+      assert.ok(reason.length > 0, `premise: /health must report a spawn.reason — ${JSON.stringify(h.spawn)}`);
+      assert.ok(!/within 5-min expiry window/.test(reason),
+        `the expired FILE must not be the token the spawn is judged on — got spawn.reason=${JSON.stringify(reason)}`);
+      // And the decision was logged, naming the source that lost.
+      assert.ok(await ltWait(() => /"event":"credential_source_selected"/.test(buf.err)), `decision not logged — ${buf.err.slice(-400)}`);
+      assert.match(buf.err, /"source":"keychain"/, buf.err.slice(-400));
+      assert.match(buf.err, /"skippedExpired":\["file"\]/, buf.err.slice(-400));
+      // Never a token in the log, on either stream.
+      assert.ok(!(buf.out + buf.err).includes(T), "a credential value must never reach the log");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "cred-source", 5000); }
+  } finally { _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+console.log("\nFields OCP accepts and does not act on (#470):");
+
+test("#470: a field is listed only when the client asked for something it is not getting", () => {
+  // Nothing sent, nothing to report.
+  assert.deepEqual(listUnhonouredFields({}), []);
+  assert.deepEqual(listUnhonouredFields(null), []);
+  assert.deepEqual(listUnhonouredFields("not an object"), []);
+
+  // THE DEFAULTS ARE HONOURED, and reporting them would make this fire on clients that are getting
+  // exactly what they asked for -- which is how a signal becomes noise and then gets ignored.
+  assert.deepEqual(listUnhonouredFields({ n: 1 }), [], "n:1 IS what OCP returns");
+  assert.deepEqual(listUnhonouredFields({ stop: [] }), [], "an empty stop list asks for nothing");
+  assert.deepEqual(listUnhonouredFields({ logprobs: false }), [], "logprobs:false is the default");
+  assert.deepEqual(listUnhonouredFields({ parallel_tool_calls: true }), [],
+    "parallel calls ARE delivered as of #478 — this one became honoured, and the list must follow");
+
+  // ...and the same fields at a non-default value are not.
+  assert.deepEqual(listUnhonouredFields({ n: 3 }), ["n"]);
+  assert.deepEqual(listUnhonouredFields({ stop: ["END"] }), ["stop"]);
+  assert.deepEqual(listUnhonouredFields({ logprobs: true, top_logprobs: 5 }), ["logprobs", "top_logprobs"]);
+  assert.deepEqual(listUnhonouredFields({ parallel_tool_calls: false }), ["parallel_tool_calls"],
+    "asking OCP to SERIALISE calls is the half that still goes unmet");
+
+  // THE OPENAI DEFAULTS are not reported either. Weaker footing than n:1 (OCP has no sampler control
+  // at all) and stated so in the module: a client sending the default gets default behaviour it
+  // cannot distinguish from what it asked for, and an SDK that fills defaults in would otherwise
+  // light this up on every call -- review measured a body of five such fields reporting all five.
+  assert.deepEqual(listUnhonouredFields({ temperature: 1, top_p: 1, presence_penalty: 0, frequency_penalty: 0, logit_bias: {} }), [],
+    "the OpenAI defaults ask for nothing the client could see OCP fail to deliver");
+  // ...and one notch off any of them IS a request.
+  assert.deepEqual(listUnhonouredFields({ temperature: 0 }), ["temperature"]);
+  assert.deepEqual(listUnhonouredFields({ presence_penalty: 0.5 }), ["presence_penalty"]);
+  assert.deepEqual(listUnhonouredFields({ logit_bias: { "50256": -100 } }), ["logit_bias"]);
+
+  // Several at once, sorted, so a log line is stable to read and to assert on.
+  assert.deepEqual(listUnhonouredFields({ max_tokens: 50, seed: 7, temperature: 0.2 }),
+    ["max_tokens", "seed", "temperature"]);
+
+  // The three that are not wholly inert: they reach cacheHash and nothing else.
+  assert.deepEqual([...CACHE_KEY_ONLY].sort(), ["max_tokens", "temperature", "top_p"]);
+});
+
+// The WIRING PIN, and the reason this list can be trusted a year from now. The claim is not "these
+// fields are ignored" -- that is prose. It is "no value of these fields reaches the spawn", which a
+// live boot can read off the argv the server really passed. Implement one of them without removing
+// it from the list and this reddens.
+ltTest("integration (#470): the listed fields reach NEITHER the argv NOR the prompt, and the request is counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  const stdinFile = join(dir, "stdin.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, STDIN_CAPTURE: stdinFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // ONE SENTINEL VALUE PER LISTED FIELD, built from the module's OWN list -- review found the first
+      // version of this test checking six of the eleven by hand, which is a pin that silently stops
+      // pinning the moment a field is added to the list and not to the test. Each value is a number
+      // or string that cannot occur by accident, so its absence from the prompt is meaningful.
+      const SENTINELS = {
+        temperature: 0.7319, top_p: 0.6173, max_tokens: 4177, max_completion_tokens: 4179,
+        seed: 918273, stop: ["ZZSTOPZZ"], logprobs: true, top_logprobs: 7,
+        presence_penalty: 0.5511, frequency_penalty: 0.5513, logit_bias: { "50256": -73 },
+      };
+      // The test's sentinel table and the module's list must agree, or a field could be listed and
+      // never exercised here. This is the assertion that keeps the two from drifting apart.
+      assert.deepEqual(Object.keys(SENTINELS).sort(), [...ALWAYS_UNHONOURED].sort(),
+        "every field in ALWAYS_UNHONOURED needs a sentinel here, and nothing else");
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], n: 3, ...SENTINELS });
+      assert.equal(r.status, 200, `an inert field must not turn into a refusal — ${r.text.slice(0, 200)}`);
+      // The spec's own answer for n>1 is n choices; OCP returns one. Asserting it pins WHY the
+      // field is on the list rather than taking the list's word for it.
+      assert.equal(JSON.parse(r.text).choices.length, 1, "n:3 is reported, not honoured");
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured — ${ltDiag(buf)}`);
+      // POSITIVE anchor before any absence claim (#405): a known-present element proves the capture
+      // is this request's and not an empty world satisfying every negative.
+      assert.ok(argv.includes("--output-format"), `premise: a real argv — ${JSON.stringify(argv.slice(0, 6))}`);
+      // No flag for ANY listed field, in either spelling the CLI could plausibly use.
+      for (const f of ALWAYS_UNHONOURED) {
+        for (const flag of [`--${f}`, `--${f.replace(/_/g, "-")}`]) {
+          assert.ok(!argv.includes(flag), `${flag} must not appear — the CLI has no such flag: ${JSON.stringify(argv)}`);
+        }
+      }
+      // And no sentinel VALUE smuggled into the prompt either, which is the other way a value could
+      // reach the model. Every listed field's sentinel is searched for, not just stop's.
+      assert.ok(await ltWait(() => _ltExists(stdinFile)), "no stdin captured");
+      const stdin = _ltRead(stdinFile, "utf8");
+      // TWO FIELDS CANNOT CARRY A DISTINCT SENTINEL and are covered by the argv check ONLY, stated
+      // here rather than papered over: `logprobs` is a boolean, and `top_logprobs` is a 0-20
+      // integer per the spec, so any value it can take is one or two characters -- and review
+      // found the first version asserting `!stdin.includes("7")` over the whole prompt, which
+      // reddens on any unrelated 7. The set is asserted exactly, so it cannot grow quietly.
+      const ARGV_ONLY = new Set(["logprobs", "top_logprobs"]);
+      assert.deepEqual([...ARGV_ONLY].sort(), ["logprobs", "top_logprobs"], "the argv-only exemption is exactly these two");
+      for (const [f, v] of Object.entries(SENTINELS)) {
+        if (ARGV_ONLY.has(f)) continue;
+        const needle = Array.isArray(v) ? v[0] : typeof v === "object" ? Object.keys(v)[0] : String(v);
+        assert.ok(needle.length >= 4, `premise: ${f}'s sentinel "${needle}" is too short to be distinct`);
+        assert.ok(!stdin.includes(needle), `${f}'s value must not be smuggled into the prompt — ${stdin.slice(0, 300)}`);
+      }
+
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 1, "one REQUEST, whatever the field count");
+      // Wait on EITHER stream, then assert the level on the line found. logEvent routes info to
+      // stdout and warn to stderr, so a wait on buf.out alone already implied "info" and the level
+      // assertion below could never be the one that fired (#405, the asymmetric shape: an earlier
+      // assertion catches the mutation, the later one never runs). Searching both makes the level
+      // assertion the ONLY thing that separates info from warn, so its mutation row is its own.
+      assert.ok(await ltWait(() => /"event":"openai_fields_not_honoured"/.test(buf.out + buf.err)),
+        `the request must be named in the log — ${(buf.out + buf.err).slice(-400)}`);
+      const line = (buf.out + buf.err).split("\n").filter((l) => l.includes("openai_fields_not_honoured")).pop();
+      assert.match(line, /"cacheKeyOnly":\["max_tokens","temperature","top_p"\]/,
+        `the three cache-key-only fields must be called out separately — ${line}`);
+      // info, not warn: a dropped tool kills an agent loop, an ignored temperature degrades one
+      // answer, and warning on most traffic would drown warn_count (#304). Asserted POSITIVELY on
+      // the captured line -- the first version tested a negative against buf.err, which logEvent
+      // never writes info to, so it could not have fired. The `log at warn` mutation reddened only
+      // because the buf.out lookup above found nothing; this is the assertion that says why.
+      assert.match(line, /"level":"info"/, `must be logged at info, not warn — ${line}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// THE P1 FROM REVIEW, as its own test. The count sat one line above validateTools, which 400s, so a
+// tools request with an unnamed function and a `temperature` was counted as served and then
+// refused: unhonouredFieldRequests 1 against totalRequests 0. Same arithmetic contradiction the
+// toolRequestsDropped counter records catching in ITS first version -- the placement rule was
+// copied and its precondition was not.
+ltTest("integration (#470): a request REJECTED by validateTools is not counted as served-with-fields-ignored", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { description: "no name" } }], temperature: 0.5 });
+      assert.equal(r.status, 400, `premise: the malformed tool must be refused — got ${r.status}: ${r.text.slice(0, 200)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 0,
+        `a request that was REFUSED cannot have been served with fields ignored — got ${h.stats.unhonouredFieldRequests}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured-400", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#470 control): a request sending only honoured fields is NOT counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // n:1 and an empty stop are the interesting half: present in the body, asking for nothing.
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], n: 1, stop: [] });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 0,
+        "a request getting what it asked for must not be counted, or the number stops meaning anything");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nreasoning_effort -> claude --effort:");
+
+test("reasoning_effort: the five OpenAI values the CLI has map one-to-one; the rest are reported, never passed", () => {
+  assert.deepEqual(CLI_EFFORT_LEVELS, ["low", "medium", "high", "xhigh", "max"]);
+  for (const l of CLI_EFFORT_LEVELS) {
+    assert.equal(cliEffort(l), l);
+    assert.deepEqual(listUnhonouredFields({ reasoning_effort: l }), [], `${l} is honoured`);
+  }
+  // OpenAI values with no CLI level, a non-value, and a wrong type: no flag, and the request is told.
+  for (const v of ["none", "minimal", "turbo", "LOW", 3]) {
+    assert.equal(cliEffort(v), null, JSON.stringify(v));
+    assert.deepEqual(listUnhonouredFields({ reasoning_effort: v }), ["reasoning_effort"], JSON.stringify(v));
+  }
+  assert.deepEqual(listUnhonouredFields({ reasoning_effort: null }), [], "null asks for nothing");
+});
+
+test("reasoning_effort: on the TUI lane a valid level is still reported, because the pane cannot take it", () => {
+  assert.deepEqual(listUnhonouredFields({ reasoning_effort: "high" }, { effortHonoured: false }), ["reasoning_effort"]);
+  assert.deepEqual(listUnhonouredFields({}, { effortHonoured: false }), [], "absent is absent on either lane");
+});
+
+// Two requests in one boot are each other's control: the flag must appear with the level after
+// the first and be gone after the second, so neither assertion can pass on a stale capture.
+ltTest("integration: reasoning_effort reaches argv as `--effort <level>`, and its absence leaves argv without it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r1 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], reasoning_effort: "max" });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      const a1 = ltArgvCalls(argvFile);
+      assert.ok(a1.includes("--output-format"), `premise: a real argv — ${JSON.stringify(a1.slice(0, 6))}`);
+      const i = a1.indexOf("--effort");
+      assert.ok(i > -1 && a1[i + 1] === "max", `--effort max must be in argv — ${JSON.stringify(a1)}`);
+
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi again" }] });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      const a2 = ltArgvCalls(argvFile);
+      assert.ok(a2.includes("--output-format"), "premise: second argv captured");
+      assert.ok(!a2.includes("--effort"), `no reasoning_effort, no flag — ${JSON.stringify(a2)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: the streaming lane passes reasoning_effort too", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }], reasoning_effort: "low" });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const a = ltArgvCalls(argvFile);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "low", `--effort low must be in the streaming argv — ${JSON.stringify(a)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-stream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: a reasoning_effort the CLI has no level for is answered, reported, and kept out of argv", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], reasoning_effort: "minimal" });
+      assert.equal(r.status, 200, `an unmappable level must not become a refusal — ${r.text.slice(0, 200)}`);
+      const a = ltArgvCalls(argvFile);
+      assert.ok(a.includes("--output-format"), "premise: a real argv");
+      assert.ok(!a.includes("--effort"), `no CLI level, no flag — ${JSON.stringify(a)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 1, "the request is counted as served with a field unmet");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-unmapped", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The structured and tool-call lanes reach callClaude through call sites of their own (the
+// structured branch's upstreamCall wrapper, and handleToolTurn), so the buffered test above
+// cannot see either one dropping the level. Each gets its own boot and its own premise: a line or
+// an argv element only that lane produces, so an argv from some other lane cannot satisfy it.
+ltTest("integration: the structured-output lane passes reasoning_effort too", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const rf = { type: "json_schema", json_schema: { name: "probe", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } } };
+      await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], response_format: rf, reasoning_effort: "high" });
+      // The stock fake answers "OK", which is not JSON, so the structured lane logs a retry. No other
+      // lane writes that line.
+      assert.ok(await ltWait(() => buf.err.includes('"event":"structured_retry"')), `premise: the structured lane ran — ${ltDiag(buf)}`);
+      const a = ltArgvCalls(argvFile);
+      assert.ok(a.includes("--output-format"), `premise: a real argv — ${JSON.stringify(a.slice(0, 6))}`);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "high", `--effort high must be in the structured argv — ${JSON.stringify(a)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-structured", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: the tool-call lane passes reasoning_effort too", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }], reasoning_effort: "xhigh" });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const a = ltArgvCalls(argvFile);
+      // --strict-mcp-config is in the tool bridge's argv and in no other.
+      assert.ok(a.includes("--strict-mcp-config"), `premise: the tool bridge's argv — ${JSON.stringify(a)}`);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "xhigh", `--effort xhigh must be in the tool-turn argv — ${JSON.stringify(a)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-tool", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The unit test above proves cacheHash CAN fold the level; this proves the call site passes it.
+// The third request is the control: same body as the second, so it must be a cache hit. Without
+// it, a cache that never stored anything would pass the second assertion for the wrong reason.
+ltTest("integration: requests that differ only in reasoning_effort do not share a cache slot", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, CLAUDE_CACHE_TTL: "60000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const spawned = () => buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"')).length;
+      const msgs = [{ role: "user", content: "effort-cache-probe" }];
+      const r1 = await ltPostStatus(port, { model: "sonnet", messages: msgs, reasoning_effort: "low" });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned() === 1), `premise: the first request spawned — ${ltDiag(buf)}`);
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: msgs, reasoning_effort: "max" });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned() === 2), `a max-effort request was answered from the low-effort slot — spawns=${spawned()}`);
+      const a = ltArgvCalls(argvFile);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "max", `the second spawn must carry --effort max — ${JSON.stringify(a)}`);
+      const r3 = await ltPostStatus(port, { model: "sonnet", messages: msgs, reasoning_effort: "max" });
+      assert.equal(r3.status, 200, r3.text.slice(0, 200));
+      await new Promise((res) => setTimeout(res, 400));
+      assert.equal(spawned(), 2, "control: the same body at the same level must be a cache hit");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-cache", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The operator-side view: with the flag, claude_spawned names the level; without it, the line has
+// no effort key. The two requests are each other's control.
+ltTest("integration: claude_spawned names the effort when --effort is in argv, and has no effort key without it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const spawned = () => buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"'));
+      const r1 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "one" }], reasoning_effort: "medium" });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned().length === 1), `premise: one spawn logged — ${ltDiag(buf)}`);
+      assert.match(spawned()[0], /"effort":"medium"/, `the level must be logged — ${spawned()[0]}`);
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "two" }] });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned().length === 2), `premise: second spawn logged — ${ltDiag(buf)}`);
+      assert.doesNotMatch(spawned()[1], /"effort"/, `no reasoning_effort, no effort key — ${spawned()[1]}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-log", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\n#512: what a spawn cost, logged:");
+
+// The measured shapes (claude 2.1.280, 2026-09-25). Identical to what FAKE_USAGE_EVENTS emits.
+const U512_RESULT_USAGE = { input_tokens: 10, cache_creation_input_tokens: 20294, cache_read_input_tokens: 13673, output_tokens: 39, output_tokens_details: { thinking_tokens: 33 }, service_tier: "standard" };
+const U512_RATE_EVENT = { type: "rate_limit_event", rate_limit_info: { status: "allowed", resetsAt: 1790323200, rateLimitType: "five_hour", overageStatus: "rejected", overageDisabledReason: "org_level_disabled", isUsingOverage: false, unifiedWindows: { five_hour: { utilization: 0.05, resetsAt: 1790323200 }, seven_day: { utilization: 0.47, resetsAt: 1790506800 } } } };
+
+test("#512 summarizeResultUsage: the four cache-relevant counts from the measured shape, and null for anything else", () => {
+  assert.deepEqual(summarizeResultUsage(U512_RESULT_USAGE), { inputTokens: 10, outputTokens: 39, cacheWriteTokens: 20294, cacheReadTokens: 13673 });
+  for (const v of [undefined, null, 3, "x", [], {}]) assert.equal(summarizeResultUsage(v), null, JSON.stringify(v));
+  // A non-count value is dropped, not passed through: this goes into a log line verbatim.
+  assert.deepEqual(summarizeResultUsage({ input_tokens: -1, output_tokens: "39", cache_read_input_tokens: NaN, cache_creation_input_tokens: 5 }), { cacheWriteTokens: 5 });
+});
+
+test("#512 summarizeRateLimitEvent: status, limit, reset and per-window utilization from the measured shape; bounded", () => {
+  assert.deepEqual(summarizeRateLimitEvent(U512_RATE_EVENT), {
+    status: "allowed", rateLimitType: "five_hour", resetsAt: 1790323200, overageStatus: "rejected", overageDisabledReason: "org_level_disabled", isUsingOverage: false,
+    windows: { five_hour: { utilization: 0.05, resetsAt: 1790323200 }, seven_day: { utilization: 0.47, resetsAt: 1790506800 } },
+  });
+  for (const v of [undefined, null, {}, { rate_limit_info: [] }, { rate_limit_info: "x" }]) assert.equal(summarizeRateLimitEvent(v), null, JSON.stringify(v));
+  // Bounded no matter what the CLI sends: at most 4 windows, no long strings, numbers only inside a window.
+  const many = {}; for (let i = 0; i < 10; i++) many[`w${i}`] = { utilization: i / 10, resetsAt: 1, note: "x" };
+  const s = summarizeRateLimitEvent({ rate_limit_info: { status: "y".repeat(65), unifiedWindows: many } });
+  assert.equal(Object.keys(s.windows).length, 4);
+  assert.equal(s.status, undefined, "a 65-char status is dropped");
+  assert.deepEqual(s.windows.w1, { utilization: 0.1, resetsAt: 1 }, "only the numeric fields survive");
+});
+
+// The live path: both events reach the log through parseStreamJsonEvent and the lane that owns the
+// spawn. FAKE_USAGE_EVENTS emits both; the second boot, with the stock fake, is the control -- a
+// result with no usage adds no token keys, and nothing was assumed about which lane logged what.
+async function u512Run(stream, env) {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const lines = (ev) => buf.out.split("\n").filter((l) => l.includes(`"event":"${ev}"`)).map((l) => JSON.parse(l));
+      assert.ok(await ltWait(() => lines("claude_ok").length === 1), `premise: one claude_ok — ${ltDiag(buf)}`);
+      return { ok: lines("claude_ok")[0], rate: lines("claude_stream_event").filter((e) => e.type === "rate_limit_event") };
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "u512", 5000); }
+  } finally { _ltRmRetry(dir); }
+}
+
+for (const stream of [false, true]) {
+  const lane = stream ? "streaming" : "buffered";
+  ltTest(`integration (#512, ${lane}): claude_ok carries the result's token counts, and the rate_limit_event is logged parsed`, async () => {
+    if (!LT_POSIX) return;
+    const { ok, rate } = await u512Run(stream, { FAKE_USAGE_EVENTS: "1" });
+    assert.equal(ok.inputTokens, 10, JSON.stringify(ok));
+    assert.equal(ok.outputTokens, 39, JSON.stringify(ok));
+    assert.equal(ok.cacheWriteTokens, 20294, JSON.stringify(ok));
+    assert.equal(ok.cacheReadTokens, 13673, JSON.stringify(ok));
+    assert.equal(rate.length, 1, `one rate_limit_event line — ${JSON.stringify(rate)}`);
+    assert.equal(rate[0].info?.windows?.five_hour?.utilization, 0.05, `utilization must be in the log line — ${JSON.stringify(rate[0])}`);
+    assert.equal(rate[0].data, undefined, "the parsed form replaces the 200-char prefix");
+  });
+  ltTest(`integration (#512 control, ${lane}): a result with no usage adds no token keys`, async () => {
+    if (!LT_POSIX) return;
+    const { ok } = await u512Run(stream, {});
+    assert.equal(typeof ok.elapsed, "number", `premise: a real claude_ok — ${JSON.stringify(ok)}`);
+    for (const k of ["inputTokens", "outputTokens", "cacheWriteTokens", "cacheReadTokens"]) assert.equal(k in ok, false, `${k} — ${JSON.stringify(ok)}`);
+  });
+}
+
+// Prefix stability, per layer. Three requests in one boot, each the others' control: 1 and 2 share
+// a system prompt and differ only in the user turn, so their systemPromptSha must match; 3 changes
+// the system message, so its sha must differ. toolsSha appears only on the request that declares tools.
+ltTest("integration (#512): claude_spawned carries systemPromptSha, toolsSha only with tools, and blockCount", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const spawned = () => buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"')).map((l) => JSON.parse(l));
+      const sys = { role: "system", content: "You are a probe." };
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      await ltPostStatus(port, { model: "sonnet", messages: [sys, { role: "user", content: "one" }] });
+      await ltPostStatus(port, { model: "sonnet", messages: [sys, { role: "user", content: "two" }] });
+      await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: "You are another probe." }, { role: "user", content: "three" }] });
+      await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [sys, { role: "user", content: "four" }] });
+      const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      await ltPostStatus(port, { model: "sonnet", messages: [sys, { role: "user", content: [{ type: "text", text: "five" }, { type: "image_url", image_url: { url: PNG } }] }] });
+      assert.ok(await ltWait(() => spawned().length === 5), `premise: five spawns — ${ltDiag(buf)}`);
+      const [a, b, c, d, e5] = spawned();
+      assert.match(a.systemPromptSha, /^[0-9a-f]{12}$/, JSON.stringify(a));
+      assert.equal(a.systemPromptSha, b.systemPromptSha, "same system prompt, same sha");
+      assert.notEqual(a.systemPromptSha, c.systemPromptSha, "a different system message must change the sha");
+      assert.equal("toolsSha" in a, false, `no tools, no toolsSha — ${JSON.stringify(a)}`);
+      assert.match(d.toolsSha || "", /^[0-9a-f]{12}$/, `tools declared, toolsSha present — ${JSON.stringify(d)}`);
+      for (const e of [a, b, c, d]) assert.equal(e.blockCount, 1, `the text path is one block — ${JSON.stringify(e)}`);
+      assert.equal(e5.inputFormat, "stream-json", `premise: the image request took the stream-json path — ${JSON.stringify(e5)}`);
+      assert.ok(e5.blockCount >= 2, `a text part and an image are at least two blocks — ${JSON.stringify(e5)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "u512-spawn", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\n#512 PR 2: one content block per message, append-only:");
+
+// An agent conversation as two consecutive requests: step N ends on two parallel tool results; step
+// N+1 is N plus the model's answer, the user's next turn, a third call and its result. Nonces make
+// each request's stdin capture identifiable (the capture file is overwritten per spawn, #405).
+function lt512Steps(nonce) {
+  const T = (id, n) => ({ id, type: "function", function: { name: n, arguments: "{}" } });
+  const stepN = [
+    { role: "system", content: "You are a probe." },
+    { role: "user", content: `first question ${nonce}` },
+    { role: "assistant", content: null, tool_calls: [T("c1", "lookup_a"), T("c2", "lookup_b")] },
+    { role: "tool", tool_call_id: "c1", content: "result A" },
+    { role: "tool", tool_call_id: "c2", content: `result B ${nonce}-N` },
+  ];
+  const stepN1 = [...stepN,
+    { role: "assistant", content: "A and B are known." },
+    { role: "user", content: "and now C?" },
+    { role: "assistant", content: null, tool_calls: [T("c3", "lookup_c")] },
+    { role: "tool", tool_call_id: "c3", content: `result C ${nonce}-N1` },
+  ];
+  return { stepN, stepN1 };
+}
+const LT512_TOOLS = ["lookup_a", "lookup_b", "lookup_c"].map((n) => ({ type: "function", function: { name: n, parameters: { type: "object" } } }));
+
+async function lt512Capture(env, bodies) {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt"); const spFile = join(dir, "sp.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const out = [];
+      for (const { body, marker } of bodies) {
+        const r = await ltPostStatus(port, body);
+        assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+        assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes(marker)), `the capture for ${marker} never appeared`);
+        out.push({ raw: _ltRead(stdinFile, "utf8"), sp: _ltRead(spFile, "utf8") });
+      }
+      const spawned = buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"')).map((l) => JSON.parse(l));
+      return { out, spawned };
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "lt512", 5000); }
+  } finally { _ltRmRetry(dir); }
+}
+
+// THE property the prompt cache depends on, tested directly: request N's blocks are an element-wise
+// prefix of request N+1's. Consecutive tool results share one block (the ~20-block lookback, #512).
+ltTest("integration (#512): step N's content blocks are an exact prefix of step N+1's, with parallel tool results in one block", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "P" + Math.random().toString(36).slice(2, 8);
+  const { stepN, stepN1 } = lt512Steps(nonce);
+  const { out } = await lt512Capture({}, [
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN }, marker: `${nonce}-N"` },
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN1 }, marker: `${nonce}-N1` },
+  ]);
+  const a = ltStdinBlocks(out[0].raw); const b = ltStdinBlocks(out[1].raw);
+  assert.ok(Array.isArray(a) && Array.isArray(b), `premise: both are stream-json envelopes — ${out[0].raw.slice(0, 120)}`);
+  assert.ok(b.length > a.length, `premise: N+1 has more blocks (${a.length} -> ${b.length})`);
+  // The cache breakpoint is a marker, not content: the prompt cache matches the blocks WITHOUT it,
+  // and it has to move to the new last block on every request. Compare content, then pin the marker.
+  const content = ({ cache_control, ...rest }) => rest;
+  for (let i = 0; i < a.length; i++) assert.deepEqual(content(b[i]), content(a[i]), `block ${i} of step N changed in step N+1 — the cache cannot match past it`);
+  for (const [name, blocks] of [["N", a], ["N+1", b]]) {
+    const marked = blocks.map((x, i) => (x.cache_control ? i : -1)).filter((i) => i > -1);
+    assert.deepEqual(marked, [blocks.length - 1], `${name}: exactly one breakpoint, on the last block — ${JSON.stringify(marked)}`);
+    assert.deepEqual(blocks[blocks.length - 1].cache_control, { type: "ephemeral", ttl: "1h" }, `${name}: the default breakpoint is 1h`);
+  }
+  // user, the two calls, the two results as ONE block.
+  assert.equal(a.length, 3, `step N is 3 blocks: ${JSON.stringify(a.map((x) => x.text.slice(0, 40)))}`);
+  const last = a[2].text;
+  const iA = last.indexOf("[Tool lookup_a returned]\nresult A"); const iB = last.indexOf("[Tool lookup_b returned]\nresult B");
+  assert.ok(iA > -1 && iB > iA, `both results, in order, in one block — ${JSON.stringify(last)}`);
+});
+
+// The model reads the same characters as before: the blocks, concatenated, are byte-identical to the
+// kill switch's plain text minus its trailing note. Two boots, same body.
+ltTest("integration (#512): the blocks concatenate to exactly the pre-#512 text, minus the trailing note", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "E" + Math.random().toString(36).slice(2, 8);
+  const { stepN1 } = lt512Steps(nonce);
+  const body = { model: "sonnet", tools: LT512_TOOLS, messages: stepN1 };
+  const multi = await lt512Capture({}, [{ body, marker: `${nonce}-N1` }]);
+  const legacy = await lt512Capture({ OCP_MULTIBLOCK_INPUT: "0" }, [{ body, marker: `${nonce}-N1` }]);
+  const blocks = ltStdinBlocks(multi.out[0].raw);
+  const plain = legacy.out[0].raw;
+  assert.ok(Array.isArray(blocks), "premise: default mode sends blocks");
+  assert.equal(ltStdinBlocks(plain), null, "premise: the kill switch sends plain text");
+  const tail = `\n\n${TOOL_CONTINUATION_NOTE}`;
+  assert.ok(plain.endsWith(tail), `premise: the legacy text ends with the note — ${JSON.stringify(plain.slice(-80))}`);
+  assert.equal(blocks.map((x) => x.text).join(""), plain.slice(0, -tail.length));
+});
+
+// A system prompt that changed with "does the history end in a tool result" would invalidate the cache
+// at the layer BEFORE the conversation. Same tools, one request ending in a result, one not.
+ltTest("integration (#512): the system prompt is byte-identical whether or not the conversation ends in a tool result", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "S" + Math.random().toString(36).slice(2, 8);
+  const { stepN } = lt512Steps(nonce);
+  const { out, spawned } = await lt512Capture({}, [
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN }, marker: `${nonce}-N"` },
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: [...stepN, { role: "assistant", content: "done" }, { role: "user", content: `thanks ${nonce}-U` }] }, marker: `${nonce}-U` },
+  ]);
+  assert.ok(out[0].sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), "premise: the note is in the system prompt");
+  assert.equal(out[1].sp, out[0].sp, "the system prompt moved with the shape of the conversation");
+  assert.equal(spawned.length, 2, "premise: two spawns");
+  assert.equal(spawned[1].systemPromptSha, spawned[0].systemPromptSha, "claude_spawned must say the same");
+});
+
+// Over budget, a text-only conversation keeps the text path: its whole-message truncation, not the
+// block path's mid-block cut. That the prefix cannot be stable here is the stated limit (#512 plan §3.4).
+ltTest("integration (#512): an over-budget text-only conversation takes the text path, without the trailing note", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "B" + Math.random().toString(36).slice(2, 8);
+  const { stepN } = lt512Steps(nonce);
+  const big = [{ role: "user", content: "x".repeat(3000) }, ...stepN.slice(1)];
+  const { out, spawned } = await lt512Capture({ CLAUDE_MAX_PROMPT_CHARS: "2000" }, [
+    // No closing quote in this marker: this capture is plain text, not JSON.
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: big }, marker: `${nonce}-N` },
+  ]);
+  assert.equal(ltStdinBlocks(out[0].raw), null, `over budget must be plain text — ${out[0].raw.slice(0, 120)}`);
+  assert.equal(spawned[0]?.inputFormat, "text", JSON.stringify(spawned[0]));
+  assert.ok(out[0].raw.includes("older messages were truncated"), `premise: the text path's truncation ran — ${out[0].raw.slice(0, 200)}`);
+  assert.ok(!out[0].raw.includes(TOOL_CONTINUATION_NOTE), "the system prompt carries the note; the text path must not add it again");
+  assert.ok(out[0].sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), "premise: the note is in the system prompt");
+});
+
+// #512: OCP_CACHE_BREAKPOINT. Three boots, each the others' control: the default puts a 1h breakpoint
+// on the last block, 5m changes only the TTL, off removes it -- and claude_spawned says which.
+ltTest("integration (#512): OCP_CACHE_BREAKPOINT sets the last block's breakpoint — 1h by default, 5m, or none", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "C" + Math.random().toString(36).slice(2, 8);
+  const { stepN } = lt512Steps(nonce);
+  const body = { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN }, marker: `${nonce}-N"` };
+  for (const [env, want] of [[{}, { type: "ephemeral", ttl: "1h" }], [{ OCP_CACHE_BREAKPOINT: "5m" }, { type: "ephemeral", ttl: "5m" }], [{ OCP_CACHE_BREAKPOINT: "off" }, undefined]]) {
+    const { out, spawned } = await lt512Capture(env, [body]);
+    const blocks = ltStdinBlocks(out[0].raw);
+    assert.ok(Array.isArray(blocks) && blocks.length > 1, `premise: a multi-block envelope — ${out[0].raw.slice(0, 120)}`);
+    assert.deepEqual(blocks[blocks.length - 1].cache_control, want, `${JSON.stringify(env)}: last block's breakpoint`);
+    assert.equal(blocks.slice(0, -1).some((x) => x.cache_control), false, `${JSON.stringify(env)}: no other block may carry one`);
+    assert.equal(spawned[0].cacheBreakpoint, want?.ttl, `${JSON.stringify(env)}: claude_spawned must name the breakpoint in use`);
+  }
+});
+
+// The CLI spends 3 of the API's 4 breakpoints and decides the TTL of the one after ours, so the API
+// can refuse ours. The first refusal switches the breakpoint off for the rest of the boot: that request
+// fails, the next one runs without it instead of failing too.
+// Both lanes, because each has its own is_error arm and each must switch it off.
+for (const stream of [false, true]) ltTest(`integration (#512, ${stream ? "streaming" : "buffered"}): a 400 naming cache_control switches the breakpoint off for the rest of the boot`, async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, FAKE_REJECT_CACHE_CONTROL: "1" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r1 = await ltPostStatus(port, { model: "sonnet", stream, messages: [{ role: "user", content: "one" }] });
+      // The streaming lane answers an upstream error as an SSE error event on a 200.
+      assert.ok(r1.status !== 200 || /"error"/.test(r1.text), `premise: the fake refused the breakpoint — ${r1.status} ${r1.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => /"event":"cache_breakpoint_disabled"/.test(buf.out + buf.err)), `the switch-off must be logged — ${ltDiag(buf)}`);
+      const r2 = await ltPostStatus(port, { model: "sonnet", stream, messages: [{ role: "user", content: "two" }] });
+      assert.ok(r2.status === 200 && !/"error"/.test(r2.text), `the next request must run without the breakpoint, not fail too — ${r2.status} ${r2.text.slice(0, 200)}`);
+      const raw = _ltRead(stdinFile, "utf8");
+      assert.ok(raw.includes("two"), `premise: the capture is the second request's — ${raw.slice(0, 120)}`);
+      assert.ok(!raw.includes("cache_control"), `the second request still carried a breakpoint — ${raw.slice(0, 200)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "bp-off", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// Review P2 on #520: a 400 naming cache_control from a spawn that sent NO breakpoint (here the kill
+// switch) says nothing about ours and must not switch it off. The failing request is the premise.
+ltTest("integration (#512): a cache_control 400 from a spawn that carried no breakpoint does not switch it off", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_MULTIBLOCK_INPUT: "0",
+      UPSTREAM_ERROR: "API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5." }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "no breakpoint here" }] });
+      assert.ok(r.status !== 200 && /cache_control/.test(r.text), `premise: the request failed with the cache_control 400 — ${r.status} ${r.text.slice(0, 200)}`);
+      await new Promise((res) => setTimeout(res, 300));
+      assert.ok(!/"event":"cache_breakpoint_disabled"/.test(buf.out + buf.err), "a spawn that sent no breakpoint switched ours off");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "bp-not-ours", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The two modes hand the model different input, so a cached answer from one must not be served in
+// the other: MULTIBLOCK_INPUT is folded into CONFIG_EPOCH. Two boots sharing one store (#176 shape).
+ltTest("integration (#512): toggling OCP_MULTIBLOCK_INPUT invalidates the standard response cache (epoch fold)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const req = { model: "sonnet", messages: [{ role: "user", content: "multiblock-epoch-probe" }] };
+  const bootOnce = async (env) => {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 160)}`);
+      _ltWrite(counter, "0");
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multiblock-epoch", 5000); }
+  };
+  try {
+    const on = await bootOnce({});
+    const off = await bootOnce({ OCP_MULTIBLOCK_INPUT: "0" });
+    assert.equal(on, 1, "premise: the first request (cache empty) must spawn claude");
+    assert.equal(off, 1, "after toggling the flag the identical request must NOT be served from the other mode's cache");
+  } finally { _ltRmRetry(dir); }
+});
+
+// "Byte for byte" under the kill switch includes the IMAGE path, which takes stream-json in both modes:
+// no breakpoint, the trailing note back as the last block, and no note in the system prompt.
+ltTest("integration (#512 kill switch): an image request under OCP_MULTIBLOCK_INPUT=0 carries no breakpoint and keeps the trailing note", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt"); const spFile = join(dir, "sp.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, OCP_MULTIBLOCK_INPUT: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [
+        { role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: PNG } }] },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "lookup_a", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: "kill-switch-image-probe" },
+      ] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltExists(spFile)), "premise: captures");
+      const blocks = ltStdinBlocks(_ltRead(stdinFile, "utf8"));
+      assert.ok(Array.isArray(blocks) && blocks.some((b) => b.type === "image"), "premise: the image path, as stream-json");
+      assert.equal(blocks.some((b) => b.cache_control), false, "the kill switch must not send a breakpoint on the image path either");
+      assert.ok(blocks[blocks.length - 1].text?.includes(TOOL_CONTINUATION_NOTE), `the trailing note is the last block again — ${JSON.stringify(blocks[blocks.length - 1])}`);
+      assert.ok(!_ltRead(spFile, "utf8").includes(TOOL_CONTINUATION_SYSTEM_NOTE), "and it is not in the system prompt");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "ks-image", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nOpenAI tool calling over the MCP bridge (ADR 0022):");
+
+// ── unit: the pure helpers ──────────────────────────────────────────────────────────────────────
+test("ADR 0022: the bridge's prefix literal agrees with lib/tool-calling.mjs (two files, one truth)", () => {
+  // lib/mcp-bridge.mjs repeats the literal so it can stay import-free (it runs as a child of a
+  // child). This is the pin that turns "they agree" from a comment into a red.
+  assert.equal(BRIDGE_PREFIX, TC_PREFIX);
+  assert.equal(TC_PREFIX, "mcp__ocp__");
+});
+
+test("ADR 0022: validateTools accepts the spec shape and refuses what the bridge could not round-trip", () => {
+  const ok = [{ type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } }];
+  assert.equal(validateTools(ok), null);
+  assert.match(validateTools([]), /non-empty/);
+  assert.match(validateTools([{ type: "function", function: { name: "has space" } }]), /must match/);
+  assert.match(validateTools([{ type: "function", function: { name: "a".repeat(65) } }]), /must match/);
+  assert.match(validateTools([{ type: "code_interpreter" }]), /type must be "function"/);
+  assert.match(validateTools([ok[0], ok[0]]), /declared twice/);
+  assert.match(validateTools([{ type: "function", function: { name: "x", parameters: [] } }]), /JSON Schema object/);
+});
+
+test("ADR 0022: extractBridgeToolUses takes ONLY mcp__ocp__ calls and ignores the CLI's own tools", () => {
+  const ev = { type: "assistant", message: { content: [
+    { type: "text", text: "Let me look." },
+    { type: "tool_use", id: "t1", name: "ToolSearch", input: { query: "select:mcp__ocp__x" } },   // the deferred-tool lookup
+    { type: "tool_use", id: "t2", name: "mcp__ocp__lookup", input: { project: "alpha" } },
+    { type: "tool_use", id: "t3", name: "mcp__other__thing", input: {} },                       // not ours
+    { type: "tool_use", id: "t4", name: "mcp__ocp__second", input: { n: 2 } },
+  ] } };
+  assert.deepEqual(extractBridgeToolUses(ev), [
+    { id: "t2", name: "lookup", input: { project: "alpha" } },
+    { id: "t4", name: "second", input: { n: 2 } },
+  ]);
+  assert.equal(extractBridgeToolUses({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), null);
+  assert.equal(extractBridgeToolUses({ type: "user", message: { content: [{ type: "tool_use", name: "mcp__ocp__x" }] } }), null);
+});
+
+test("ADR 0022: toolUsesToOpenAI emits `arguments` as a JSON STRING and mints an id only when the CLI gave none", () => {
+  const out = toolUsesToOpenAI([{ id: "toolu_1", name: "a", input: { k: 1 } }, { id: null, name: "b", input: {} }], () => "call_minted");
+  assert.deepEqual(out, [
+    { id: "toolu_1", type: "function", function: { name: "a", arguments: "{\"k\":1}" } },
+    { id: "call_minted", type: "function", function: { name: "b", arguments: "{}" } },
+  ]);
+  assert.equal(typeof out[0].function.arguments, "string", "a client does JSON.parse(arguments); an object here breaks every client");
+});
+
+test("ADR 0022: renderToolTurn pairs a result with its call by id, and the continuation note follows the last result", () => {
+  const names = new Map();
+  const a = renderToolTurn({ role: "assistant", content: "On it.", tool_calls: [{ id: "c1", type: "function", function: { name: "lookup", arguments: "{\"p\":1}" } }] }, names);
+  assert.equal(a.text, "[Assistant] On it.\n[Assistant called tool lookup with arguments {\"p\":1}]");
+  const t = renderToolTurn({ role: "tool", tool_call_id: "c1", content: "build-9" }, names);
+  assert.equal(t.text, "[Tool lookup returned]\nbuild-9");
+  assert.equal(renderToolTurn({ role: "user", content: "hi" }, names), null, "ordinary messages are left to messagesToPrompt");
+  assert.equal(endsWithToolResult([{ role: "user", content: "q" }, { role: "assistant", tool_calls: [] }, { role: "tool", content: "r" }]), true);
+  assert.equal(endsWithToolResult([{ role: "tool", content: "r" }, { role: "user", content: "q" }]), false);
+  assert.equal(endsWithToolResult([{ role: "tool", content: "r" }, { role: "system", content: "s" }]), true, "a trailing system message does not change whose turn it is");
+  assert.ok(TOOL_CONTINUATION_NOTE.includes("results are final"));
+});
+
+test("ADR 0022: buildBridgeConfig names the server `ocp`, which is what puts mcp__ocp__ on every tool", () => {
+  const c = buildBridgeConfig({ nodeBin: "/n", bridgeScript: "/b.mjs", toolsFile: "/t.json" });
+  assert.deepEqual(c, { mcpServers: { ocp: { command: "/n", args: ["/b.mjs"], env: { OCP_TOOLS_FILE: "/t.json" } } } });
+});
+
+// ── integration: a tool turn end to end, against a fake claude that BLOCKS after its tool_use ────
+// The fake does what the real CLI was measured to do (lib/tool-calling.mjs header): emit the
+// assistant event carrying tool_use, then block waiting on the bridge. So this test proves three
+// things from one spawn: the response is tool_calls in OpenAI shape; the server ENDED the spawn
+// rather than waiting (the fake sleeps 120 s; the request completes in seconds); and the argv is the
+// bridge shape -- schema emptied, our config, strict, our prefix pre-approved, NO Bash.
+ltTest("integration (ADR 0022): a declared tool the model chooses comes back as tool_calls, and the spawn is ended, not awaited", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt"); const toolsFile = join(dir, "tools.json"); const stdinFile = join(dir, "stdin.txt");
+  try {
+    // CLAUDE_TIMEOUT short so that a server which FAILS to end the spawn reddens in 20 s (as a 500)
+    // rather than sitting on the fake's 120 s sleep. The 30 s assertion below is what reads it.
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000", ARGV_CAPTURE: argvFile, TOOLS_CAPTURE: toolsFile, STDIN_CAPTURE: stdinFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // The banner is printed AFTER `listening on` in the same listen() callback, so the first stdout
+      // chunk can legally end before it: waiting for `listening on` and then asserting this line is
+      // the #199 shape. Measured by the PR's reviewer on the unwaited version: 5 red in 8 runs.
+      assert.ok(await ltWait(() => buf.out.includes("Tool calling: ON")), `banner must say the bridge is on — ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } };
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], tool_choice: "auto", messages: [{ role: "user", content: "build id for alpha?" }] });
+      const elapsed = Date.now() - t0;
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      // The fake blocks after its tool_use, and CLAUDE_TIMEOUT above is 20 s. A server that ends the
+      // spawn ON THE EVENT completes in well under a second; one that merely waits for the timeout to
+      // do it completes at ~20 s with the same 200 and the same tool_calls -- which is why this bound
+      // sits at half the timeout and not above it. An earlier version said 30 s, and the mutation
+      // that removed the kill stayed green behind the timeout.
+      assert.ok(elapsed < 10000, `the request took ${elapsed} ms — the server waited for CLAUDE_TIMEOUT to end the blocked spawn instead of ending it on the tool_use event`);
+
+      const body = JSON.parse(r.text);
+      const ch = body.choices[0];
+      assert.equal(ch.finish_reason, "tool_calls", `finish_reason is the value a client branches on: ${JSON.stringify(ch)}`);
+      assert.equal(ch.message.role, "assistant");
+      assert.equal(ch.message.content, "Let me look that up.", "text the model wrote alongside its call is delivered, not dropped");
+      assert.deepEqual(ch.message.tool_calls, [{ id: "toolu_fake01", type: "function", function: { name: "lookup_build_id", arguments: "{\"project\":\"alpha\"}" } }]);
+
+      // argv: the bridge shape, and NOT the default nine
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, JSON.stringify(argv.slice(0, 8)));
+      // #512: `--input-format stream-json` now leads every -p tail; the bridge's flags follow it.
+      assert.deepEqual(argv.slice(spIdx + 2, spIdx + 4), ["--input-format", "stream-json"], JSON.stringify(argv.slice(spIdx)));
+      const tail = argv.slice(spIdx + 4);
+      assert.equal(tail[0], "--tools"); assert.equal(tail[1], "", "the built-in schema is EMPTIED: the model holds exactly the client's tools");
+      assert.equal(tail[2], "--mcp-config"); assert.ok(tail[3].endsWith(".json"), tail[3]);
+      assert.equal(tail[4], "--strict-mcp-config", "only the bridge is loaded; no account connectors");
+      // #478 added --include-partial-messages HERE, and the deepEqual is why that is checkable:
+      // the flag is what gives the turn a message-end signal, so a build that stops sending it goes
+      // back to ending on the first tool_use and truncating a parallel call to one -- silently.
+      assert.deepEqual(tail.slice(5), ["--allowedTools", "mcp__ocp__*", "--include-partial-messages"]);
+      assert.ok(!argv.includes("Bash"), `a tool turn must not also grant Bash: ${JSON.stringify(tail)}`);
+
+      // the tools file the bridge would serve: the client's array, verbatim
+      assert.ok(await ltWait(() => _ltExists(toolsFile)), "the fake did not capture the tools file");
+      assert.deepEqual(JSON.parse(_ltRead(toolsFile, "utf8")), [TOOL]);
+
+      // counters: emitted, not dropped
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.toolCallsEmitted, 1, "the turn must be counted as emitted");
+      assert.equal(h.stats.toolRequestsDropped, 0, "…and NOT as dropped");
+      assert.equal(h.stats.errors, 0, "ending the spawn on purpose is not an error");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-turn", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The other half of the loop: the client sends the result back. This spawn's PROMPT must carry the
+// rendered call and result, and the continuation note, because that text is the only way a fresh
+// spawn learns what happened (stream-json injection was measured not to work).
+const PAR_TOOLS = [
+  { type: "function", function: { name: "lookup_build_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } },
+  { type: "function", function: { name: "lookup_deploy_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } },
+];
+
+// #478. The CLI emits ONE assistant event PER CONTENT BLOCK, so a message carrying two parallel
+// calls arrives as two events and the turn has no stop_reason on either -- measured on 2.1.270,
+// where all three events of such a message share one message.id and the stop reason arrives only in
+// a trailing `message_delta`. Ending on the FIRST tool_use therefore handed the client 1 of N and
+// dropped any preamble.
+ltTest("integration (#478): BOTH parallel calls come back, and the preamble survives as content", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_PARALLEL: "1", CLAUDE_TIMEOUT: "20000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "both please" }] });
+      const took = Date.now() - t0;
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const body = JSON.parse(r.text);
+      const msg = body.choices[0].message;
+
+      // BOTH, in order. `.length` first: a bare deepEqual on names would report "1 !== 2" just as
+      // well, but the count is the claim and reading it first makes the failure say so.
+      assert.equal(msg.tool_calls.length, 2, `a parallel call must not be truncated — got ${JSON.stringify(msg.tool_calls)}`);
+      assert.deepEqual(msg.tool_calls.map((c) => c.function.name), ["lookup_build_id", "lookup_deploy_id"]);
+      assert.deepEqual(msg.tool_calls.map((c) => c.id), ["toolu_fakeA", "toolu_fakeB"], "each call keeps ITS OWN id, or the client cannot pair results");
+      assert.equal(body.choices[0].finish_reason, "tool_calls");
+
+      // The preamble arrived as a text DELTA, in its own block, before either call -- which is what
+      // made `content` null before: the tool events' own text is empty.
+      assert.equal(msg.content, "Looking both up.", `the preamble must survive — got ${JSON.stringify(msg.content)}`);
+
+      // Still ended, not awaited. Half the timeout, for the reason the sibling test records.
+      assert.ok(took < 10000, `the spawn must be ended on the end signal — took ${took} ms`);
+
+      // buf.OUT, not buf.err: the healthy ending logs at `info` and the degraded one at `warn`, and
+      // logEvent splits those across the two pipes. Asserting the wrong pipe is a test that fails
+      // for the right reason at the wrong place -- which is how this line was first written.
+      assert.match(buf.out, /"endedOn":"signal"/, `the healthy path must record WHICH trigger ended it, or it cannot be told from the degraded one — ${buf.out.slice(-400)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.toolCallsEmitted, 1, "one TURN, whatever the call count");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "parallel-tools", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The fail-safe, and its control is the test above: same fixture, end signal withheld. The calls
+// must still reach the client rather than be dropped -- but this arm CANNOT end the spawn early,
+// so it is slow by construction and says so in the log. Without this test the fallback would be
+// unreachable code that reads like a safety net.
+// THE FALLBACK IS BOUNDED, and the bound is the claim. Name-gating --include-partial-messages at
+// boot proves the CLI ACCEPTS it, never that the CLI still EMITS `stop_reason: "tool_use"`. A build
+// that accepted the flag and renamed the stop reason would send EVERY tool request down this arm --
+// so if the arm waits for CLAUDE_TIMEOUT, the fix is worse than the truncation it replaced. The
+// duration assertion is therefore not decoration: it is the only thing separating "degrades by a
+// bounded delay" from "hangs on every tool request", and it was missing until review asked.
+ltTest("integration (#478): with NO end signal the calls arrive on a BOUNDED wait, not at CLAUDE_TIMEOUT", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    // The two budgets are deliberately far apart so the assertion can tell them apart: quiesce at
+    // 1 s, CLAUDE_TIMEOUT at 30 s. A bound of "under 10 s" therefore fails loudly on a build that
+    // fell through to the timeout, and cannot pass by accident on a slow host.
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_PARALLEL: "1", TOOL_USE_NO_END_SIGNAL: "1", OCP_TOOL_TURN_QUIESCE_MS: "1000", CLAUDE_TIMEOUT: "30000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "both please" }] });
+      const took = Date.now() - t0;
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const msg = JSON.parse(r.text).choices[0].message;
+      assert.equal(msg.tool_calls.length, 2, `both calls must survive the fallback — got ${JSON.stringify(msg.tool_calls)}`);
+      assert.ok(took < 10000, `the fallback must be BOUNDED, not wait for CLAUDE_TIMEOUT — took ${took} ms against a 30000 ms timeout`);
+      // ...and it must not be so eager that it beats a signal that was merely a little late.
+      assert.ok(took >= 1000, `the quiescence budget must actually be spent — took ${took} ms`);
+      assert.match(buf.err, /"endedOn":"quiescence"/, `the log must say WHICH trigger ended it — ${buf.err.slice(-400)}`);
+      assert.match(buf.err, /"signalMissing":true/, `and name itself as the degraded path — ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "parallel-nosignal", 8000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// ── #474: a timeout that never answers the client is a hang, not a timeout ────────────────────
+//
+// The overall timer kills only the DIRECT child. A grandchild that inherited the stdout pipe —
+// the `sleep 300 & wait` shape, which a real `claude` tool subprocess can produce — survives the
+// SIGTERM/SIGKILL aimed at the parent and keeps the pipe open. 'close' therefore never fires, and
+// the promise in callClaude (the SSE stream in callClaudeStreaming) settles only on 'close', so
+// the client waits forever. MEASURED 2026-09-17 on v3.37.0 (issue #474, CLAUDE_TIMEOUT=30000):
+// the client request hung past 240 s while the server log already showed request_timeout and a
+// claude_exit — the parent was reaped, the response was never sent.
+//
+// Fixture B below reproduces the shape with a fake whose ONLY job is to hold the pipe; fixture A
+// is LT_FAKE (emits a result, exits 0) as the control. The fix has two parts, and each gets its
+// own assertion: (1) the TIMER answers the client (500 on the buffered lane, error frame + [DONE]
+// on the streaming lane) — proven by the response ARRIVING with a bounded elapsed; (2) the KILL
+// reaches the whole process group (detached: true + kill(-pid)) — proven by the grandchild being
+// DEAD after the response, not merely the parent. Pre-fix, both fixture-B tests fail at the
+// 12 s abort: the response never arrives and the grandchild is still alive.
+const LT474_FAKE_HOLD = `#!/bin/sh
+# #474 fixture B: a claude fake with TWO call shapes, because the server issues BOTH within one
+# request cycle and the fixture must emulate the real claude for each:
+#   \`claude auth status\` — the periodic auth probe (server.mjs execFile, per-process kill).
+#     Real claude exits promptly and forks no long-lived children, so this path must too —
+#     otherwise its orphan grandchild clobbers the pid file below and the test polls a process
+#     the request's group kill can never touch (measured: the flake's true source).
+#   \`claude --model ... -p ...\` — the request. THIS is the #474 scenario: a grandchild (a real
+#     claude tool subprocess) holds the stdout pipe. A SIGTERM aimed at the shell only (pre-fix)
+#     leaves sleep alive and the pipe open.
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true}'
+  exit 0
+fi
+sleep 300 &
+echo $! > "$GRANDCHILD_PID_FILE"
+wait
+`;
+
+// #474 fixture C: the STUCK-PIPE shape (zai review P2). Fixture B's parent is alive when the
+// timer fires; here the parent exits on its OWN within milliseconds (like a claude that
+// finishes its turn while a tool-spawned descendant it abandoned keeps the inherited stdout fd
+// open). Pre-fix, 'exit' runs cleanup() which CLEARS the request timer, so with the parent gone
+// no watchdog remains and the client hangs with zero response — the same failure class #474
+// eliminates, just with an earlier parent death. The fix must keep a live watchdog until
+// 'close' (the pipe) settles, not until 'exit'.
+const LT474_FAKE_ORPHAN = `#!/bin/sh
+# auth probe: same discipline as fixture B (real claude forks no long-lived children here).
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true}'
+  exit 0
+fi
+sleep 300 &
+echo $! > "$GRANDCHILD_PID_FILE"
+# NO wait: the shell exits immediately, orphaning the pipe-holding grandchild.
+`;
+
+// #474 fixture D: the WITH-RESULT stuck-pipe shape (zai review P1 counter-reproduction). The
+// parent emits a FULL result — LT_FAKE's exact success shape, assistant + result events — and
+// then exits WITHOUT waiting while a tool-spawned descendant keeps the inherited stdout fd open.
+// The buffered lane settles only on 'close', so this request must still be answered at the
+// deadline: a 500 timeout with a request_timeout log, never silence. If the watchdog were
+// disarmed at result parse (the P1's claimed failure), this request would hang with no response
+// and no log line — the test would fail at the 12 s abort with the diagnostic.
+const LT474_FAKE_RESULT_ORPHAN = `#!/bin/sh
+# auth probe: same discipline as fixtures B/C (real claude forks no long-lived children here).
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true}'
+  exit 0
+fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+sleep 300 &
+echo $! > "$GRANDCHILD_PID_FILE"
+# NO wait: the shell exits with the result already written, orphaning the pipe-holder.
+`;
+
+function lt474FakeHold(dir) {
+  const p = join(dir, "claude-hold");
+  _ltWrite(p, LT474_FAKE_HOLD);
+  _ltChmod(p, 0o755);
+  return p;
+}
+
+function lt474FakeOrphan(dir) {
+  const p = join(dir, "claude-orphan");
+  _ltWrite(p, LT474_FAKE_ORPHAN);
+  _ltChmod(p, 0o755);
+  return p;
+}
+
+function lt474FakeResultOrphan(dir) {
+  const p = join(dir, "claude-result-orphan");
+  _ltWrite(p, LT474_FAKE_RESULT_ORPHAN);
+  _ltChmod(p, 0o755);
+  return p;
+}
+
+// `process.kill(pid, 0)` cannot tell a zombie from a live process, and a reparented grandchild
+// IS a zombie between death and reaping — so asking it would report "alive" for a dead process.
+// And on a loaded machine a DEAD grandchild's pid can be reused by an unrelated process inside
+// the polling window, which would also read "alive". Ask ps for both the state AND the start
+// time: empty = gone, Z = zombie (dead, unreaped), and a live process whose start time differs
+// from the fingerprint is a REUSE — our grandchild is dead either way.
+function lt474Start(pid) {
+  const r = spawnSync("ps", ["-p", String(pid), "-o", "lstart="]);
+  // Normalize EXACTLY like lt474Alive's probe: ps space-pads single-digit days
+  // ("Wed Dec  3 10:00:00"), and lt474Alive rejoins its split with single spaces — if this
+  // fingerprint kept the raw double space, every day 1-9 of a month a LIVE grandchild would
+  // mismatch and read "dead", passing the kill assertions vacuously.
+  return (r.stdout || "").toString().trim().split(/\s+/).join(" ");
+}
+function lt474Alive(pid, startFp) {
+  const r = spawnSync("ps", ["-p", String(pid), "-o", "stat=,lstart="]);
+  if (r.error) return false;
+  const out = (r.stdout || "").toString().trim();
+  if (out === "") return false;
+  const [stat, ...rest] = out.split(/\s+/);
+  if (/^Z/.test(stat)) return false; // zombie = dead, unreaped
+  // A live process at our pid with a DIFFERENT start time is a reuse, not the grandchild.
+  // An empty fingerprint means the grandchild was ALREADY DEAD when we fingerprinted, so a live
+  // process at that pid can only be a reuse — it must read "dead". (An `||` here would be a
+  // flake: on a loaded machine the dead pid gets reused inside the polling window and the
+  // reused process reads "alive", failing a correct fix.)
+  return startFp !== "" && rest.join(" ") === startFp;
+}
+async function lt474WaitDead(pid, startFp, ms = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (!lt474Alive(pid, startFp)) return true;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return !lt474Alive(pid, startFp);
+}
+
+// The grandchild outlives every server in this block — pre-fix by up to 300 s, and on any
+// failure path of a post-fix run it must not be left holding a pipe to a dead server either.
+function lt474ReapGrandchild(pidFile) {
+  if (!_ltExists(pidFile)) return;
+  const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+  if (!Number.isInteger(gp) || gp <= 0) return;
+  // Fingerprint before kill (zai review P2): a bare kill of a pid read from a file can strike an
+  // UNRELATED process — on a loaded machine the dead grandchild's pid can be reused inside the
+  // window, and this cleanup runs unconditionally in every fixture test's finally. Only reap a pid
+  // the oracle still reads as OUR grandchild (live AND start-time-matching). A microsecond TOCTOU
+  // between the probe and the kill remains — it shrinks the hazard from "entirely plausible" to
+  // "requires a reuse in the same poll", which is acceptable for test cleanup, not for production.
+  const fp = lt474Start(gp);
+  if (fp && lt474Alive(gp, fp)) { try { process.kill(gp, "SIGKILL"); } catch { /* already gone */ } }
+}
+
+// On a kill miss: show the grandchild's actual group so a reviewer can see whether it was even
+// in the signaled group (a pid whose group id is NOT the fake shell's pid means the detached
+// spawn did not take effect — a different defect than a missed signal). The keyword list is the
+// intersection of GNU and BSD ps — `sid` is rejected by macOS ps ("keyword not found") and would
+// have made the whole line vanish exactly when it is needed.
+function lt474KillDiag(pidFile, buf) {
+  const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+  const r = spawnSync("ps", ["-o", "pid,ppid,pgid,stat,comm", "-p", String(gp)]);
+  const psLine = ((r.stdout || "") + (r.stderr || "")).toString().trim().replace(/\n/g, " | ") || "ps: gone";
+  return `grandchild ps: ${psLine}`;
+}
+
+// #474 oracle self-check (zai review P2): the group-kill assertion only means something if the
+// liveness oracle actually works — not just that ps prints a line, but that the fingerprint
+// COMPARISON discriminates. It is verified against a KNOWN-LIVE pid (the server just booted):
+// the oracle must read that live server as ALIVE. If `ps` is missing (slim CI containers), the
+// stat/lstart keywords are unsupported, or the fingerprint normalization is asymmetric (ps
+// space-pads single-digit days — "Dec  3" — and the two sides must normalize identically), the
+// live server reads "dead" and the test fails loudly instead of letting the kill assertions
+// pass vacuously on a real regression.
+function lt474PsSanity(serverPid) {
+  const fp = lt474Start(serverPid);
+  if (!fp) return "the ps lstart probe returned nothing for a live pid — ps or the keyword is unavailable here";
+  if (!lt474Alive(serverPid, fp)) return "the oracle read a KNOWN-LIVE process as dead — the lstart fingerprint comparison is broken on this platform";
+  return "";
+}
+
+ltTest("integration (#474): a grandchild holding stdout gets a 500 at the timeout, not silence", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeHold(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const before = await ltHealth(port);
+      assert.ok(before && before.stats, `precondition: /health serves a stats block — ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the client got NO response in 12 s — the #474 hang (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      // Premise: the timer really fired. A fast failure that merely LOOKS like a timeout would
+      // pass every other assertion here and prove nothing.
+      assert.ok(elapsed >= 1500, `the response at ${elapsed} ms predates the 2000 ms timeout — this is not the timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the response took ${elapsed} ms — it must be bounded by the timer, not by the 12 s abort`);
+      assert.equal(r.status, 500, `a timeout is a REFUSED request, not a success — got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /timed out/i, `the body must say it timed out — got ${r.text.slice(0, 200)}`);
+      assert.match(buf.err, /"event":"request_timeout"/, `the timer must have logged — ${buf.err.slice(-300)}`);
+      const after = await ltHealth(port);
+      assert.ok(after && after.stats, `/health must still serve after the timeout — ${ltDiag(buf)}`);
+      assert.equal(after.stats.timeouts, before.stats.timeouts + 1, "the timeout moves the aggregate counter exactly once");
+      // Part 2: the KILL must have reached the grandchild — the holder, not just the parent.
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      // Fingerprint the grandchild NOW: if the kill missed, it is still alive here (the kill can
+      // land only at the 2 s timer), so its start time is capturable and the check below will
+      // keep reading "alive" for it — a real failure stays a real failure. If the kill worked,
+      // the process is already gone and the fingerprint is empty, which reads "dead".
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the grandchild (pid ${gp}) that holds the stdout pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-buffered", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474): a grandchild holding stdout ends the SSE stream at the timeout, not silence", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeHold(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the SSE stream never ended in 12 s — the #474 hang on the streaming lane (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      assert.ok(elapsed >= 1500, `the stream ended at ${elapsed} ms — before the 2000 ms timeout, so this is not the timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the stream took ${elapsed} ms to end — it must end at the timeout, not at the 12 s abort`);
+      assert.equal(r.status, 200, "the eager SSE headers make the status unchangeable; the FAILURE must ride in the frame");
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /"type":"proxy_error"/, `the timeout must surface as an error frame — got ${r.text.slice(0, 300)}`);
+      assert.match(r.text, /timed out/i, `the frame must say it timed out — got ${r.text.slice(0, 300)}`);
+      assert.match(r.text, /data: \[DONE\]/, "the stream must be TERMINATED, not merely errored");
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      // Fingerprint as in the buffered twin — see there for why the empty-fingerprint case is safe.
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the grandchild (pid ${gp}) holding the pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-streaming", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474): a parent that exits early with an orphan holding stdout still gets a 500 at the timeout", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeOrphan(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const before = await ltHealth(port);
+      assert.ok(before && before.stats, `precondition: /health serves a stats block — ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the client got NO response in 12 s — the stuck-pipe #474 hang: the parent exited, the orphan held the pipe, and no watchdog answered (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      // The parent dies in ~0 ms here, so any fast failure would NOT be the timeout path.
+      // The response must arrive AT the deadline: the watchdog that survived the parent's exit.
+      assert.ok(elapsed >= 1500, `the response at ${elapsed} ms predates the 2000 ms timeout — this is not the stuck-pipe timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the response took ${elapsed} ms — it must be bounded by the timer, not by the 12 s abort`);
+      assert.equal(r.status, 500, `a timeout is a REFUSED request, not a success — got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /timed out/i, `the body must say it timed out — got ${r.text.slice(0, 200)}`);
+      assert.match(buf.err, /"event":"request_timeout"/, `the timer must have logged — ${buf.err.slice(-300)}`);
+      const after = await ltHealth(port);
+      assert.ok(after && after.stats, `/health must still serve after the timeout — ${ltDiag(buf)}`);
+      assert.equal(after.stats.timeouts, before.stats.timeouts + 1, "the timeout moves the aggregate counter exactly once");
+      // Part 2: the group kill must have reached the orphan — the pipe holder, not the (already dead) parent.
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      // Same fingerprint discipline as the buffered twin: an alive orphan is a real failure.
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the orphaned grandchild (pid ${gp}) holding the pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-stuckpipe", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474): a parent that emits the full result and exits with an orphan holding stdout still gets a 500 at the timeout", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeResultOrphan(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const before = await ltHealth(port);
+      assert.ok(before && before.stats, `precondition: /health serves a stats block — ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the client got NO response in 12 s — the with-result stuck-pipe hang: the result was emitted, the parent exited, the orphan held the pipe, and no watchdog answered (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      // The parent exits ~0 ms after emitting the result, so a fast response would NOT be the
+      // timeout path — and the buffered lane settles only on 'close', which the orphan prevents.
+      // The ONLY correct answer is the timeout at the deadline: a 500, never a 200 (the client
+      // was never served) and never silence.
+      assert.ok(elapsed >= 1500, `the response at ${elapsed} ms predates the 2000 ms timeout — this is not the stuck-pipe timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the response took ${elapsed} ms — it must be bounded by the timer, not by the 12 s abort`);
+      assert.equal(r.status, 500, `a timeout is a REFUSED request, not a success — the emitted result was never delivered to the client, so a 200 would be a lie: got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /timed out/i, `the body must say it timed out — got ${r.text.slice(0, 200)}`);
+      assert.match(buf.err, /"event":"request_timeout"/, `the timer must have logged — ${buf.err.slice(-300)}`);
+      const after = await ltHealth(port);
+      assert.ok(after && after.stats, `/health must still serve after the timeout — ${ltDiag(buf)}`);
+      // Exactly ONE accounting. Global, from /health: the timeout moves timeouts+1 and NOT
+      // errors (a timeout is a separate class, ADR 0018).
+      assert.equal(after.stats.timeouts, before.stats.timeouts + 1, "the timeout moves the aggregate counter exactly once");
+      assert.equal(after.stats.errors, before.stats.errors, "the global error counter must not move — a timeout is not an error (ADR 0018)");
+      // Per-model, from the wire — /usage is the only endpoint that serves the model snapshot.
+      // Same no-token 502 branch as the ADR 0018 test: the `models` block is attached either
+      // way, so the per-model counters are readable with every credential source closed.
+      const ur = await fetch(`http://127.0.0.1:${port}/usage`);
+      assert.equal(ur.status, 502, `/usage must take the no-token branch here — got ${ur.status} ${ltDiag(buf)}`);
+      const ub = await ur.json();
+      const m = ub.models || {};
+      const keys = Object.keys(m);
+      assert.equal(keys.length, 1, `premise: exactly one model row on a fresh boot — or the per-model assertions are vacuous; got ${JSON.stringify(m)}`);
+      const row = m[keys[0]];
+      assert.equal(row.timeouts, 1, `the per-model timeout counter must agree with the aggregate one (ADR 0018) — got ${JSON.stringify(row)}`);
+      assert.equal(row.errors, 1, "the timeout counts as the single per-model failure — not two bookings");
+      assert.equal(row.successes, 0, `the emitted-but-undelivered result must NOT be recorded as a success: the close that lands after the group kill is a REAP, not a second settlement — without the timedOut guard the buffered fall-through (code=0, resultEventSeen=true) takes the success arm for a request whose client received a 500 (measured red: successes=1 alongside errors=1, timeouts=1); got ${JSON.stringify(row)}`);
+      // Part 2: the group kill must have reached the orphan — the pipe holder.
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the orphaned grandchild (pid ${gp}) holding the pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-result-stuckpipe", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474 control): a normal spawn still completes with the detached process group", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].message.content, "OK",
+        "fixture A must answer normally — the control that the detached/group-kill change did not break the happy path");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// #512 split this test in two: the rendering is the same on both input paths, but WHERE the
+// continuation note lives is not. Default (OCP_MULTIBLOCK_INPUT on): stdin is one stream-json
+// envelope whose LAST block is the tool result itself, and the note is in the system prompt. Kill
+// switch: the pre-#512 shape, plain-text stdin with the note after the last result. The two tests
+// are each other's control -- a mutation that puts the note in both places, or in neither, reddens one.
+async function ltToolResultTurn(env) {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt"); const spFile = join(dir, "sp.txt"); const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, ARGV_CAPTURE: argvFile, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
+        { role: "user", content: "build id for alpha?" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_abc", type: "function", function: { name: "lookup_build_id", arguments: "{\"project\":\"alpha\"}" } }] },
+        { role: "tool", tool_call_id: "call_abc", content: "build-7f3a9c" },
+      ] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].finish_reason, "stop", "the fake answers with text, so this turn ends normally");
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltExists(spFile)), "the fake did not capture stdin and the system prompt");
+      return { raw: _ltRead(stdinFile, "utf8"), sp: _ltRead(spFile, "utf8"), argv: ltArgvCalls(argvFile) };
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-result", 5000); }
+  } finally { _ltRmRetry(dir); }
+}
+
+ltTest("integration (ADR 0022, #512): a tool result sent back is rendered into the next spawn's prompt, ends it, and the continuation note rides in the system prompt", async () => {
+  if (!LT_POSIX) return;
+  const { raw, sp, argv } = await ltToolResultTurn({});
+  const blocks = ltStdinBlocks(raw);
+  assert.ok(Array.isArray(blocks) && blocks.length >= 2, `premise: a stream-json envelope with one block per message — ${raw.slice(0, 300)}`);
+  assert.ok(argv.includes("--input-format"), `premise: the stream-json input path — ${JSON.stringify(argv.slice(-10))}`);
+  const text = blocks.map((b) => b.text).join("");
+  // Positive anchors first (#405), then order.
+  const iCall = text.indexOf("[Assistant called tool lookup_build_id with arguments {\"project\":\"alpha\"}]");
+  const iRes = text.indexOf("[Tool lookup_build_id returned]\nbuild-7f3a9c");
+  assert.ok(iCall > -1, `the call was not rendered: ${text.slice(0, 300)}`);
+  assert.ok(iRes > iCall, `the result was not rendered after the call (call@${iCall}, result@${iRes})`);
+  // The cache property: the prompt ENDS on the result itself, so the next request's blocks extend
+  // this one's instead of replacing its last block.
+  assert.ok(blocks[blocks.length - 1].text.endsWith("[Tool lookup_build_id returned]\nbuild-7f3a9c"),
+    `the last block must be the tool result — ${JSON.stringify(blocks[blocks.length - 1])}`);
+  assert.ok(!text.includes(TOOL_CONTINUATION_NOTE), "the trailing note must not be in the user turn");
+  assert.ok(sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), `the note must reach the spawn through the system prompt — ${sp.slice(-300)}`);
+});
+
+ltTest("integration (ADR 0022, #512 kill switch): OCP_MULTIBLOCK_INPUT=0 restores plain-text stdin with the continuation note after the last result", async () => {
+  if (!LT_POSIX) return;
+  const { raw, sp, argv } = await ltToolResultTurn({ OCP_MULTIBLOCK_INPUT: "0" });
+  assert.equal(ltStdinBlocks(raw), null, `premise: plain-text stdin — ${raw.slice(0, 120)}`);
+  assert.ok(!argv.includes("--input-format"), `no stream-json input on the text path — ${JSON.stringify(argv.slice(-10))}`);
+  const iCall = raw.indexOf("[Assistant called tool lookup_build_id with arguments {\"project\":\"alpha\"}]");
+  const iRes = raw.indexOf("[Tool lookup_build_id returned]\nbuild-7f3a9c");
+  const iNote = raw.indexOf(TOOL_CONTINUATION_NOTE);
+  assert.ok(iCall > -1, `the call was not rendered: ${raw.slice(0, 300)}`);
+  assert.ok(iRes > iCall, `the result was not rendered after the call (call@${iCall}, result@${iRes})`);
+  assert.ok(iNote > iRes, `the continuation note must follow the last result (result@${iRes}, note@${iNote})`);
+  assert.ok(!sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), "the kill switch must also take the note back out of the system prompt");
+});
+ltTest("integration (ADR 0022): with stream:true the tool_calls arrive as one indexed delta, then finish_reason, then [DONE]", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000", TOOL_USE_NAME: "lookup_build_id" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "sonnet", stream: true, tools: [TOOL], messages: [{ role: "user", content: "build id for alpha?" }] }) });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get("content-type") || "", /text\/event-stream/);
+      const raw = await res.text();
+      // Positive count first (#405): an empty stream satisfies every "no bad chunk" claim.
+      const frames = raw.split("\n\n").filter(Boolean);
+      assert.ok(frames.length >= 4, `expected role, tool_calls, finish, [DONE]; got ${frames.length}: ${raw.slice(0, 300)}`);
+      assert.equal(frames[frames.length - 1], "data: [DONE]");
+      const chunks = frames.slice(0, -1).map(f => { assert.ok(f.startsWith("data: "), f); return JSON.parse(f.slice(6)); });
+      const deltas = chunks.map(c => c.choices[0]);
+      // 1: role (+ the text the model wrote alongside its call)
+      assert.equal(deltas[0].delta.role, "assistant");
+      assert.equal(deltas[0].delta.content, "Let me look that up.");
+      // 2: the call, whole, with its index -- a client accumulating by index sees one piece
+      const tc = deltas[1].delta.tool_calls;
+      assert.ok(Array.isArray(tc) && tc.length === 1, JSON.stringify(deltas[1]));
+      assert.deepEqual(tc[0], { index: 0, id: "toolu_fake01", type: "function", function: { name: "lookup_build_id", arguments: "{\"project\":\"alpha\"}" } });
+      assert.equal(typeof tc[0].function.arguments, "string");
+      // 3: the finish reason a client branches on
+      assert.equal(deltas[2].finish_reason, "tool_calls");
+      assert.ok(deltas.slice(0, 2).every(d => d.finish_reason === null), "finish_reason must be null until the closing chunk");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-stream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// #477 INVERTS the test that used to live here. Until now an image ANYWHERE in the conversation
+// refused tool calling outright, because the multimodal spawn path did not render tool turns and a
+// vision agent's turn 2 would re-call forever. Both halves are asserted, because the claim is that
+// the image path now behaves like the text path and one assertion cannot say that:
+//   turn 1 -- the bridge is wired even though an image is present (it used to be refused), and
+//   turn 2 -- the rendered call, result and continuation note reach the spawn's stdin IN ORDER,
+//             which is the thing whose absence caused the re-call loop.
+ltTest("integration (#477): an image request IS bridged, and its tool history reaches the next spawn", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  const stdinFile = join(dir, "stdin.txt");
+  const spFile = join(dir, "sp.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      const imageTurn = { role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: PNG } }] };
+
+      // TURN 1: the bridge must be wired. This is the assertion the old test made backwards.
+      const r1 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [imageTurn] });
+      assert.equal(r1.status, 200, `${r1.status} ${r1.text.slice(0, 200)}`);
+      const calls = JSON.parse(r1.text).choices[0].message.tool_calls;
+      assert.ok(Array.isArray(calls) && calls.length === 1, `an image request must now be bridged — got ${r1.text.slice(0, 250)}`);
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, "no argv captured");
+      assert.ok(argv.includes("--mcp-config"), `the bridge must be wired on the image path: ${JSON.stringify(argv.slice(-8))}`);
+      // ...and it is still the MULTIMODAL lane, or this proves nothing about that lane.
+      assert.ok(argv.includes("--input-format"), `still the stream-json input path: ${JSON.stringify(argv.slice(-10))}`);
+
+      // TURN 2: the history the model actually receives. Anchor on the ORDER, because the failure
+      // this replaces was not "the text is missing" but "the model never learned the result".
+      const NONCE = "NONCE-" + Math.random().toString(36).slice(2, 10);
+      const r2 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
+        imageTurn,
+        { role: "assistant", content: "Let me look that up.", tool_calls: [{ id: "call_x1", type: "function", function: { name: "lookup_build_id", arguments: '{"project":"alpha"}' } }] },
+        { role: "tool", tool_call_id: "call_x1", content: NONCE },
+      ] });
+      assert.equal(r2.status, 200, `${r2.status} ${r2.text.slice(0, 200)}`);
+      // WAIT FOR TURN 2'S CAPTURE, not for the file. Turn 1 is bridged now, so it captured stdin
+      // too and the file already exists — `_ltExists` returns true immediately and says nothing
+      // about whose capture is in it. STDIN_CAPTURE is write-then-rename (overwrite), so reading on
+      // mere existence races turn 2's write and can read TURN 1. The nonce appears only in turn 2,
+      // which makes it the thing to wait for. (#405: wait for what you are about to assert.)
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes(NONCE)),
+        `turn 2's stdin capture never appeared — ${_ltExists(stdinFile) ? _ltRead(stdinFile, "utf8").slice(0, 300) : "(no file)"}`);
+      const stdin = _ltRead(stdinFile, "utf8");
+      const iCall = stdin.indexOf("[Assistant called tool lookup_build_id");
+      const iResult = stdin.indexOf("[Tool lookup_build_id returned]");
+      const iNonce = stdin.indexOf(NONCE);
+      // Anchors by INDEX before any ordering claim (#347): -1 is not "early", it is "absent".
+      assert.ok(iCall > -1, `the rendered CALL must reach the spawn — ${stdin.slice(0, 400)}`);
+      assert.ok(iResult > -1, `the rendered RESULT must reach the spawn — ${stdin.slice(0, 400)}`);
+      assert.ok(iNonce > -1, `the client's own result value must reach the spawn — ${stdin.slice(0, 400)}`);
+      assert.ok(iCall < iResult && iResult < iNonce,
+        `order must be call → result → value, got ${iCall}/${iResult}/${iNonce}`);
+      // #512: the continuation note reaches the spawn through the system prompt now, not as a
+      // trailing user block (which moved every step and broke the prompt cache).
+      assert.ok(!stdin.includes(TOOL_CONTINUATION_NOTE), `the trailing note must not be in the user turn — ${stdin.slice(-300)}`);
+      assert.ok(_ltExists(spFile) && _ltRead(spFile, "utf8").includes(TOOL_CONTINUATION_SYSTEM_NOTE),
+        "the continuation note must reach the spawn through the system prompt");
+      // The image is still there: rendering the history must not have displaced it.
+      assert.match(stdin, /"type":"image"/, `the image block must survive alongside the rendered turns — ${stdin.slice(0, 300)}`);
+      // A rendered turn already carries its own role marker, so rolePrefix must NOT be applied on
+      // top. Without this the two paths drift by a doubled `[Assistant] [Assistant]` and every other
+      // assertion here still passes — found because the mutation that adds the prefix came back
+      // GREEN. The positive anchors above are what make this negative safe to trust.
+      assert.ok(!stdin.includes("[Assistant] [Assistant]"),
+        `the rendered turn must not be given a SECOND role prefix — ${stdin.slice(0, 400)}`);
+      // A rendered turn's OWN image must survive too. Rendering flattens content to text, so a bare
+      // `continue` dropped an image carried BY a tool result -- silently, and without counting it.
+      // Two images in, two images out; measured against origin/main, which emits two.
+      const r3 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
+        imageTurn,
+        { role: "assistant", content: "Let me look.", tool_calls: [{ id: "call_x2", type: "function", function: { name: "lookup_build_id", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_x2", content: [{ type: "text", text: "chart:" }, { type: "image_url", image_url: { url: PNG } }] },
+      ] });
+      assert.equal(r3.status, 200, `${r3.status} ${r3.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes("chart:")),
+        "turn 3's stdin capture never appeared");
+      const stdin3 = _ltRead(stdinFile, "utf8");
+      const imgs = (stdin3.match(/"type":"image"/g) || []).length;
+      assert.equal(imgs, 2, `an image carried BY a tool result must survive the rendering — got ${imgs} image blocks`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-image", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (ADR 0022): tool_choice \"none\" is the plain path and is NOT counted as a drop", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], tool_choice: "none", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].message.tool_calls, undefined);
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, "no argv captured");
+      assert.ok(!argv.includes("--mcp-config"), `tool_choice none must not bridge: ${JSON.stringify(argv.slice(-8))}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.toolRequestsDropped, 0, "text is the spec-mandated outcome for \"none\"; it is not a drop");
+      assert.equal(h.stats.toolCallsEmitted, 0);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-none", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (ADR 0022): OCP_TOOL_CALLING=0 restores the dropped-and-counted path, with the reason logged", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_TOOL_CALLING: "0", ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => buf.out.includes("Tool calling: OFF (OCP_TOOL_CALLING=0)")), `banner — ${ltDiag(buf)}`);  // same #199 shape as above
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      const body = JSON.parse(r.text);
+      assert.equal(body.choices[0].finish_reason, "stop");
+      assert.equal(body.choices[0].message.tool_calls, undefined, `switch is off, yet tool_calls came back: ${r.text.slice(0, 200)}`);
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, "no argv captured");
+      assert.ok(!argv.includes("--mcp-config"), `no bridge must be configured with the switch off: ${JSON.stringify(argv.slice(-8))}`);
+      assert.ok(argv.includes("Bash"), "the default nine are back");
+      // logEvent writes to stderr, and the event lands after the response is sent -- wait for it.
+      assert.ok(await ltWait(() => /"event":"openai_tools_dropped"/.test(buf.err)), `no drop event — ${ltDiag(buf)}`);
+      assert.ok(/"reason":"OCP_TOOL_CALLING=0"/.test(buf.err), `the drop must say WHY — ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-off", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nForced tool_choice is refused, permissive tool_choice is untouched (#311, ADR 0013):");
 
 test("#311: tool_choice \"required\" is refused — the spec demands finish_reason tool_calls and OCP cannot produce one", () => {
@@ -5373,7 +8730,7 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
 fi
 prev=""
 for a in "$@"; do
-  if [ "$prev" = "--system-prompt" ] && [ -n "$SP_CAPTURE" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
+  if [ "$prev" = "--system-prompt-file" ] && [ -n "$SP_CAPTURE" ]; then cat "$a" > "$SP_CAPTURE"; fi
   prev="$a"
 done
 if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
@@ -5513,13 +8870,62 @@ async function ltHealth(port) {
 // too, so feed the measured overshoot back into the deadline — see ltWait's comment for the
 // measurements behind the 10x cap), but the predicate needs a real HTTP GET /health per poll,
 // which ltWait's synchronous cond() cannot express. Returns the matching body, or null.
+// #457: the LAST /health body ltWaitHealth read, kept so a timeout can say WHY it timed out.
+//
+// On timeout ltWaitHealth returns null, which is falsy for `assert.ok(...)` -- and that null is
+// the same whether the server was unreachable or answered 30 times with a body the predicate
+// kept rejecting. Those two have unrelated root causes, and #457 is currently stuck between them
+// precisely because the failure message reports PROCESS state (ltDiag) rather than the body the
+// waiter just read. This makes the next occurrence self-diagnosing rather than another data point.
+//
+// Deliberately module-level rather than a changed return shape: ltWaitHealth has 29 call sites, and
+// every one of them relies on `null`-on-timeout being falsy and on the success value being the
+// body itself.
+let _ltEverHealth = null;     // the last NON-null body, or null if /health never answered at all
+let _ltHealthPolls = 0;
+let _ltLastPollFailed = false;
+
+// Render the last body a waiter saw. `null` vs a body is the discriminator, so the two cases are
+// worded differently on purpose -- a caller pasting this into an issue should not have to know
+// the helper to tell them apart.
+function ltHealthDiag() {
+  if (_ltHealthPolls === 0) return "healthDiag: ltWaitHealth never polled";
+  if (_ltEverHealth === null) {
+    return `healthDiag: ${_ltHealthPolls} poll(s), /health NEVER returned a body — the server was ` +
+           `unreachable or not answering, so the predicate was never evaluated`;
+  }
+  // A final failed poll is real information (the server may have died mid-wait), so it is said
+  // rather than hidden -- but it does NOT turn this into the unreachable case, because the
+  // predicate demonstrably ran against the bodies that did arrive.
+  const tail = _ltLastPollFailed
+    ? ` NOTE: the FINAL poll returned no body (server may have gone away mid-wait); the values ` +
+      `below are from the last poll that DID answer.`
+    : "";
+  const auth = _ltEverHealth.auth;
+  return `healthDiag: ${_ltHealthPolls} poll(s), last body READ and predicate still false. ` +
+         `auth=${JSON.stringify(auth)} stats=${JSON.stringify(_ltEverHealth.stats)}${tail}`;
+}
+
 async function ltWaitHealth(port, pred, ms = 9000) {
   const start = Date.now();
   let deadline = start + ms;
   const hardCap = start + ms * 10;
   let body = null;
+  _ltEverHealth = null;
+  _ltHealthPolls = 0;
+  _ltLastPollFailed = false;
   for (;;) {
     body = await ltHealth(port);
+    // #457 review P1: these two must be kept SEPARATELY. An earlier revision recorded only the
+    // last body, so the discriminator was "did the LAST poll return one" -- and ltHealth catches
+    // EVERY exception and returns null, so a single transient fetch failure on the final poll made
+    // the diagnostic report "/health NEVER returned a body" for a server that had been answering
+    // throughout. That is the false sentence this helper exists to prevent, in the case it is
+    // MOST likely to occur: a transient failure is more probable under host load, which is the
+    // only condition #457 is about.
+    if (body) _ltEverHealth = body;
+    _ltLastPollFailed = !body;
+    _ltHealthPolls++;
     if (body && pred(body)) return body;
     if (Date.now() >= deadline) return null;
     const before = Date.now();
@@ -5528,6 +8934,127 @@ async function ltWaitHealth(port, pred, ms = 9000) {
     if (overshoot > 0) deadline = Math.min(deadline + overshoot, hardCap);
   }
 }
+
+console.log("\nltWaitHealth reports WHY it timed out (#457):");
+
+// ── #457: a timeout that cannot say why is another data point, not a diagnosis ────────────────
+//
+// ltWaitHealth returns null on timeout, and that null is identical whether /health was
+// unreachable or answered repeatedly with a body the predicate kept rejecting. Those have
+// unrelated root causes. #324 has flaked repeatedly and every occurrence was undiagnosable for
+// exactly this reason. Both branches are driven here, because the whole value of the helper is
+// telling them APART -- a test of only one branch would pass while the other printed nonsense.
+
+ltTest("integration (#457): a timeout with NO reachable /health says so", async () => {
+  if (!LT_POSIX) return;
+  // Nothing is listening on this port: ltHealth returns null every poll.
+  const dead = await ltFreePort();
+  const r = await ltWaitHealth(dead, () => true, 300);
+  assert.equal(r, null, "premise: an unreachable /health must time out");
+  const d = ltHealthDiag();
+  assert.match(d, /NEVER returned a body/, `should name the unreachable case: ${d}`);
+  // The poll count is the premise for the sentence: "never returned a body" from zero polls would
+  // mean the waiter never ran, which is a different fault with the same words.
+  assert.match(d, /[1-9]\d* poll\(s\)/, `must report a NON-ZERO poll count: ${d}`);
+  assert.ok(!/predicate still false/.test(d), `must not claim it read a body: ${d}`);
+});
+
+ltTest("integration (#457): a timeout that DID read /health reports the body, not the process", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // A predicate that can never be true against a live server: /health answers, the predicate
+      // rejects every time.
+      const r = await ltWaitHealth(port, () => false, 300);
+      assert.equal(r, null, "premise: an unsatisfiable predicate must time out");
+      const d = ltHealthDiag();
+      assert.match(d, /predicate still false/, `should name the read-but-rejected case: ${d}`);
+      assert.ok(!/NEVER returned a body/.test(d), `must not claim /health was unreachable: ${d}`);
+      // And it must carry the block these waiters actually predicate on -- a diagnostic that omits
+      // it sends the reader back to the process state this exists to replace.
+      assert.match(d, /auth=/, `must include the auth block: ${d}`);
+      assert.match(d, /stats=/, `must include stats: ${d}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "healthdiag", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#457): the MIXED case — answered, then the last poll failed — is not reported as unreachable", async () => {
+  if (!LT_POSIX) return;
+  // The case the first revision of this helper got wrong, and the one it is MOST likely to meet:
+  // ltHealth catches every exception and returns null, so one transient fetch failure on the
+  // final poll used to print "/health NEVER returned a body" for a server that had been answering
+  // throughout. Under host load -- the only condition #457 is about -- a transient failure is
+  // MORE probable, not less. Driven here by killing the child mid-wait.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // Start an unsatisfiable wait, WAIT UNTIL A POLL HAS ACTUALLY SUCCEEDED, then take the
+      // server away.
+      //
+      // The first version slept 300 ms here and assumed that was long enough for a poll to land.
+      // That is a timing-dependent PREMISE WITH NOTHING ASSERTING IT HELD, and under full-suite
+      // contention it does not: if no poll succeeds before the kill, `_ltEverHealth` is still null,
+      // the diagnostic correctly reports "NEVER returned a body", and this test fails for a reason
+      // that has nothing to do with what it is testing. Measured: green 5/5 in isolation, red
+      // inside the loaded suite — the signature of a premise, not of the behaviour under test.
+      //
+      // `_ltEverHealth` records the last non-null body and `_ltHealthPolls` counts polls, so BOTH
+      // premises this test rests on are OBSERVABLE rather than timed. Waiting on the thing the
+      // assertion depends on is the rule this suite already states; this is that rule applied to its
+      // own new helper.
+      //
+      // THERE ARE TWO PREMISES, and an independent review found the first fix asserted only one:
+      //   (a) a poll SUCCEEDED before the kill -- otherwise this is the unreachable case, and the
+      //       `/NEVER returned a body/` assertion below fails with the BEHAVIOUR message for a fixture
+      //       that never armed. That is what the 300 ms sleep got wrong.
+      //   (b) a poll RAN AFTER the kill -- otherwise ltWaitHealth's own budget expired while the server
+      //       was still alive, the LAST poll succeeded, and `/FINAL poll returned no body/` fails:
+      //       again a behaviour message for a fixture-timing cause. Reachable -- squeezing that budget
+      //       reproduces it.
+      // Both are asserted below, so neither can fail silently wearing the other's diagnosis.
+      const waiting = ltWaitHealth(port, () => false, 1500);
+      assert.ok(await ltWait(() => _ltEverHealth !== null, 5000),
+        `premise: /health must answer at least once before the server is killed, or this test is ` +
+        `measuring the unreachable case instead of the mixed one — ${ltDiag(buf)}`);
+      const pollsAtKill = _ltHealthPolls;
+      child.kill("SIGKILL");
+      const r = await waiting;
+      assert.equal(r, null, "premise: an unsatisfiable predicate must still time out");
+      // Premise (b), asserted rather than assumed. Read AFTER `await waiting`, so the wait has
+      // stopped polling; `pollsAtKill` was sampled synchronously before the signal, so any growth
+      // is a poll that COMPLETED after the server was taken away — not one issued after it.
+      // The distinction is not pedantry: `_ltHealthPolls++` runs AFTER `await ltHealth(port)`
+      // resolves, so a poll already in flight at the sample point increments post-kill. The guard
+      // is therefore very slightly weaker than "issued after" would promise — if the ONLY growth
+      // were an in-flight pre-kill poll that SUCCEEDED, premise (b) passes while the behaviour
+      // assertion below fails. Measured margin: growth is 36-37 polls across 5 runs, so that case
+      // was not reachable here; it is reasoned from the source rather than constructed, and it is
+      // recorded because a later reader deciding whether the residual is closed would trust this
+      // sentence.
+      assert.ok(_ltHealthPolls > pollsAtKill,
+        `premise: ltWaitHealth must still be polling when the server dies (polls ${pollsAtKill} ` +
+        `-> ${_ltHealthPolls}). If its own budget expired first, the LAST poll succeeded and the ` +
+        `"FINAL poll returned no body" assertion below would fail for a fixture-timing reason ` +
+        `while reading as a behaviour defect — the exact confusion this test was rewritten to ` +
+        `remove — ${ltDiag(buf)}`);
+
+      const d = ltHealthDiag();
+      // The whole point: earlier polls DID answer, so this is not the unreachable case.
+      assert.ok(!/NEVER returned a body/.test(d),
+        `answered-then-died must NOT be reported as unreachable — that sentence would be false in ` +
+        `every clause: bodies were returned, the server was answering, and the predicate ran. Got: ${d}`);
+      assert.match(d, /predicate still false/, `should report the read-but-rejected case: ${d}`);
+      // And the final failure is real information, so it is said rather than hidden.
+      assert.match(d, /FINAL poll returned no body/, `should disclose that the last poll failed: ${d}`);
+      assert.match(d, /auth=/, `must still carry the last body that DID answer: ${d}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "healthdiag-mixed", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
 
 console.log("\nAuth probe: non-blocking + verdict semantics (#232 / ADR 0010):");
 
@@ -5730,10 +9257,14 @@ ltTest("integration (#324, P1 from review): a conclusive rejection RESETS a coun
   }, dir);
   try {
     const climbed = await ltWaitHealth(port, b => (b.auth?.consecutiveInconclusive ?? 0) >= 3, 20000);
-    assert.ok(climbed, `the inconclusive tally never climbed — ${ltDiag(buf)}`);
+    // #457: ltHealthDiag() first. This test has flaked repeatedly and every occurrence so far has
+    // been undiagnosable, because ltDiag reports the CHILD's state while the question is what the
+    // tally actually reached. "Probes ran but never yielded `inconclusive`" and "probes were slow
+    // but climbing" need different fixes, and only the body tells them apart.
+    assert.ok(climbed, `the inconclusive tally never climbed — ${ltHealthDiag()} — ${ltDiag(buf)}`);
     assert.equal(climbed.auth.ok, null, "no conclusive probe has happened yet, so ok is still null");
     const reset = await ltWaitHealth(port, b => b.auth?.lastOutcome === "rejected", 20000);
-    assert.ok(reset, `the conclusive rejection never landed — ${ltDiag(buf)}`);
+    assert.ok(reset, `the conclusive rejection never landed — ${ltHealthDiag()} — ${ltDiag(buf)}`);
     assert.equal(reset.auth.consecutiveInconclusive, 0,
       "a conclusive rejection must RESET the tally. Preserving it produces {ok:false, " +
       "lastOutcome:'rejected', consecutiveInconclusive:>=3} — a rejection seconds old that the " +
@@ -9169,6 +12700,61 @@ function _ltStageChild(argv, label) {
   _ltRegisterOpenChild(child, buf, label);
   return { child, buf };
 }
+// #485: control C's grandchild used to live a FIXED 2500 ms (`setTimeout(()=>{},2500)`), so that
+// the control would never need a kill it could not attribute. That lifetime raced the host: the
+// control must see the grandchild running before it kills the parent, and on this host a stall of
+// the TEST process during staging is routine -- the grandchild's own clock keeps running while the
+// observer is not scheduled, so a stall longer than the remaining lifetime made the premise
+// permanently unreachable. Captured twice (2026-09-14, 2026-09-19) as `✗ #374 control C: … the
+// grandchild must be running before the parent is killed`.
+//
+// So the grandchild now lives until RELEASED, not until a timer fires. It polls for a file this
+// function owns and exits when the file appears -- still no kill the control cannot attribute,
+// which was the reason for the timer in the first place. The 60 s cap is a leak bound, not a
+// schedule: it is what guarantees the grandchild goes away if the suite dies before releasing. It is
+// not inert otherwise -- in control C it also bounds the window the assertions run inside, which is
+// why it is measured on a monotonic clock (see the script below). RULE 5: 60 000 ms stops being the right bound if a control ever needs to hold
+// the pipe for longer than a minute; the caller would then pass its own, not move this one.
+//
+// Marker placement is still load-bearing: `where` is the grandchild's LAST argv element and appears
+// in the parent's -e source, so the scan counts both. The poll lives in a FILE rather than in `-e`,
+// and that is not style: _ltGrandchildScan returns each matching line cut to 200 chars. An inline
+// poll put the grandchild's command line past 200, the marker fell off the returned line, and
+// control C failed on "the REAPED-GONE branch must scan for who is still holding the pipe" --
+// caught by the control itself on this change's first run. (`ps` was measured NOT to truncate a
+// 440-char argv when piped; true, and irrelevant, because the harness truncates on its own.)
+// With the file, the line is `<execPath> <dir>/hold.js <where>`: measured at 143 chars on the
+// maintainer's workstation (execPath 36, tmpdir() 48). RULE 5: that margin is spent by a longer
+// execPath or TMPDIR, not by anything in this file -- if either grows past ~55 more chars, the
+// marker falls off again and control C says so, loudly, with the line it got.
+const LT_HOLDER_LEAK_BOUND_MS = 60000;
+function _ltStageHolder(where) {
+  const dir = _ltMkdtemp(join(_ltTmp(), "oc374hold-"));
+  const releaseFile = join(dir, "release");
+  const script = join(dir, "hold.js");
+  // process.uptime(), not Date.now(): the bound must not move when the WALL clock does. An NTP
+  // step or a VM resume that jumps Date.now() forward would otherwise fire it early -- and in
+  // control C that ends the grandchild inside the window the assertions depend on, resurrecting
+  // exactly the failure signature this helper exists to retire. (Review finding on #510.)
+  _ltWrite(script, `const f=require("path").join(__dirname,"release");(function p(){` +
+                   `if(require("fs").existsSync(f)||process.uptime()*1000>${LT_HOLDER_LEAK_BOUND_MS})process.exit(0);` +
+                   `setTimeout(p,50)})()\n`);
+  const holder = `require("child_process").spawn(process.execPath,` +
+                 `[${JSON.stringify(script)},${JSON.stringify(where)}],` +
+                 `{stdio:"inherit"});setTimeout(()=>{},30000)`;
+  const { child, buf } = _ltStageChild([process.execPath, "-e", holder], where);
+  let released = false;
+  const release = () => { if (!released) { released = true; _ltWrite(releaseFile, ""); } };
+  // Everything a control needs to leave nothing behind on ANY exit path, including a failed
+  // assertion before its own kill -- which is exactly the path that leaked before (see control C).
+  const cleanup = async () => {
+    release();
+    child.kill("SIGKILL");   // per-process kill: a no-op once Node has reaped it
+    await ltWait(() => buf.closed, 10000);
+    _ltRm(dir, { recursive: true, force: true });
+  };
+  return { child, buf, release, cleanup };
+}
 // The controls stage exactly one child each, but the registry is global and a run that is ALREADY
 // in #374's state can have a straggler in it. Reporting that rather than asserting on the total
 // keeps the control's own claim ("the child I staged reads X") provable without making it fail on
@@ -9527,42 +13113,75 @@ test("#374: the host snapshot carries the level gauges and a suite-start delta, 
 });
 
 ltTest("#374 control C: a grandchild holding stdout reads REAPED-GONE on a LIVE loop, and the scan names the holder", async () => {
-  // Marker rather than a directory: the ps filter is on the label, and this control has no fixture
-  // dir. It goes in the grandchild's argv so `ps -eo command=` carries it — measured unnecessary
-  // to pass -ww on this host, but the marker is placed last precisely because that is the end that
-  // truncates. Includes this pid so two concurrent suites cannot match each other's holder.
+  // Marker rather than a directory: the ps filter is on the label. Includes this pid so two
+  // concurrent suites cannot match each other's holder. The grandchild lives until RELEASED, not on
+  // a fixed timer -- see _ltStageHolder for why the timer lost to the host (#485).
   const where = `oc374holdC${process.pid}`;
-  const holder = `require("child_process").spawn(process.execPath,["-e","setTimeout(()=>{},2500)","${where}"],{stdio:"inherit"});setTimeout(()=>{},30000)`;
-  const { child, buf } = _ltStageChild([process.execPath, "-e", holder], where);
-  // Wait for the grandchild to EXIST before killing the parent — waiting on the thing about to be
-  // asserted, not a proxy for it. Two hits: the parent (the marker is in its -e source) and the
-  // grandchild (the marker is its argv).
-  assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length >= 2, 10000),
-    "the grandchild must be running before the parent is killed");
+  const { child, buf, release, cleanup } = _ltStageHolder(where);
+  try {
+    // Wait for the grandchild to EXIST before killing the parent — waiting on the thing about to be
+    // asserted, not a proxy for it. Two hits: the parent (the marker is in its -e source) and the
+    // grandchild (the marker is its argv).
+    assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length >= 2, 10000),
+      "the grandchild must be running before the parent is killed");
 
-  const t0 = Date.now();
-  child.kill("SIGKILL");
-  // Here the loop IS live, deliberately: this is the world in which 'exit' lands and 'close' does
-  // not. Waiting for exit is what makes the REAPED-GONE reading deterministic rather than a race.
-  assert.ok(await ltWait(() => buf.signal !== undefined, 10000), "the parent's exit must be observed");
-  assert.equal(buf.closed, false, "'close' must NOT have fired — the grandchild still holds the pipe");
-  const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
+    const t0 = Date.now();
+    child.kill("SIGKILL");
+    // Here the loop IS live, deliberately: this is the world in which 'exit' lands and 'close' does
+    // not. Waiting for exit is what makes the REAPED-GONE reading deterministic rather than a race.
+    assert.ok(await ltWait(() => buf.signal !== undefined, 10000), "the parent's exit must be observed");
+    assert.equal(buf.closed, false, "'close' must NOT have fired — the grandchild still holds the pipe");
+    const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
 
-  const mine = _ltControlChild(rec, child, where);
-  assert.equal(mine.verdict, LT_PS_VERDICT.GONE,
-    `a reaped child must read REAPED-GONE; ps said ${JSON.stringify(mine.raw)}`);
-  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE,
-    `the loop was never blocked here, so it must read LOOP-LIVE, got ${rec.loop.verdict} (${JSON.stringify(rec.loop)})`);
-  // The contrast with control A is the reading itself: `undefined` there means UNOBSERVED, `null`
-  // here means observed-and-killed. Same field, and only the ps verdict tells them apart.
-  assert.equal(mine.loopRead.exit, null, "a SIGKILLed child reports exit=null with signal set");
-  assert.equal(mine.loopRead.signal, "SIGKILL", "the signal is the observed part of that reading");
-  assert.ok(Array.isArray(mine.grandchildren) && mine.grandchildren.some(l => l.includes(where)),
-    `the REAPED-GONE branch must scan for who is still holding the pipe, got ${JSON.stringify(mine.grandchildren)}`);
+    const mine = _ltControlChild(rec, child, where);
+    assert.equal(mine.verdict, LT_PS_VERDICT.GONE,
+      `a reaped child must read REAPED-GONE; ps said ${JSON.stringify(mine.raw)}`);
+    assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE,
+      `the loop was never blocked here, so it must read LOOP-LIVE, got ${rec.loop.verdict} (${JSON.stringify(rec.loop)})`);
+    // The contrast with control A is the reading itself: `undefined` there means UNOBSERVED, `null`
+    // here means observed-and-killed. Same field, and only the ps verdict tells them apart.
+    assert.equal(mine.loopRead.exit, null, "a SIGKILLed child reports exit=null with signal set");
+    assert.equal(mine.loopRead.signal, "SIGKILL", "the signal is the observed part of that reading");
+    assert.ok(Array.isArray(mine.grandchildren) && mine.grandchildren.some(l => l.includes(where)),
+      `the REAPED-GONE branch must scan for who is still holding the pipe, got ${JSON.stringify(mine.grandchildren)}`);
 
-  assert.ok(await ltWait(() => buf.closed, 15000),
-    "the grandchild exits on its own, so this control needs no kill it cannot attribute");
+    release();
+    assert.ok(await ltWait(() => buf.closed, 15000),
+      "the grandchild exits once RELEASED, so this control still needs no kill it cannot attribute");
+  } finally {
+    // #485: this control had no finally, unlike A and B. A failed premise returned before
+    // `child.kill` ran, so the 30 s parent LEAKED into the controls after it -- captured on
+    // 2026-09-19 as control E's record reading `pid … ALIVE … HYPOTHESIS FLIPPED` with
+    // `label=oc374holdC<pid>`: control C's own marker, in control E's drain. The "SIGKILL did not
+    // take" reading was an artifact; that process had never been sent one. It is also what failed
+    // control F's "no earlier boot is still registered" premise on 2026-09-14, in the same run as C.
+    await cleanup();
+  }
   assert.equal(_ltOpenChildren.has(child.pid), false, "'close' must deregister it");
+});
+
+// #485: pins the fix to control C's staging race. The field failure was the TEST process not being
+// scheduled while the grandchild's own clock ran out. A real `await` reproduces "real time passes
+// between staging and the premise check" exactly, WITHOUT staging the stall itself -- so this adds
+// nothing to the #374 stall ledger, and it is deterministic where the field failure was not.
+// 3000 ms is chosen against the OLD lifetime (2500 ms), not tuned: it has to exceed it, nothing more.
+ltTest("#485: control C's holder outlives a delay longer than its old fixed lifetime, and exits when released", async () => {
+  const where = `oc485hold${process.pid}`;   // distinct from control C's marker, so the scans cannot collide
+  const { child, buf, release, cleanup } = _ltStageHolder(where);
+  try {
+    assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length >= 2, 10000),
+      "premise: the parent and the grandchild must both be running");
+    await new Promise(r => setTimeout(r, 3000));
+    assert.ok((_ltGrandchildScan(where) || []).length >= 2,
+      "the grandchild must still be running 3000 ms after staging — the old fixed 2500 ms lifetime had already exited");
+    release();
+    assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length === 1, 10000),
+      "once released the grandchild must exit on its own, leaving only the parent — the cap is a leak bound, not the schedule");
+  } finally {
+    await cleanup();
+  }
+  assert.equal(buf.closed, true, "cleanup must leave the parent closed");
+  assert.equal(_ltOpenChildren.has(child.pid), false, "and deregistered");
 });
 
 ltTest("#374 control E: a drain that overruns its budget and SUCCEEDS is recorded too — the face the reproduction actually produced", async () => {
@@ -9604,25 +13223,32 @@ ltTest("#374 control F: a child that closes WHILE the drain waits reads CLOSED-B
     "premise: no earlier boot is still registered, or openAtStart is not this control's");
   const beforeTimeouts = _ltDrainTimeouts.length;
   const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
-  assert.equal(_ltOpenChildren.size, 1, "premise: exactly the staged child is registered");
-  // Killed BEFORE the drain and never awaited, so it closes while the drain is waiting and the
-  // loop is live throughout — the reschedule world, staged.
-  child.kill("SIGKILL");
-  const ok = await ltDrain(() => false, where, 500);
-  assert.equal(ok, false, "a constant-false condition must still time out");
-  assert.equal(_ltDrainTimeouts.length, beforeTimeouts + 1, "exactly one record");
-  const rec = _ltDrainTimeouts.pop();
-  assert.equal(_ltDrainTimeouts.length, beforeTimeouts, "the control record must not survive in the offender ledger");
+  try {
+    assert.equal(_ltOpenChildren.size, 1, "premise: exactly the staged child is registered");
+    // Killed BEFORE the drain and never awaited, so it closes while the drain is waiting and the
+    // loop is live throughout — the reschedule world, staged.
+    child.kill("SIGKILL");
+    const ok = await ltDrain(() => false, where, 500);
+    assert.equal(ok, false, "a constant-false condition must still time out");
+    assert.equal(_ltDrainTimeouts.length, beforeTimeouts + 1, "exactly one record");
+    const rec = _ltDrainTimeouts.pop();
+    assert.equal(_ltDrainTimeouts.length, beforeTimeouts, "the control record must not survive in the offender ledger");
 
-  assert.equal(buf.closed, true, "premise: the child closed while the drain waited");
-  assert.equal(rec.children.length, 0, "so there is nothing left to probe");
-  assert.equal(rec.openAtStart, 1, "but one child WAS open when the drain started — that is the whole signal");
-  assert.equal(rec.registry, LT_PS_VERDICT.CLOSED_FIRST,
-    `an emptied registry must be NAMED, got ${rec.registry}`);
-  assert.ok(_ltExplainDrainTimeout(rec).includes("positively excludes"),
-    "the printed diagnosis must say this is information rather than the absence of it");
-  assert.ok(_ltRenderDrainTimeout(rec).includes(LT_PS_VERDICT.CLOSED_FIRST),
-    "the compact offender line must carry it too — that line is what the #358 summary prints");
+    assert.equal(buf.closed, true, "premise: the child closed while the drain waited");
+    assert.equal(rec.children.length, 0, "so there is nothing left to probe");
+    assert.equal(rec.openAtStart, 1, "but one child WAS open when the drain started — that is the whole signal");
+    assert.equal(rec.registry, LT_PS_VERDICT.CLOSED_FIRST,
+      `an emptied registry must be NAMED, got ${rec.registry}`);
+    assert.ok(_ltExplainDrainTimeout(rec).includes("positively excludes"),
+      "the printed diagnosis must say this is information rather than the absence of it");
+    assert.ok(_ltRenderDrainTimeout(rec).includes(LT_PS_VERDICT.CLOSED_FIRST),
+      "the compact offender line must carry it too — that line is what the #358 summary prints");
+  } finally {
+    // #485: A and B clean up in a finally and F did not, so a failed assertion here left a 30 s
+    // sleeper registered for the controls after it -- the leak shape control C caused for F.
+    child.kill("SIGKILL");
+    await ltWait(() => buf.closed, 5000);
+  }
 });
 
 ltTest("#374 control G: a drain that was never waiting on a child says NO-CHILD-WAS-OPEN, and the two must not collapse", async () => {
@@ -9644,35 +13270,41 @@ ltTest("#374 control G: a drain that was never waiting on a child says NO-CHILD-
 ltTest("#374 control D: a real ltDrain timeout carries the probe and the tracer, and a still-running child reads ALIVE", async () => {
   const where = "#374-control-D-EXPECTED-CONTROL";
   const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
-  const before = _ltDrainTimeouts.length;
-  // The real thing, timing out for real — the other three controls stage the observation, this one
-  // proves ltDrain reaches it. cond is constant-false, so the give-up is not a race either.
-  const ok = await ltDrain(() => false, where, 60);
-  assert.equal(ok, false, "a constant-false condition must time out");
-  assert.equal(_ltDrainTimeouts.length, before + 1, "ltDrain must push exactly one record per timeout");
-  // Popped, not left behind: this is a DELIBERATE timeout, and the #358 summary reads that ledger
-  // to name real offenders. A control that seeded it would make a green run print a #374 lead that
-  // did not happen — which is the failure mode this whole PR exists to remove, not to add.
-  const rec = _ltDrainTimeouts.pop();
-  assert.equal(_ltDrainTimeouts.length, before, "the control record must not survive in the offender ledger");
-  assert.equal(rec.where, where, "the record must carry the site that timed out");
-  assert.ok(rec.ms >= 60, `the record must carry the elapsed wait, got ${rec.ms}ms`);
+  try {
+    const before = _ltDrainTimeouts.length;
+    // The real thing, timing out for real — the other three controls stage the observation, this one
+    // proves ltDrain reaches it. cond is constant-false, so the give-up is not a race either.
+    const ok = await ltDrain(() => false, where, 60);
+    assert.equal(ok, false, "a constant-false condition must time out");
+    assert.equal(_ltDrainTimeouts.length, before + 1, "ltDrain must push exactly one record per timeout");
+    // Popped, not left behind: this is a DELIBERATE timeout, and the #358 summary reads that ledger
+    // to name real offenders. A control that seeded it would make a green run print a #374 lead that
+    // did not happen — which is the failure mode this whole PR exists to remove, not to add.
+    const rec = _ltDrainTimeouts.pop();
+    assert.equal(_ltDrainTimeouts.length, before, "the control record must not survive in the offender ledger");
+    assert.equal(rec.where, where, "the record must carry the site that timed out");
+    assert.ok(rec.ms >= 60, `the record must carry the elapsed wait, got ${rec.ms}ms`);
 
-  const mine = _ltControlChild(rec, child, where);
-  assert.equal(mine.verdict, LT_PS_VERDICT.ALIVE,
-    `a child that was never killed must read ALIVE; ps said ${JSON.stringify(mine.raw)}`);
-  assert.ok(!mine.state.startsWith("Z"), `ALIVE must not be a zombie state, got ${JSON.stringify(mine.state)}`);
-  assert.equal(mine.grandchildren, null, "the grandchild scan is REAPED-GONE-only — it must not run here");
-  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE, `the loop was live, got ${JSON.stringify(rec.loop)}`);
+    const mine = _ltControlChild(rec, child, where);
+    assert.equal(mine.verdict, LT_PS_VERDICT.ALIVE,
+      `a child that was never killed must read ALIVE; ps said ${JSON.stringify(mine.raw)}`);
+    assert.ok(!mine.state.startsWith("Z"), `ALIVE must not be a zombie state, got ${JSON.stringify(mine.state)}`);
+    assert.equal(mine.grandchildren, null, "the grandchild scan is REAPED-GONE-only — it must not run here");
+    assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE, `the loop was live, got ${JSON.stringify(rec.loop)}`);
 
-  const line = _ltRenderDrainTimeout(rec);
-  assert.ok(line.includes(LT_PS_VERDICT.ALIVE) && line.includes(LT_LOOP_VERDICT.LIVE),
-    `the offender line must name BOTH verdicts so a reader need not infer the world: ${line}`);
-  assert.ok(_ltExplainDrainTimeout(rec).includes(LT_PS_DIAGNOSIS[LT_PS_VERDICT.ALIVE]),
-    "the full explanation must carry the ALIVE diagnosis sentence — the one that says the hypothesis flipped");
-
-  child.kill("SIGKILL");
-  assert.ok(await ltWait(() => buf.closed, 5000), "control D must clean up its own child");
+    const line = _ltRenderDrainTimeout(rec);
+    assert.ok(line.includes(LT_PS_VERDICT.ALIVE) && line.includes(LT_LOOP_VERDICT.LIVE),
+      `the offender line must name BOTH verdicts so a reader need not infer the world: ${line}`);
+    assert.ok(_ltExplainDrainTimeout(rec).includes(LT_PS_DIAGNOSIS[LT_PS_VERDICT.ALIVE]),
+      "the full explanation must carry the ALIVE diagnosis sentence — the one that says the hypothesis flipped");
+  } finally {
+    // #485: the kill used to be the LAST statement, after a dozen assertions -- one of them
+    // `rec.loop.verdict === LOOP-LIVE`, which is exactly what a host stall breaks. Any of them
+    // failing leaked a 30 s sleeper into the next test. Same discipline as A and B.
+    child.kill("SIGKILL");
+    await ltWait(() => buf.closed, 5000);
+  }
+  assert.equal(buf.closed, true, "control D must clean up its own child");
 });
 // ── #374 mem snapshot: STRUCTURE, never values ───────────────────────────────────────────────
 // The #427 audit of 6978505 measured this feature at ZERO test coverage — three mutations, three
@@ -17582,6 +21214,29 @@ test("buildStreamJsonInput: emits one newline-terminated user envelope", () => {
   assert.equal(env.message.content[1].type, "image");
 });
 
+// #512: blockCount is what claude_spawned reports for this path, so it must be the envelope's own count.
+test("buildStreamJsonInput: stats.blockCount is the number of content blocks in the envelope", () => {
+  const { payload, stats } = mmBuildStreamJsonInput([{ role: "user", content: [txtPart("hi"), imgPart()] }, { role: "assistant", content: "ok" }, { role: "user", content: "more" }]);
+  const n = JSON.parse(payload.trim()).message.content.length;
+  assert.ok(n >= 3, `premise: a multi-block envelope — ${n}`);
+  assert.equal(stats.blockCount, n);
+});
+
+// #512: coalescing appends a tool result to the PREVIOUS TEXT block only. A tool result that carried
+// an image leaves that image as the last block, and the next result must open a new text block.
+test("buildImageBlocks: coalesceToolResults never appends text onto an image block", () => {
+  const { blocks } = mmBuildImageBlocks([
+    { role: "user", content: "look" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "shot", arguments: "{}" } }, { id: "c2", type: "function", function: { name: "note", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", content: [txtPart("a chart"), imgPart()] },
+    { role: "tool", tool_call_id: "c2", content: "second result" },
+  ], { coalesceToolResults: true, continuationNote: false }); // the multi-block path's options
+  const types = blocks.map((b) => b.type);
+  assert.deepEqual(types.slice(-3), ["text", "image", "text"], `the image stays between the two results — ${JSON.stringify(types)}`);
+  assert.equal("text" in blocks[blocks.length - 2], false, "no text was appended onto the image block");
+  assert.ok(blocks[blocks.length - 1].text.includes("[Tool note returned]\nsecond result"), JSON.stringify(blocks[blocks.length - 1]));
+});
+
 // ── malformed / policy / oversized handling (clean 4xx, never a silent drop) ──
 test("buildImageBlocks: unsupported media type → 400 unsupported_image_type", () => {
   assert.throws(
@@ -17846,8 +21501,8 @@ test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SP
   assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
 });
 
-test("models.json aliases.opus === 'claude-opus-5' (opus-alias SPOT)", () => {
-  assert.equal(_spotModels.aliases.opus, "claude-opus-5");
+test("models.json aliases.opus === 'claude-opus-5-5' (opus-alias SPOT)", () => {
+  assert.equal(_spotModels.aliases.opus, "claude-opus-5-5");
 });
 
 // ── Referential integrity (PR #152 review) ──────────────────────────────────
@@ -17893,7 +21548,7 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 // re-scaled the ceiling for every model. ADR 0011 made the budget per-model, so the cap is gone and
 // there is now exactly ONE legal value per row: the registry's. That makes the table discriminating
 // for the first time — before, all seven rows resolved to 200000 and it was equivalent to
-// `assert.equal(m.contextWindow, 200000)`; now four rows require 1000000 and three require 200000,
+// `assert.equal(m.contextWindow, 200000)`; now five rows require 1000000 (four until claude-opus-5-5 was added) and three require 200000,
 // so a copy-paste that flattens them fails.
 //
 // It remains a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
@@ -17915,7 +21570,12 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 //      binary-wide and independently of the per-id slices: `native_1m:!0` occurs 6x and
 //      `context:{window:1e6` occurs 6x, over the same six records — the four below plus
 //      claude-fable-5 and claude-mythos-5, which OCP does not expose.
+//      THAT COUNT IS A 2.1.220 READING AND IS LEFT AS ONE (it is pinned to the sha above). Re-measured
+//      on CLI 2.1.280 when claude-opus-5-5 was added: `context:{window:1e6` occurs 9x — the five 1M rows
+//      below plus claude-fable-5, claude-fable-5-1, claude-mythos-5 and claude-mythos-5-1, none of which
+//      OCP exposes. (Review of that change proposed "7" by inference; the binary says 9.)
 const _spotRegistryContextWindow = {
+  "claude-opus-5-5": 1000000,   // CLI 2.1.280 registry: context:{window:1e6}
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
   "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
   "claude-haiku-4-5-20251001": 200000,      // registry id: claude-haiku-4-5
@@ -17991,6 +21651,11 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // -> 633 passed, 0 failed (the wrong-repro trap — renaming without adding the new id anywhere
 // fails the FORWARD check instead and masks this gap entirely; see #222 for both repros).
 const _spotRegistryMaxTokens = {
+  // claude-opus-5-5 is read from the CLI 2.1.280 registry, NOT 2.1.220 like the rows below -- the model
+  // did not exist then. Record: max_output_tokens:{default:128000,upper:128000}. Note it is NOT the
+  // sibling claude-opus-5 value (default:64000,upper:128000): copying the neighbour row, which is what
+  // the first draft of this change did, would have under-advertised it by half and this test caught it.
+  "claude-opus-5-5": 128000,
   "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
   "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
   "claude-haiku-4-5-20251001": 32000,       // registry id: claude-haiku-4-5
@@ -18527,6 +22192,85 @@ test("makeResolveSpawnToken: no override → REAL isTokenExpiring (default) path
 
 // ── Async: F3 real-HOME fallback serialization mutex ──
 async function runAsyncTests() {
+
+  // ── #500: the SIGKILL escalation timer's lifecycle (lib/child-tree.mjs) ──
+  // #474 arms a SIGKILL 5 s after each SIGTERM. Two of the four sites never cleared it, so on the
+  // normal path (measured: 'close' at ~1 ms, group already ESRCH) the timer sat ~4999 ms per
+  // request aimed at a released pgid — and killChildTree's group kill is a raw syscall with no
+  // liveness check. The cancel condition is an EMPTY GROUP; 'close' is only the prompt to
+  // re-check it. Each claim gets its OWN body: the close/group mutations break several at once,
+  // and co-located they could only ever produce one red (#405, "Mutual").
+  const _esc = () => { const p = new EventEmitter(); p.pid = 424242; return p; };
+  const _settle = () => new Promise((r) => setTimeout(r, 150));
+  const _occupied = makeKillEscalation({ groupEmpty: () => false });
+
+  await testAsync("#500 escalation is cancelled once the GROUP is empty", async () => {
+    const proc = _esc(); const sigs = []; let drained = false;
+    const sched = makeKillEscalation({ groupEmpty: () => drained });
+    sched(proc, (_p, sig) => sigs.push(sig), 30);
+    drained = true;                      // the group emptied, then 'close' woke the re-check
+    proc.emit("close");
+    await _settle();
+    assert.deepEqual(sigs, [], "a drained group must not be signalled — its pgid may be reused by then");
+  });
+
+  await testAsync("#500 'close' with a SURVIVING group member does NOT cancel the escalation", async () => {
+    // A backgrounded tool subprocess that redirected its fds away from the inherited pipes lets
+    // 'close' fire while it is still in the group. Cancelling here would trade the stale-pgid
+    // kill for a silent process leak — the pre-#500 code did kill this member at 5 s.
+    const proc = _esc(); const sigs = [];
+    _occupied(proc, (_p, sig) => sigs.push(sig), 30);
+    proc.emit("close");
+    await _settle();
+    assert.deepEqual(sigs, ["SIGKILL"], "a surviving group member must still be escalated");
+  });
+
+  await testAsync("#500 an already-released pgid is never armed at all", async () => {
+    const proc = _esc(); const sigs = [];
+    const sched = makeKillEscalation({ groupEmpty: () => true });
+    const timer = sched(proc, (_p, sig) => sigs.push(sig), 30);
+    assert.equal(timer, null, "nothing to escalate against — arming would BE the defect");
+    await _settle();
+    assert.deepEqual(sigs, [], "a released pgid must never be signalled");
+  });
+
+  await testAsync("#500 escalation still fires when the tree never closes", async () => {
+    const proc = _esc(); const sigs = [];
+    _occupied(proc, (_p, sig) => sigs.push(sig), 30);
+    await _settle();
+    assert.deepEqual(sigs, ["SIGKILL"], "a SIGTERM-resistant tree must still be escalated");
+  });
+
+  await testAsync("#500 'exit' without 'close' does NOT cancel the escalation (the #474 stuck-pipe shape)", async () => {
+    // The parent has been reaped while a grandchild still holds the stdout pipe: 'exit' has
+    // fired, 'close' has not. This is precisely the case #474 exists for, so clearing on 'exit'
+    // — what the disconnect site (#111) does, and the obvious thing to copy — would cancel the
+    // one kill that matters.
+    const proc = _esc(); const sigs = [];
+    _occupied(proc, (_p, sig) => sigs.push(sig), 30);
+    proc.emit("exit", null, "SIGTERM");
+    await _settle();
+    assert.deepEqual(sigs, ["SIGKILL"], "clearing on 'exit' would cancel the escalation #474 needs");
+  });
+
+  await testAsync("#500 a pending escalation does not hold the event loop open", async () => {
+    const proc = _esc();
+    const timer = _occupied(proc, () => {}, 30);
+    assert.equal(timer.hasRef(), false, "an unref'd timer must never be why the process stays alive");
+    clearTimeout(timer);
+  });
+
+  await testAsync("#500 the production binding uses the real group check, not an injected one", async () => {
+    // Pins the DEFAULT wiring: scheduleKillEscalation must be makeKillEscalation()'s product with
+    // defaultGroupEmpty bound. pid 424242 is not a live pgid here, so the real check reports empty
+    // and the helper declines to arm — which an injected always-occupied stub would not do.
+    const proc = _esc(); const sigs = [];
+    const timer = scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+    assert.equal(timer, null, "the exported binding must consult the real group, not a stub");
+    await _settle();
+    assert.deepEqual(sigs, []);
+  });
+
   await testAsync("createSerialMutex: second waiter blocks until first holder releases", async () => {
     const mutex = createSerialMutex();
     const order = [];
@@ -19702,6 +23446,7 @@ const _OC_EXPECTED_MODEL_META_TABLE = {
   "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 200000 },
   "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000, contextWindow: 200000 },
   "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000, contextWindow: 200000 },
+  "claude-opus-5-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 128000, contextWindow: 1000000 },
   "claude-opus-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-4-8": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-4-7": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
@@ -24290,7 +28035,7 @@ test("#242 cmd_usage (main): absent python3 shows the raw plan JSON instead of d
     proxy: { uptime: "5h", totalRequests: 42, activeRequests: 0, errors: 0, timeouts: 0 },
     models: {},
   });
-  const r = _bwHarnessRun({ args: ["usage"], pythonAbsent: true, curlResponses: [{ match: "/usage", body }] });
+  const r = _bwHarnessRun({ args: ["usage"], pythonAbsent: true, curlResponses: [{ match: "/usage", body: `${body}\n200` }] });  // #475: cmd_usage now reads the status curl appends
   assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
   assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("allowed"), `expected the raw plan JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
@@ -24306,7 +28051,7 @@ test("#242 control: cmd_usage (main) with python3 PRESENT still prints the forma
     proxy: { uptime: "5h", totalRequests: 42, activeRequests: 0, errors: 0, timeouts: 0 },
     models: {},
   });
-  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body }] });
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: `${body}\n200` }] });  // #475: cmd_usage now reads the status curl appends
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.stdout.includes("Plan Usage Limits"), `expected the formatted header, got: ${JSON.stringify(r.stdout)}`);
   assert.ok(r.stdout.includes("Proxy: up 5h"), `expected the formatted proxy line, got: ${JSON.stringify(r.stdout)}`);
@@ -24436,7 +28181,7 @@ test("#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy
   // (proving the curl-failure branch's own message is unaffected by this site's restructuring).
   const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a non-zero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or key management not available"), `expected the curl-failure message preserved, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the curl-failure message preserved (#475: the network label is now exactly that), got stderr=${JSON.stringify(r.stderr)}`);
 });
 
 test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
@@ -24495,10 +28240,10 @@ test("#242 fix-3 cmd_settings (GET): 'Error: proxy unreachable' goes to stderr, 
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable or unauthorized' goes to stderr, stdout stays empty", () => {
+test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0);
-  assert.ok(r.stderr.includes("Error: proxy unreachable or unauthorized"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr (#475: the network label is now exactly that), got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
@@ -24531,7 +28276,7 @@ test("#261 cmd_usage --by-key: curl missing from $PATH must be reported as a loc
 test("#261 control: cmd_usage --by-key with curl present but the proxy genuinely unreachable still says so", () => {
   const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or usage API not available"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: network label is now exactly this,
     `a GENUINE network failure must still be reported as such (proves the fix does not just delete the diagnosis), got stderr=${JSON.stringify(r.stderr)}`);
 });
 
@@ -24561,7 +28306,7 @@ test("#261 cmd_keys add: curl missing from $PATH must be reported as a local fau
 test("#261 control: cmd_keys add with curl present but the proxy genuinely unreachable still says so", () => {
   const r = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or unauthorized"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
@@ -24575,6 +28320,75 @@ test("#261 stream parity: cmd_usage/cmd_keys-add 'proxy unreachable' guards now 
 });
 
 // ── Independent review round 1: two fold-ins ──────────────────────────────────────────────────
+console.log("\nocp: a proxy that ANSWERED with an HTTP error is not \"unreachable\" (#475):");
+
+// The defect: `curl -sf` turns a 502-with-a-body into exit 22 and an EMPTY stderr (-s silences
+// curl's own message), so _curl_or_die's network branch printed "proxy unreachable" about a proxy
+// that had just answered /health -- and the body naming the real fault was discarded.
+test("#475: `ocp usage` on a 502 names the status and shows the proxy's own error, never 'unreachable'", () => {
+  const body = JSON.stringify({ error: "Usage API returned 401 with no rate-limit headers", proxy: {} });
+  // cmd_usage now fetches without -f and with the status appended, so the stub returns body + code.
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: `${body}\n502`, exit: 0 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CURL-CALL"), `premise: curl was invoked; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `a proxy that answered must not be called unreachable; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("answered HTTP 502"), `the status must be named; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Usage API returned 401"),
+    `the proxy's own error text is the whole point and must be shown; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// The body is not always JSON: a reverse proxy in front of OCP answers 502 with "Bad Gateway". The
+// first version of the printer read stdin twice and showed NOTHING for that -- the shape this row
+// exists to keep visible.
+test("#475: `ocp usage` on a NON-JSON error body still shows the body", () => {
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: "Bad Gateway\n502", exit: 0 }] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("answered HTTP 502"), `status named; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Bad Gateway"), `a non-JSON body must still be shown; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#475 control: `ocp usage` on a 200 still formats the plan as before", () => {
+  // Shape copied from the formatter's own reads (plan.currentSession / plan.weeklyLimits.allModels
+  // / plan.extraUsage.status / proxy / models), not guessed -- the first version of this fixture
+  // spelled `weekly` and the control reddened on a KeyError, which is the fixture lying rather
+  // than the code failing.
+  const body = JSON.stringify({
+    plan: {
+      currentSession: { percent: "34%", resetsIn: "22m", resetsAtHuman: "soon", utilization: 0.34 },
+      weeklyLimits: { allModels: { percent: "10%", resetsIn: "3d", resetsAtHuman: "later", utilization: 0.1 } },
+      extraUsage: { status: "allowed" },
+    },
+    proxy: { totalRequests: 1, activeRequests: 0, errors: 0, timeouts: 0, uptime: "1m" },
+    models: {},
+  });
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: `${body}\n200`, exit: 0 }] });
+  assert.equal(r.status, 0, `a 200 must still succeed; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stderr.includes("answered HTTP"), `no error headline on success; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("34%"), `the plan must be rendered; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// The general layer: every OTHER call site still uses -sf, so exit 22 must at least stop being
+// reported as unreachable there, even though the body is gone. `usage --by-key` hits /api/usage
+// through _curl_or_die with -sf.
+test("#475: _curl_or_die on curl exit 22 (HTTP error under -f) says 'answered', not 'unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlResponses: [{ match: "/api/usage", body: "", exit: 22 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CURL-CALL"), `premise: curl was invoked; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable"), `exit 22 is an ANSWER, not a connection failure; stderr=${JSON.stringify(r.stderr)}`);
+  // This site carries its own HTTP-error label (a refusal on /api/usage means the admin key), so
+  // the generic "answered, but with an HTTP error" text is NOT what appears here -- the specific
+  // one is, and that is the better outcome. What must hold is: not "unreachable", and it names a
+  // refusal rather than a connection.
+  assert.ok(/refused \/api\/usage/.test(r.stderr), `must say the proxy REFUSED, i.e. answered; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#475 control: a genuine connection failure (curl exit 7) is STILL 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlResponses: [{ match: "/api/usage", body: "", exit: 7 }] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("proxy unreachable"), `exit 7 IS unreachable and must keep saying so; stderr=${JSON.stringify(r.stderr)}`);
+});
+
 console.log("\nocp _curl_or_die: independent review round 1 fold-ins (exit 126, mktemp security):");
 
 test("#261 fold-in B (independent review round 1): curl present but NOT EXECUTABLE (exit 126) is reported as a local fault, not 'proxy unreachable'", () => {
@@ -24836,10 +28650,10 @@ test("#278 cmd_keys revoke: curl missing from $PATH must be reported as a local 
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_keys revoke with curl present but the proxy genuinely unreachable still says 'proxy unreachable or unauthorized'", () => {
+test("#278 control: cmd_keys revoke with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or unauthorized"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
@@ -24851,10 +28665,10 @@ test("#278 cmd_keys list: curl missing from $PATH must be reported as a local fa
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_keys list with curl present but the proxy genuinely unreachable still says 'proxy unreachable or key management not available'", () => {
+test("#278 control: cmd_keys list with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or key management not available"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
@@ -26684,6 +30498,20 @@ test("replay → dashboard.html Status card DECIDES tag-ok (the green card) on t
     "control: a real degraded verdict must still render the error tag");
 });
 
+// #518, measured on CI (Linux, Node 24 and 26): process.exit() does not wait for stdout writes that
+// libuv had to QUEUE because a piped stdout was not writable at that instant, so the last lines a
+// run prints -- its results line -- can be dropped. The lock tests' contender child recorded
+// "results printed 1/0" and "exit code=0" in a side file within the same millisecond, and its
+// parent, reading until 'close', never received that line. It did not reproduce on macOS. Exit
+// only after an empty write on each stream has completed: writes complete in order, so its
+// callback fires after everything queued before it.
+function _exitAfterFlush(code) {
+  let pending = 2;
+  const done = () => { if (--pending === 0) process.exit(code); };
+  process.stdout.write("", done);
+  process.stderr.write("", done);
+}
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   // THE RESULTS LINE IS A CONSUMED INTERFACE — keep it byte-identical (#366 review, finding A).
@@ -26730,7 +30558,8 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
     console.error(`=== VOID: nothing ran, so no Results line was printed — a filter that matches ` +
                   `nothing is not a green run. ===`);
     _ltReportStallLedger();
-    process.exit(1);
+    _exitAfterFlush(1);
+    return;
   }
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
@@ -26740,11 +30569,11 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
                 `to see which coverage this run did NOT provide.\n`);
   }
   _ltReportStallLedger();
-  process.exit(failed > 0 ? 1 : 0);
+  _exitAfterFlush(failed > 0 ? 1 : 0);
 }).catch((e) => {
   console.error("async test runner crashed:", e);
   closeDb();
-  process.exit(1);
+  _exitAfterFlush(1);
 });
 
 // ── #411: an unhandledRejection must carry the request's method + path ──────────────────────
@@ -27419,10 +31248,15 @@ function lt416Contender(cwd) {
     cwd, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, OCP_SUITE_LOCK_CHILD: "1" },
   });
-  const state = { out: "", exited: null, child };
+  const state = { out: "", err: "", exited: null, closed: false, child };
   child.stdout.on("data", (d) => { state.out += d; });
-  child.stderr.on("data", () => {});
+  // A bounded tail of stderr, for the failure messages only: with it discarded, a child that crashed
+  // and a child whose last stdout had not been read yet looked identical (#518).
+  child.stderr.on("data", (d) => { state.err = (state.err + d).slice(-2000); });
   child.on("exit", (code, signal) => { state.exited = { code, signal }; });
+  // #518: 'exit' can fire while the stdout pipe still holds the child's last lines -- the #203 race
+  // AGENTS.md records. Anything that READS state.out after the child ends waits for 'close'.
+  child.on("close", () => { state.closed = true; });
   return state;
 }
 const lt416Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -27505,10 +31339,11 @@ lockTest("#416 F2: only the OLDEST ticket acts — a real contender holds off a 
     // repo's rule that a claim of guaranteed behaviour must cite the mutation that proves it, and
     // it has to be earned by more than one attempt.
     _lockRmSync(olderTicket, { force: true });
-    await lt416Until(() => c.exited !== null, "the contender to acquire and finish once its ticket is the oldest");
+    await lt416Until(() => c.closed, "the contender to acquire, finish and close its stdio once its ticket is the oldest");
     assert.ok(c.out.includes(LT_LOCK_CHILD_DONE),
       `once oldest, the contender must get through acquire and RUN TO COMPLETION — expected ${JSON.stringify(LT_LOCK_CHILD_DONE)} ` +
-      `from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; its stdout ended: ${JSON.stringify(c.out.slice(-400))}`);
+      `from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; exit ${JSON.stringify(c.exited)}; its stdout ended: ${JSON.stringify(c.out.slice(-400))}; ` +
+      `stderr ended: ${JSON.stringify(c.err.slice(-400))}`);
   } finally {
     try { c.child.kill("SIGKILL"); } catch {}
     try { _lockRmSync(base, { recursive: true, force: true }); } catch {}
@@ -27605,14 +31440,14 @@ lockTest("#423 F3: the exit handler releases the lock — a finished run leaves 
   const lockDir = join(base, "scratchpad", ".suite.lock");
   const c = lt416Contender(base); // uncontended: nothing else holds this path
   try {
-    await lt416Until(() => c.exited !== null, "the uncontended run to finish");
+    await lt416Until(() => c.closed, "the uncontended run to finish and close its stdio");
     // Two premises, because "no lock dir" is exactly what a child that never took one leaves.
     // The results line is only reachable PAST the module-level acquire, and `scratchpad/` exists
     // only because the acquire's populate-then-publish mkdir -p'd its temp dir into it.
     assert.ok(c.out.includes(LT_LOCK_CHILD_DONE),
       `premise: the child must have run past the module-level acquire and completed its one test — ` +
       `expected ${JSON.stringify(LT_LOCK_CHILD_DONE)} from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; ` +
-      `stdout ended: ${JSON.stringify(c.out.slice(-400))}`);
+      `exit ${JSON.stringify(c.exited)}; stdout ended: ${JSON.stringify(c.out.slice(-400))}; stderr ended: ${JSON.stringify(c.err.slice(-400))}`);
     assert.ok(_lockExistsSync(join(base, "scratchpad")),
       "premise: the child's acquire must have created the scratchpad dir its lock lives in");
     assert.ok(!_lockExistsSync(lockDir),
@@ -28217,6 +32052,18 @@ ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, no
     { CLAUDE_BIN: fake, OCP_ALLOWED_HOSTS: "good.example.com, bad host!, evil.com/path, tls.example.com:443" }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // WAIT FOR THE THING BEING ASSERTED, not for a proxy for it. The warning goes to STDERR; the
+    // `listening on` line above goes to STDOUT. They are two pipes, and under load the parent can
+    // see the second before the first even though the child wrote them in the opposite order.
+    // Measured 2026-09-13: red in 2/2 full runs on this branch AND in a full run of origin/main on
+    // the same host (7 loop stalls each), green 1/1 in isolation every time -- the #199 shape.
+    // Wait for the LAST of the warning's lines, not the first (#518's CI run, 2026-09-25): they are
+    // separate console.warn writes (server.mjs, the OCP_ALLOWED_HOSTS boot block), and under load
+    // the parent received the first two while "declare the bare host" had not arrived yet. Waiting
+    // on the first line and then asserting on the fourth is the #199 shape one line further down.
+    assert.ok(await ltWait(() => /OCP_ALLOWED_HOSTS — ignored/.test(buf.out + buf.err)
+                              && /the entry is correct as written/.test(buf.out + buf.err), 5000),
+      `the boot warning never fully arrived on either pipe — ${ltDiag(buf)}`);
     const all = buf.out + buf.err;
     assert.match(all, /OCP_ALLOWED_HOSTS — ignored 2 unparseable entries/,
       `both bad entries must be counted in the boot warning; got: ${all.slice(-600)}`);

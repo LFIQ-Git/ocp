@@ -96,7 +96,7 @@ The simplest path: ask your AI.
 
 The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you when to OAuth.
 
-**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), authenticated:
+**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — new enough to have `--system-prompt-file`, which OCP passes on every spawn since v3.32.0. There is still no *version* floor — no minimum has been established, so this statement is deliberately version-free — but since [#455](https://github.com/dtzp555-max/ocp/issues/455) OCP **checks the capability at boot** and refuses to start if your CLI rejects a flag it passes, so you will find out at startup rather than on your first request — authenticated:
 
 ```bash
 npm install -g @anthropic-ai/claude-code
@@ -113,11 +113,11 @@ node setup.mjs
 
 `setup.mjs` verifies the Claude CLI, starts the proxy on port 3456, and installs auto-start (launchd on macOS, systemd on Linux). The `ocp` CLI lands at `~/ocp/ocp` — symlink it onto your PATH (`sudo ln -sf ~/ocp/ocp /usr/local/bin/ocp`, or `ln -sf ~/ocp/ocp ~/.local/bin/ocp`) or alias it (`alias ocp=~/ocp/ocp`); the rest of the docs assume `ocp` is on your PATH.
 
-**Verify** — should list 7 models:
+**Verify** — should list exactly the ids in [`models.json`](./models.json) (a count written here would go stale with every model added):
 
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 **Connect one IDE** — point any OpenAI-compatible tool at the proxy, then reload your shell and start a tool (Cline / Continue / Cursor / OpenCode):
@@ -157,21 +157,23 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --
 
 ### Client-tools boundary
 
-OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
-
-**Offering tools is fine; *forcing* a tool call gets a 400.** Because OCP never emits `tool_calls`, a request that *requires* one cannot be answered correctly, so it is refused rather than answered with prose that claims the turn ended normally:
+**OCP passes a client's OpenAI `tools` through to the model and returns its `tool_calls` (ADR 0022, v3.34.0).** A request that declares `tools` is served by its own path: the spawn is given exactly those tools through an MCP bridge, and when the model chooses one the response carries `choices[0].message.tool_calls` — `function.arguments` as a JSON **string**, per the spec — with `finish_reason: "tool_calls"`. The client runs the tool and sends the whole history back, including its `tool` message; OCP renders that history as text into the next spawn's prompt and the model answers or calls again. Every request is still one short-lived child; nothing is held across requests.
 
 | Request | OCP |
 |---|---|
-| `tools` with no `tool_choice`, or `tool_choice` `"auto"` / `"none"` / `allowed_tools` `mode: "auto"` | **served normally** — text, `finish_reason: "stop"` |
-| `tool_choice` `"required"`, `{"type":"function"}`, `{"type":"custom"}`, or `allowed_tools` `mode: "required"` | **`400`** — `error.code: "unsupported_parameter"`, `error.param: "tool_choice"` |
-| legacy `function_call: {"name": …}` | **`400`**, same shape, `error.param: "function_call"` |
+| `tools` with no `tool_choice`, or `tool_choice` `"auto"` | **bridged** — the model holds exactly the declared tools (built-ins emptied); a call comes back as `tool_calls`, `finish_reason: "tool_calls"`; text comes back as before |
+| `tool_choice` `"none"` | **served on the plain path** — the spec says the model will not call a tool, and text is the mandated outcome; not counted as dropped |
+| `tool_choice` `"required"`, `{"type":"function"}`, `{"type":"custom"}`, or `allowed_tools` `mode: "required"` | **`400`** — the CLI cannot be forced, and a forced call the model does not make would be a silently wrong answer (ADR 0013's analysis, still in force) |
+| legacy `functions` / `function_call` | `functions` is **dropped and counted** (reason `legacy_functions_shape`); `function_call: {"name": …}` is **`400`** |
+| `tools` together with `response_format`, or on the **TUI lane** | **dropped and counted**, reason logged — see the boundary below |
 
-Simply sending a tool list is never an error — that is the common case (every OpenClaw turn carries one) and it is unchanged. Only the instruction OCP cannot obey is refused, and it is refused loudly so a client can fall back to another provider or retry with `"auto"` instead of silently receiving a wrong answer. See [ADR 0013](docs/adr/0013-no-openai-tool-calling.md) for why this is a refusal rather than an implementation.
+Every drop increments `/health`'s `stats.toolRequestsDropped` and logs `openai_tools_dropped` with a `reason`; every bridged call increments `stats.toolCallsEmitted`. With `OCP_TOOL_CALLING=0` (see § Environment Variables) every declared tool is dropped and counted, which is the pre-3.34.0 behaviour.
 
-Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output. Note that on the `-p` path OCP prepends a system-prompt wrapper telling the model it has **no** local access (right for a shared gateway) — a single-user loopback instance whose model *should* use its tools can flip this with `OCP_LOCAL_TOOLS=1` (see Environment Variables).
+**One limit worth knowing before pointing an agent at OCP.** A request that declares `tools` and asks for `stream: true` receives its response as SSE **once the turn completes**, not token by token.
 
-**Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).
+**Images and tools work together** as of #477. They did not before: the multimodal spawn path did not render tool turns, so a vision agent was measured — with a real model — to re-call its tool indefinitely, and such requests were refused onto the plain path. That path now renders the same call/result/continuation text the text path does. Verified with a real model: fed its own tool result back with the image still in the history, the model answers from the result (no re-call) **and** describes the image.
+
+The tools the bridge grants run on the **client**, so this works in every auth mode, including `AUTH_MODE=multi`: a guest calling its own tool touches nothing on the OCP host. What the model can do on the host itself is a separate question, governed by `--allowedTools` and `OCP_LOCAL_TOOLS` below — and when a request declares client tools, the host-side built-ins are emptied for that spawn so there is exactly one way to do each thing.
 
 **What this means for choosing OCP (workload fit).** LAN/multi-device OCP is built for **chat-class** workloads — Q&A, translation, scripting against the API, chat frontends, home-automation backends — where text in/text out is the whole job. It is **not** the right tool for a coding agent running on a *client* machine that needs the AI to read and edit *that machine's* files: tools execute on the OCP host, so the model can never touch the client's filesystem. For that workload, run `claude` (or a local OCP) directly on the machine where the code lives.
 
@@ -179,8 +181,9 @@ Any tool use happens server-side, under the `--allowedTools` set configured on t
 
 | Model ID | Context window | Notes |
 |----------|---------------:|-------|
-| `claude-opus-5` | 1M | Most capable (default for `opus` alias) |
-| `claude-opus-4-8` | 1M | Previous Opus, retained for pinning |
+| `claude-opus-5-5` | 1M | Most capable (default for `opus` alias) |
+| `claude-opus-5` | 1M | Previous Opus, retained for pinning |
+| `claude-opus-4-8` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-7` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-6` | 200k | Older Opus, retained for pinning |
 | `claude-sonnet-5` | 1M | Latest Sonnet (default for `sonnet` alias) |
@@ -221,6 +224,53 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/cache/stats` | GET | Cache statistics (admin only) |
 | `/cache` | DELETE | Clear response cache (admin only) |
 
+### Fields OCP accepts and does not act on
+
+Sending one of these is **not an error** and never will be — a client that sets `temperature: 0` out of habit still gets an answer. But OCP does not honour them, and since 3.37.0 it says so: each such request increments `/health`'s **`stats.unhonouredFieldRequests`** and logs `openai_fields_not_honoured` at `info` with the field names.
+
+| field | what happens |
+|---|---|
+| `n` (≠ 1) | one choice is returned |
+| `logprobs`, `top_logprobs` | no `logprobs` in the response |
+| `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `max_completion_tokens` | no effect |
+| `temperature`, `top_p`, `max_tokens` | **no effect on generation** — they are read only as cache-key material, so they partition the response cache. Reported separately as `cacheKeyOnly`. The OpenAI defaults (`temperature: 1`, `top_p: 1`, penalties `0`, `logit_bias: {}`) are **not** reported: a client sending them gets default behaviour it cannot tell apart from what it asked for |
+| `parallel_tool_calls: false` | calls are not serialised (`true` **is** honoured — see § tool calling) |
+| `reasoning_effort` `none` / `minimal` / a non-OpenAI value, or **any** value on the TUI lane | no `--effort` flag; the CLI uses its default (see below) |
+
+### `reasoning_effort`
+
+OpenAI's [`reasoning_effort`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-reasoning_effort) is passed to the spawned CLI as `claude --effort <level>` for `low`, `medium`, `high`, `xhigh` and `max` — the five OpenAI values `claude` has a level for. `none` and `minimal` have no CLI level and are reported in the table above rather than rounded; so is any other value, which never reaches argv, so a typo cannot fail the spawn. Without the field the argv is unchanged. The level is part of the cache key, so answers at different efforts never share a slot. On the TUI lane the pane is booted before the request with `OCP_TUI_EFFORT`, so a per-request level cannot reach it and is reported instead. To confirm the level a request ran at, look for `"effort"` on its `claude_spawned` line in the proxy log (`~/.ocp/logs/proxy.log` for the service `setup.mjs` installs); the key is present only when `--effort` was passed.
+
+**These are not unwired fields, they are absent knobs.** `claude` exposes no `--max-tokens`, `--stop`, `--seed`, `--temperature` or `--top-p`; its only budget flags are `--max-budget-usd` (a dollar cap) and `--autocompact` (the context window, not the output). Honouring them would mean OCP post-processing the model's output.
+
+**`max_tokens` deserves a second look if you are using it for cost control** — it does not cap anything here. Use `--max-budget-usd` on the CLI side, or a per-key quota (§ API Keys), instead.
+
+### A `429` from `/v1/chat/completions` has two causes
+
+Since 3.35.0 the proxy returns `429 { "error": { "type": "rate_limit_error" } }` for **two different things**. They are genuinely the same kind of answer — *slow down* — which is why they share a shape, and **an ordinary 429 handler that backs off and honours `Retry-After` is correct for both.** What differs is how long the wait is and whether waiting in this process can ever end it:
+
+| cause | what it means | `/health` counter | `Retry-After` | can backing off clear it? |
+|---|---|---|---|---|
+| OCP is full | more requests are in flight and queued than `CLAUDE_MAX_CONCURRENT` + `CLAUDE_MAX_QUEUE` allow | `stats.queueRejections` | **always** present, and short — seconds | yes |
+| the **upstream** wall | the Anthropic subscription or rate limit the spawned `claude` hit | `stats.upstreamRateLimits` | only when the upstream text said when | **not within this process** — it clears on the upstream's schedule, which can be hours |
+
+So a client that only implements *back off and retry* is safe, not wrong. A client that can do better reads `Retry-After` when it is there and the message when it is not: `usage limit` / `rate limit` / `hit your session limit` text means the second row, and a client with somewhere else to go should go there rather than spend its retry budget on a wall that cannot move.
+
+**Choosing where to go is the client's job, not OCP's.** The proxy reports the condition accurately and stops there; it does not retry against another upstream, switch providers, or hold a queue on your behalf. If you want failover, configure it in the agent framework or SDK that calls OCP.
+
+The two counters are what an **operator** reads to tell "we hit the wall" from "the proxy is saturated" — a distinction `stats.errors` never made. Before 3.35.0 the second row was a `500 proxy_error`, which told every client the proxy had broken.
+
+**One shape cannot carry the status, and which one is not what you would guess.** With `stream: true` **and no `tools`**, the SSE headers go out *before* the spawn produces anything (so the heartbeat can cover the silent window), and a status cannot be un-sent — so an upstream wall arrives as an SSE error frame with `200`. It is still counted in `stats.upstreamRateLimits` and logged with `"lane":"streaming"`, so the operator view stays complete even though the status is not. See [#482](https://github.com/dtzp555-max/ocp/issues/482).
+
+A **streaming request that declares `tools`** is not affected, and that is the shape agents actually send: with tool calling on (the default since 3.34.0) OCP completes the turn before it writes any SSE, so a wall still comes back as a real `429`. Measured against a live 3.35.0 instance whose upstream fails with a wall:
+
+| request | status | lane, in the proxy's own log (`/logs`) |
+|---|---|---|
+| `stream: true` **with** `tools` | **429** | `buffered` |
+| `stream: true` without `tools` | 200 + SSE error frame | `streaming` |
+
+So the blind spot is real but narrow: it needs `stream: true`, no tools — or `OCP_TOOL_CALLING=0`, or a request the tool path excludes (`response_format`, the legacy `functions` shape, `tool_choice: "none"`).
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -233,6 +283,10 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
+| `OCP_TOOL_CALLING` | `1` | OpenAI tool calling over the MCP bridge (ADR 0022). `0` restores the pre-0022 behaviour: declared `tools` are dropped, answered as text, and counted in `/health`'s `stats.toolRequestsDropped` with the reason logged. |
+| `OCP_MULTIBLOCK_INPUT` | `1` | How the conversation is handed to `claude -p` (#512). By default each message is its own content block, sent over `--input-format stream-json`, and the tool-continuation note is part of the system prompt. A growing agent conversation then only ever appends blocks, so the prompt cache can match everything it has seen before and does not re-write it on every step. `0` restores the pre-#512 input byte for byte: one text block, with the note after the last tool result. Boot-time only. See § "Per-request tokens and prompt-cache hits" for how to see the effect. |
+| `OCP_CACHE_BREAKPOINT` | `1h` | The one prompt-cache breakpoint OCP adds, on the last block it sends, under `OCP_MULTIBLOCK_INPUT` (#512). `1h`, `5m` or `off`. The CLI already uses 3 of the API's 4 breakpoints and places one after ours, and a shorter TTL may not precede a longer one. So if the API refuses the breakpoint (a 400 naming `cache_control`), OCP logs `cache_breakpoint_disabled` and switches it off for the rest of the boot. The request that hit the 400 fails, and so does any request already in flight with a breakpoint (up to `CLAUDE_MAX_CONCURRENT`). Requests spawned after the switch run without it. Boot-time only. |
+| `OCP_TOOL_TURN_QUIESCE_MS` | `2000` | Milliseconds to wait for the model's message-end signal after a tool call before ending the turn anyway. The healthy path never reaches it — the signal arrives first — so this is a **ceiling on the degraded path**, not a target: it bounds what happens if a `claude` build accepts `--include-partial-messages` but stops emitting `stop_reason: "tool_use"`. Every `openai_tool_calls` log line records `endedOn` (`signal` / `quiescence` / `close`); a run of `quiescence` means re-measure. |
 | `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See ["Streaming heartbeat"](#streaming-heartbeat) below. |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
@@ -251,7 +305,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
 | `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | `20971520` | Aggregate decoded-byte cap across all images in a request (default 20 MB). Over-cap gets `HTTP 413`. |
 | `CLAUDE_SYSTEM_PROMPT` | *(unset)* | Operator-wide system-prompt text appended (last) to every request's composed system prompt on the default `-p` path. TUI-mode panes are unaffected (they keep the interactive CLI's own system prompt). Echoed truncated on `/health.systemPrompt`. Note: changing this value and restarting auto-invalidates the response cache (the key carries a boot-config epoch, #177). |
-| `OCP_LOCAL_TOOLS` | *(unset)* | **Single-user, loopback only.** `=1` swaps the default *"you have no local filesystem/shell access"* system-prompt wrapper for a positive one telling the model it **may** use its tools. These are the **server-side `claude` tools** OCP spawns via `-p` (`--allowedTools`) — which, on a loopback instance, run on the operator's own machine, i.e. *local* tools. For a personal instance (e.g. an **OpenClaw** agent on its own local OCP) the default wrapper otherwise makes the model refuse to use tools it legitimately has. Changes **only the prompt**, never the tool surface (governed by `--allowedTools`/`--disallowedTools`; multi-tenant still `--disallowedTools` the whole FS surface). **Does not** enable client-side `tool_calls` for OpenClaw/Cline/etc. — that remains unsupported by design (see § How tools work). Fail-closed: OCP **refuses to boot** if `=1` is combined with `CLAUDE_AUTH_MODE=multi`, a non-loopback bind, or `PROXY_ANONYMOUS_KEY` (mirrors `OCP_TUI_FULL_TOOLS`, ADR 0007). **Inert in TUI mode** (the `-p` wrapper is unused there; the TUI tool surface is `OCP_TUI_FULL_TOOLS`) — a warning is logged. Off by default → the default path is byte-for-byte unchanged. Toggling it auto-invalidates the standard response cache (boot-config epoch, #177). |
+| `OCP_LOCAL_TOOLS` | *(unset)* | **Single-user, loopback only.** `=1` swaps the default *"you have no local filesystem/shell access"* system-prompt wrapper for a positive one telling the model it **may** use its tools. These are the **server-side `claude` tools** OCP spawns via `-p` (`--allowedTools`) — which, on a loopback instance, run on the operator's own machine, i.e. *local* tools. For a personal instance (e.g. an **OpenClaw** agent on its own local OCP) the default wrapper otherwise makes the model refuse to use tools it legitimately has. Changes **only the prompt**, never the tool surface (governed by `--allowedTools`/`--disallowedTools`; multi-tenant passes `--tools ""`, which empties the built-in tool schema outright rather than enumerating what to deny). **Unrelated to client-side `tool_calls`**, which are supported since v3.34.0 regardless of this flag (see § Client-tools boundary): this flag is about what the model may do on the *OCP host*, and a request that declares client tools empties the host-side built-ins for that spawn anyway. Fail-closed: OCP **refuses to boot** if `=1` is combined with `CLAUDE_AUTH_MODE=multi`, a non-loopback bind, or `PROXY_ANONYMOUS_KEY` (mirrors `OCP_TUI_FULL_TOOLS`, ADR 0007). **Inert in TUI mode** (the `-p` wrapper is unused there; the TUI tool surface is `OCP_TUI_FULL_TOOLS`) — a warning is logged. Off by default → the default path is byte-for-byte unchanged. Toggling it auto-invalidates the standard response cache (boot-config epoch, #177). |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key (multi mode) — this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. Full setup + security notes: [docs/lan-mode.md § Anonymous Access](docs/lan-mode.md#anonymous-access-optional). |
@@ -271,6 +325,8 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_TUI_STREAM_POLL_MS` | `100` | (TUI-mode, streaming) Interval at which OCP drains the delta sink; the hook fires at block granularity so a finer poll buys nothing. See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
 | `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns, independent of `CLAUDE_MAX_CONCURRENT`. Excess turns queue (bounded); a full queue yields 503. See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars). |
 | `OCP_TUI_POOL_SIZE` | `0` (off) | (TUI-mode) Number of pre-booted warm `claude` panes (max `32`) so a request skips the cold boot — measured p50 `10.17s` → `6.00s`. Each warm pane is a live idle process; panes are single-use. Keep it small on a small host. See [docs/tui-mode.md § `OCP_TUI_POOL_SIZE`](docs/tui-mode.md#ocp-tui-pool-size). |
+| `CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS` | `10000` | Budget for the boot-time capability probe ([#455](https://github.com/dtzp555-max/ocp/issues/455)). ~50× the measured cost (0.17–0.21 s), sized generously on purpose: overrunning it yields `inconclusive`, which **warns and boots**, so a tight value would silently turn the gate off on a loaded host rather than failing visibly. |
+| `OCP_SKIP_CAPABILITY_PROBE` | *(unset)* | When `=1`, skip the boot-time `claude` capability probe ([#455](https://github.com/dtzp555-max/ocp/issues/455)). The probe spawns `claude` once at startup with OCP's **real** spawn argv and a deliberately missing `--system-prompt-file`, and refuses to start only if the CLI answers `unknown option '--<flag>'` — i.e. only on observed absence. It costs no quota (no model turn; measured 0.18–0.21 s) and anything it cannot classify is logged as a warning and boots. Set this if you want to run against a CLI you know is missing a flag, and accept that every request will fail. |
 | `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. Under the announced (currently **paused**) 2026-06-15 billing split this probe would draw from the metered Agent SDK credit pool; set this to avoid burning a probe on re-installs or `ocp update` runs. Auth is validated at the first real request. |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) `=1` grants the interactive session the same tool surface as the `-p` path (`--allowedTools` + optional `--mcp-config`) so a trusted single operator can run a tool-using / MCP agent on the subscription pool. Safe because TUI refuses to boot under `AUTH_MODE=multi`. See [docs/tui-mode.md § `OCP_TUI_FULL_TOOLS`](docs/tui-mode.md#ocp-tui-full-tools). |
 | `OCP_TUI_TOOLS` | *(unset)* | (TUI-mode) Restrict which **built-in** tools the interactive pane may use, via `claude --tools` (e.g. `Read,Glob,Grep,WebSearch,WebFetch`). `--tools` is the tool-*availability* registry, not a permission layer, so an omitted tool is simply never offered and cannot hang a headless pane on an unanswerable permission prompt. Unset, empty or whitespace-only = all built-in tools available (default). Applies to the default MCP-walled surface only (not `OCP_TUI_FULL_TOOLS`, whose surface is `CLAUDE_ALLOWED_TOOLS` or its hardcoded default set). Narrows what the model is *offered*; it is not a trust boundary. See [docs/tui-mode.md § `OCP_TUI_TOOLS`](docs/tui-mode.md#ocp-tui-tools). |
@@ -420,6 +476,34 @@ Proxy: up 6h 32m | 23 reqs | 0 err | 0 timeout
 
 **Web Dashboard:** open `http://<host>:3456/dashboard` in any browser for real-time per-key usage, request history, plan utilization, and system health (screenshot + details in [docs/lan-mode.md § Monitoring](docs/lan-mode.md#monitoring-server-side)).
 
+### Per-request tokens and prompt-cache hits (proxy log)
+
+Each spawn's cost is on its log lines in the proxy log (`~/.ocp/logs/proxy.log` for the service `setup.mjs` installs). The values are read from the `claude` CLI's own stream-json events, and OCP computes nothing itself:
+
+| event | fields | what they tell you |
+|---|---|---|
+| `claude_ok` | `inputTokens`, `outputTokens`, `cacheWriteTokens`, `cacheReadTokens` | The four counts from the CLI's `result.usage`. `inputTokens` is only the uncached remainder. The whole prompt is the sum of the three input fields. A conversation that re-writes itself into the cache on every call shows a large `cacheWriteTokens` and a `cacheReadTokens` that never grows (#512). Absent when the CLI reported no usage, for example on a tool turn, whose spawn is ended before its result event. |
+| `claude_spawned` | `systemPromptSha`, `toolsSha` (tool requests only), `blockCount` | The first 12 hex characters of sha256 of the system prompt and of the declared tools, plus the number of content blocks sent. The prompt cache matches tools, then system, then messages, in that order. So if a sha changes between two requests of one conversation, that layer invalidated everything after it. Content is never logged. |
+| `claude_stream_event` (`type: "rate_limit_event"`) | `info.status`, `info.rateLimitType`, `info.resetsAt`, `info.windows.<name>.utilization` | The CLI's own view of the subscription windows (`five_hour`, `seven_day`), per spawn. A shape OCP does not recognise is logged as the old 200-character `data` prefix instead. |
+
+**Why an agent's prompt can be cached at all (#512, `OCP_MULTIBLOCK_INPUT`, `OCP_CACHE_BREAKPOINT`).** Anthropic's prompt cache matches a request's prefix at content blocks. OCP used to flatten the whole conversation into one block, and a block that grows at its end never matches the previous request's block, so every step of an agent loop re-wrote the entire conversation into the cache. Two changes, both needed:
+
+- **One block per message.** Consecutive tool results share one block, and the "results are final" note moves into the system prompt, where it is byte-constant. As a trailing block, it moved to the new end on every step.
+- **One cache breakpoint on the last block OCP sends.** The CLI's own final breakpoint lands on a block it appends after OCP's content. The entry it writes is therefore never a prefix of the next request, and on opus 5.5 and sonnet 5 nothing else finds it. (haiku 4.5 happened to recover through the API's short lookback. The Claude 5 models did not.) An entry that ends on OCP's last block is a prefix of the next request, and the lookback finds it.
+
+Measured on opus 5.5 through OCP, with `reasoning_effort: low` and the tool bridge (#512):
+
+| per step | written to cache | read from cache |
+|---|---|---|
+| before | ~13.5k (the whole conversation) | ~0.6k |
+| now | ~240 | the whole previous prompt |
+
+What this does not cover:
+- A conversation over the model's prompt budget keeps the text path's whole-message truncation. Once old messages are dropped, the start of the prompt shifts on every turn and nothing can cache.
+- A client that sends one tool result at a time within a single step extends the last block instead of appending one, so that one step misses.
+
+The fields are read from `claude` 2.1.280's event shapes. They are not a documented contract, so if a CLI upgrade removes them, the keys disappear from these lines rather than holding wrong values.
+
 ### All Commands
 
 ```
@@ -457,7 +541,7 @@ export CLAUDE_CACHE_TTL=300000   # cache responses for 5 minutes
 ```
 
 **How it works:**
-- Cache key = SHA-256 of `v2|<keyId or "anon">|model + messages + temperature + max_tokens + top_p`
+- Cache key = SHA-256 of `v2|<keyId or "anon">|model + messages + temperature + max_tokens + top_p + reasoning_effort`
 - **Per-key isolation** — different API keys never share cache entries; anonymous callers share one `anon` pool
 - Cache hits return instantly — no Claude CLI process spawned. **Streaming hits** are replayed as multiple SSE chunks (80 codepoints each), not one large delta, so incremental render is preserved
 - **`cache_control` bypass** — a request carrying an Anthropic `cache_control` annotation (top-level or nested in `content[]`) skips OCP's cache entirely, so it doesn't interfere with Anthropic-side prompt caching
@@ -611,6 +695,8 @@ After installing, use `/ocp` slash commands in your chat: `/ocp status`, `/ocp u
 
 ## Troubleshooting
 
+**`/usage` answers `502` (or `ocp usage` reports an HTTP error) while chat works.** Since 3.37.0 the proxy logs `credential_source_selected` when it passes over an expired credential source in favour of a valid one — look for `"skippedExpired":["file"]`. That means a stale `~/.claude/.credentials.json` (the Linux-style file) is sitting next to a live macOS keychain entry; on macOS nothing rewrites that file, so it never self-heals. The proxy now picks the valid source anyway; removing the stale file is optional and is your call. If instead the log shows `"source":"env"`, `CLAUDE_CODE_OAUTH_TOKEN` is set for the service and wins outright — it is never expiry-checked, so a stale value there produces the same symptom and only unsetting it fixes it.
+
 The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_action`. Tell me if you hit anything that needs human input.` The doctor emits a JSON `next_action` with `ai_executable[]` (commands to run verbatim) and `human_required[]` (usually just OAuth).
 
 **Most common issues:**
@@ -618,6 +704,9 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 - **`EADDRINUSE: port 3456 already in use`** — an old OCP instance is bound. Find it (`lsof -nP -iTCP:3456 -sTCP:LISTEN`) and stop it (`launchctl bootout gui/$(id -u)/dev.ocp.proxy` on macOS, `systemctl --user stop ocp-proxy` on Linux). There is no `ocp stop` — the proxy is a service; `ocp restart` bounces it.
 - **`node: command not found` / version error** — OCP needs Node.js 22.13+ (`node --version`). The floor is 22.13 and not 22.5 because `keys.mjs` imports `node:sqlite` at module load and `server.mjs` imports `keys.mjs` at module load, so a Node that needs `--experimental-sqlite` cannot start OCP at all — and nothing on the launch path passes that flag. Node removed the flag requirement in **v22.13.0** and **v23.4.0** (see nodejs.org/api/sqlite.html § History) — so **23.0–23.3 are also excluded**, which is why the declared range is `>=22.13.0 <23.0.0 || >=23.4.0` and not a single floor.
 - **`claude: command not found`** — install the Claude CLI, run `claude auth login`, then re-run `node setup.mjs`.
+- **OCP refuses to start with `FATAL: this build of \`claude\` does not support --<flag>`** — your Claude CLI is missing a flag OCP passes on every request, so every request would 500. Run `claude update` (or reinstall the CLI) and start OCP again. This is the **boot-time capability probe** ([#455](https://github.com/dtzp555-max/ocp/issues/455)): OCP builds its real spawn argv, points `--system-prompt-file` at a path that does not exist, and reads which of the two errors comes back — `System prompt file not found` (every flag known) or `unknown option '--x'` (one is not). It costs no quota, because the CLI stops at argument validation without starting a model turn. **Only an observed `unknown option` refuses the boot**; a missing binary, a slow host, or an unfamiliar message logs `claude_capability_probe_inconclusive` and starts normally, so the gate can never brick a fleet on an ambiguous reading. Set `OCP_SKIP_CAPABILITY_PROBE=1` to disable it.
+- **Every request returns 500 with `error: unknown option '--system-prompt-file'`** — the same cause, on an instance where the probe is disabled or inconclusive. OCP passes the system prompt as a file rather than on the command line (see [Security](#security)); the flag is measured working on `claude` **2.1.233+** and is absent from `claude --help`'s option list, so you cannot confirm it there. Run `claude update` and restart OCP.
+- **Stray `ocp-sysprompt-*.txt` files in your temp directory** — OCP writes the system prompt to a `0600` temp file per request (it is passed as `--system-prompt-file`, not in argv — see [Security](#security)) and removes it when the turn ends. A **hard kill** of the proxy (`SIGKILL`, a crash, a power loss) skips that cleanup, so one file per in-flight request can survive. They are owner-only and harmless; delete them if you like. Normal restarts, timeouts, spawn failures and client disconnects all clean up.
 - **Usage shows "unknown" / 401** — usually an expired Claude CLI session: `claude auth login && ocp restart`. For the *permanent* TUI-mode `Please run /login · API Error: 401` that re-login can't fix, see [docs/troubleshooting.md § permanent TUI-mode 401](docs/troubleshooting.md#tui-401).
 - **`ocp update` refuses to restart** (`could not determine what ... owns the OCP port`, `not managed by any systemd unit`, `nothing is currently listening`, a sudo message, or a rollback-scope message) — deliberate: the restart phase resolves which unit actually owns the port and refuses rather than guesses when it can't tell, or when guessing would be unsafe. See [docs/troubleshooting.md § restart refusal](docs/troubleshooting.md#restart-target-refusal) for what each message means and how to proceed.
 
@@ -633,6 +722,7 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 
 **Bootstrap quirks (one-time migrations):**
 
+- **Every request started returning 500 `error: unknown option '--system-prompt-file'` after upgrading to v3.32.0** — v3.32.0 stopped putting the system prompt on the command line, because argv is world-readable on Linux (`/proc/<pid>/cmdline`), and passes it as a `0600` file instead ([#453](https://github.com/dtzp555-max/ocp/issues/453)). Your Claude CLI predates the `--system-prompt-file` flag. Run `claude update` (or reinstall the CLI) and restart OCP. Measured working on `claude` **2.1.233+**; the flag is absent from `claude --help`'s option list, so you cannot confirm it there, and since [#455](https://github.com/dtzp555-max/ocp/issues/455) OCP **refuses to start** rather than failing per request when it detects this: the boot log carries `FATAL: this build of `claude` does not support --system-prompt-file`. If you are seeing per-request 500s instead, the boot probe was skipped (`OCP_SKIP_CAPABILITY_PROBE=1`) or returned `claude_capability_probe_inconclusive`.
 - **Dashboard mutations started returning 403 after upgrading to v3.31.0** — v3.31.0 stopped letting an **undeclared public DNS name** vouch for itself, because that shape is indistinguishable from DNS rebinding ([ADR 0020](docs/adr/0020-declared-hosts.md), #446). If your dashboard lives at a real domain, set `OCP_ALLOWED_HOSTS` to it once and restart. Nothing reached by IP, `localhost`, `*.local` or Tailscale is affected.
 - **A TUI session vanished right after upgrading OCP** — if a pre-3.21.1 and a post-3.21.1 instance ran on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance. Restart the affected session (`ocp restart` or re-run your TUI turn) and it returns under the new instance's port-scoped naming.
 - **OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)** — the running shell had the old `cmd_update` cached, so the sync hook doesn't fire on that single jump. Run once: `node ~/ocp/scripts/sync-openclaw.mjs && openclaw gateway restart`. Every future update syncs automatically.
@@ -687,6 +777,7 @@ Top-level files a contributor or operator may need to know:
 - **3-tier auth** — `none` (trusted network), `shared` (single key), `multi` (per-user keys with usage tracking)
 - **Timing-safe key comparison** — prevents timing attacks on API keys and admin keys
 - **Cross-origin requests refused** — a request carrying an `Origin` header outside the loopback/private-range allowlist is rejected `403` on any method except `GET`/`HEAD`, before auth and before routing. Browsers always send `Origin` cross-origin, so this closes the ordinary path by which a web page you merely *visit* could drive the proxy — which, with the default tool set, means running commands as you. **It does not close DNS rebinding**, which produces a genuinely same-origin request that no `Origin` check can distinguish; see [ADR 0019](./docs/adr/0019-inbound-origin-gate.md) § "What this does not do". Same-origin requests are admitted by comparing `Origin` to `Host`, so reaching the dashboard by hostname, `[::1]`, a Tailscale address or through a TLS proxy keeps working. It does **not** wall off a page served from an origin the allowlist admits — any other loopback port, or any host on your LAN. Clients that send no `Origin` (curl, the OpenAI SDKs, `ocp-connect`) are unaffected and need no change. See [ADR 0019](./docs/adr/0019-inbound-origin-gate.md)
+- **The system prompt is not in argv** — it is written to a `0600` temp file and passed as `--system-prompt-file`, because argv is world-readable on Linux (`/proc/<pid>/cmdline` is mode `-r--r--r--`, and a default `/proc` mount carries no `hidepid`). Before this, any local account on the host could read every system prompt the proxy handled — the client's `system` messages plus `CLAUDE_SYSTEM_PROMPT` — for the lifetime of each request. The conversation already went over **stdin** and the OAuth token over the child's **env** (`/proc/<pid>/environ` is `-r--------`), so this was the one sensitive channel still in the open. The file is removed when the turn ends; a hard kill of the proxy can leave one behind, which at `0600` is litter rather than a leak.
 - **Admin-only key management** — creating, listing, and revoking keys requires the admin key
 - **Public endpoints** — `/health` and `/dashboard` are always accessible without auth
 - **No API keys needed** — authentication goes through Claude CLI's OAuth session
