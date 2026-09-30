@@ -1,7 +1,7 @@
 # 0017 — `POST /api/keys` Request Shape, and What the Grandfather Is a Snapshot Of
 
-- **Date**: 2026-08-10 (**Amendment 1** proposed 2026-09-30 — see under Decision)
-- **Status**: Accepted (maintainer sign-off 2026-08-11). Amendment 1: Proposed (independent review pending)
+- **Date**: 2026-08-10 (**Amendment 1** accepted 2026-09-30 — see under Decision)
+- **Status**: Accepted (maintainer sign-off 2026-08-11). Amendment 1: Accepted (maintainer sign-off 2026-09-30, after independent review on PR #6)
 - **Authors**: project maintainer (with AI advisory drafting)
 - **Related**: ADR 0006 (Class A/B taxonomy and the B.2 grandfather), ADR 0012 (additive fields on grandfathered B.2), ADR 0016 (how B.2 surface may be *removed*), ADR 0023 (the follow-up Amendment 1 closes), `ALIGNMENT.md:114`, issues #383, #360, #114
 
@@ -85,7 +85,7 @@ It is **not** re-opened for redesign by this ADR. Anyone wanting to widen or nar
 
 The `#360:` block comment in the `POST /api/keys` branch must stop asserting the endpoint sits at its v3.16.4 snapshot. Under this ADR the scalar path is fixed and the regex is authorized, so the comment's job changes entirely: it should record what the endpoint accepts and under which authorization, not argue for inaction.
 
-> **Amendment 1 (proposed 2026-09-30; independent review pending).** `POST /api/keys` refuses a
+> **Amendment 1 (accepted 2026-09-30; maintainer sign-off after independent review on PR #6).** `POST /api/keys` refuses a
 > new key whose name, **trimmed and compared case-insensitively**, is one of OCP's internal bucket
 > names:
 >
