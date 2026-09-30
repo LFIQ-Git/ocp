@@ -5223,6 +5223,10 @@ async function handleRequest(req, res) {
   // shared-mode path. Admin is decided from this, never from authKeyName, because a key in the
   // DB may legitimately be NAMED "admin" or "shared".
   let remoteCredentialIsAdmin = false;
+  // ADR 0023: set only when a remote request was admitted WITHOUT being asked for any credential
+  // (none mode, or shared mode with no PROXY_API_KEY and no token that matched anything). Like the
+  // flag above, it exists so no key NAME can ever confer admin: a DB key may be named "remote".
+  let admittedWithoutCredential = false;
   const tokenIs = (token, secret) => {
     if (!token || !secret) return false;
     const a = Buffer.from(token); const b = Buffer.from(secret);
@@ -5279,12 +5283,15 @@ async function handleRequest(req, res) {
             reason: token ? "unknown_key" : "missing_key",
             keyPreview: token ? token.slice(0, 8) : null,
             relayedBy,
-            clientIp: String(req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"] || remoteAddr),
+            // Capped: x-forwarded-for's leftmost entry is client-controlled. Not for blocking decisions.
+            clientIp: String(req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"] || remoteAddr).slice(0, 200),
             method: req.method,
             path: pathname,
           });
+        } else {
+          // PROXY_API_KEY unset: unchanged pass-through as "remote" (the boot warning says so).
+          admittedWithoutCredential = true;
         }
-        // PROXY_API_KEY unset: unchanged pass-through as "remote" (the boot warning says so).
       }
     } else if (AUTH_MODE === "multi") {
       // If a token is provided, validate it; if not, allow as anonymous
@@ -5319,6 +5326,9 @@ async function handleRequest(req, res) {
       } else {
         authKeyName = "anonymous";
       }
+    } else {
+      // none (or any unrecognised mode): no auth, so a remote caller is admitted without a credential.
+      admittedWithoutCredential = true;
     }
   }
 
@@ -5337,7 +5347,7 @@ async function handleRequest(req, res) {
   // present one of the two admin credentials.
   const isAdmin = AUTH_MODE === "multi"
     ? authKeyName === "admin" || isLocalhost
-    : isLocalhost || remoteCredentialIsAdmin || (!relayedBy && authKeyName === "remote");
+    : isLocalhost || remoteCredentialIsAdmin || (!relayedBy && admittedWithoutCredential);
 
   // GET /v1/models
   if (req.url === "/v1/models" && req.method === "GET") {

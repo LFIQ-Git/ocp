@@ -121,9 +121,20 @@ When it is on, a boot warning says so, since it admits requests that would other
 - Not admin: a per-app DB key, `unverified`, and any relayed request that did not present one of the
   two admin credentials.
 
-Admin is decided from **which credential matched**, never from `authKeyName`. The keys API accepts
-any name matching `^[A-Za-z0-9 ._-]{1,64}$`, so a DB key can be named `admin` or `shared`; a test
-mints one named `admin` and proves it is refused on the admin API.
+Admin is decided from **which credential matched**, never from `authKeyName`. Two explicit flags
+carry it: `remoteCredentialIsAdmin` (the token matched `OCP_ADMIN_KEY` or `PROXY_API_KEY`) and
+`admittedWithoutCredential` (none mode, or shared mode with no `PROXY_API_KEY` and nothing matched).
+The keys API accepts any name matching `^[A-Za-z0-9 ._-]{1,64}$`, so a DB key can carry an internal
+bucket name. Tests mint keys named `remote`, `local`, `shared`, `admin`, `unverified` and
+`anonymous`, use them from a direct LAN peer and through the tunnel, and prove each is refused on the
+admin API.
+
+> **Review correction (PR #5).** The first version of this decision tested the third arm as
+> `!relayedBy && authKeyName === "remote"`. Independent review showed that a DB key **named**
+> `remote` was then admin for a direct LAN caller in shared mode (`200` on `/api/keys` and
+> `/settings`, against `403` for a key named `app1`). The relayed path was never affected. The arm
+> now reads the `admittedWithoutCredential` flag, and mutation M17 reinstates the old test to prove
+> the new LAN-peer tests catch it.
 
 ### 5. `AUTH_MODE=none` and relayed requests
 
@@ -173,10 +184,9 @@ is answered separately.
   of unknown key hygiene should upgrade with `OCP_REMOTE_AUTH_OBSERVE=1`, read the
   `auth_would_reject` lines, fix the consumers, then remove the variable.
 - **Per-app keys work remotely in shared mode**, for relayed and direct LAN callers alike, and they
-  are attributed and quota-bound. Before, a direct LAN shared-mode caller could only use the shared
-  key.
-- **A direct LAN shared-mode caller with a DB key is not admin.** Before, every shared-mode request
-  was admin. The shared key and admin key keep admin.
+  are attributed and quota-bound, but they are not admin. Before, a direct LAN shared-mode caller
+  presenting a DB key got `401`, since only the shared key was accepted. So no direct LAN caller
+  loses admin: the shared key keeps it, and the admin key is now accepted too.
 - **`/health` stops showing `anonymousKey` through a relay.** It was shown when `isLocalhost`, which
   every relayed request used to be. `PROXY_ADVERTISE_ANON_KEY=1` still advertises it everywhere.
 - **`unverified` callers can read `unverified` usage rows.** `/api/usage` scopes a non-admin caller to
@@ -196,6 +206,22 @@ is answered separately.
   presented in multi mode is still admin there. That predates this ADR, and Decision 4 keeps multi
   mode's formula as it was. Recorded so it is not mistaken for covered.
 - It does not replace Cloudflare Access. It makes OCP's own auth meaningful behind it.
+- **Residual fail-open.** Any path that reaches the port from loopback **without** adding a relay
+  header is still localhost and admin: a `cloudflared` `tcp://` ingress, WARP private-network
+  routing, an SSH `-L` forward, or a proxy that strips the headers. Closing that needs an explicit
+  operator switch that turns loopback trust off entirely. Follow-up, its own ADR.
+
+### Follow-ups recorded, not done here
+
+- **Reserve the internal bucket names at key creation** (`admin`, `local`, `remote`, `shared`,
+  `unverified`, `anonymous`). After this ADR no name confers admin, but a DB key with one of those
+  names still shares that bucket's rows on `/api/usage` and in usage attribution. Refusing them is a
+  change to `POST /api/keys`'s accepted request shape, which ADR 0017 governs, so it needs its own
+  ADR 0017 amendment and PR rather than being folded into a security fix.
+- **Multi mode's admin-by-name**, above. Fixing it changes multi mode's admin rule, which this ADR
+  deliberately leaves alone.
+- `admin_usage_full_scope` logs the socket peer as `ip`, which is `127.0.0.1` for a relayed caller.
+  Logging only, not a trust decision.
 
 ## Evidence
 
@@ -209,10 +235,14 @@ sends the same request with and without the relay header, so each half is the ot
 | `shared mode — a bogus key is REFUSED through the tunnel and still admitted on real loopback` | the production repro, `401` with the existing body, and the loopback control |
 | `shared mode — tunneled requests are attributed to the key that made them, never to "local"` | DB key attributed by name; shared key attributed `shared`; no `local` row |
 | `shared mode — through the tunnel the admin API takes the admin or shared key, and refuses a per-app key` | `403` for a per-app key and for a DB key **named** `admin`; `200` for both admin credentials and for loopback |
-| `OCP_REMOTE_AUTH_OBSERVE=1 admits a bogus tunneled key as "unverified" …` | boot warning, `200`, `auth_would_reject` with an 8-character preview and not the token, `unverified` attribution, `403` on the admin API |
+| `shared mode, direct LAN peer — no per-app key NAME confers admin …` | server bound to the host's LAN address, so the peer is non-loopback and unrelayed (premise: keyless `401`); keys named `remote`, `local`, `shared`, `admin`, `unverified`, `anonymous` and `app1` all `403` on `/api/keys` and `/settings`; both admin credentials `200` |
+| `shared mode with NO PROXY_API_KEY — a keyless direct LAN caller keeps upstream admin …` | keyless LAN caller `200` (upstream pass-through); key named `remote` `403`; relayed keyless caller `403` |
+| `OCP_REMOTE_AUTH_OBSERVE=1 admits a bogus tunneled key as "unverified" …` | boot warning, `200`, `auth_would_reject` with an 8-character preview and not the token, `missing_key` for no token, `unverified` attribution, `403` on the admin API |
 | `none mode — a tunneled request is still admitted, but is not admin` | Decision 5 |
+| `none mode, direct LAN peer — upstream admin is kept for the unrelayed caller …` | LAN keyless `200`, same peer relayed `403` |
 | `multi mode — a tunneled request is no longer localhost-admin` | Decision 4, multi mode |
 
-Against the **pre-fix** `server.mjs` (branch base) the section is `1 passed, 6 failed`: only the
-pure `relayHeaderOf` unit test passes, because it does not touch the server. The mutation table and
+The three LAN-peer tests skip, and say so, on a host with no non-internal IPv4 interface. Against the
+**pre-fix** `server.mjs` (branch base) the first seven tests went `1 passed, 6 failed`: only the pure
+`relayHeaderOf` unit test passed, because it does not touch the server. The mutation table and
 full-suite result are in the PR body.

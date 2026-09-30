@@ -8,7 +8,7 @@
   - A request carrying `cf-connecting-ip` or `x-forwarded-for` is never localhost (`lib/net.mjs` § `RELAY_HEADERS`). Presence can only downgrade a request, so a local caller sending the header gains nothing and no trusted-proxy list is needed.
   - Shared mode, remote caller: `OCP_ADMIN_KEY` (admin), `PROXY_API_KEY` (`shared`, admin as before), or a keys-DB key (its own name and id, quota-bound, **not** admin). Anything else gets the existing `401`.
   - `OCP_REMOTE_AUTH_OBSERVE=1` admits a missing or unknown key as `unverified` (not admin) and logs `auth_would_reject` (`reason`, 8-character `keyPreview`, `relayedBy`, `clientIp`, `method`, `path`). Default off. Boot warnings when it is on, when it cannot take effect, and when it is set to anything other than `1`.
-  - Admin is decided from which credential matched, never from the key name, so a DB key named `admin` is not admin in shared mode. Multi mode's formula is unchanged apart from relayed requests no longer being localhost.
+  - Admin is decided from which credential matched, never from the key name, so no DB key name (`remote`, `local`, `shared`, `admin`, `unverified`, `anonymous`) confers admin in shared or none mode. A direct LAN shared-mode caller with a DB key used to get 401; it is now admitted without admin. Multi mode's formula is unchanged apart from relayed requests no longer being localhost.
   - `none` mode still serves relayed requests but they are not admin. Real loopback callers are unchanged in every mode.
   - README: `OCP_REMOTE_AUTH_OBSERVE` row, `OCP_ADMIN_KEY` row, and a bootstrap-quirk entry.
 

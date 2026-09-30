@@ -7,6 +7,7 @@
 import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind, relayHeaderOf } from "./lib/net.mjs";
+import { networkInterfaces as _lt23NetIfaces } from "node:os";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
@@ -32256,16 +32257,25 @@ test("ADR 0023: relayHeaderOf reports cf-connecting-ip and x-forwarded-for by PR
   assert.equal(relayHeaderOf(undefined), null);
 });
 
-async function lt23Fetch(port, { method = "GET", path = "/v1/chat/completions", token = null, relay = null, body = null } = {}) {
+async function lt23Fetch(port, { method = "GET", path = "/v1/chat/completions", token = null, relay = null, body = null, host = "127.0.0.1" } = {}) {
   const headers = {};
   if (token !== null) headers.Authorization = `Bearer ${token}`;
   if (relay) Object.assign(headers, relay);
   if (body !== null) headers["Content-Type"] = "application/json";
   try {
-    const r = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body === null ? undefined : JSON.stringify(body) });
+    const r = await fetch(`http://${host}:${port}${path}`, { method, headers, body: body === null ? undefined : JSON.stringify(body) });
     return { status: r.status, text: await r.text() };
   } catch (e) { return { status: 0, text: String(e && e.message) }; }
 }
+// A non-loopback, UNRELAYED peer: bind the server to this host's own LAN address and connect to it,
+// so req.socket.remoteAddress is that address. This is the direct-LAN-client shape.
+function lt23LanAddress() {
+  const all = Object.values(_lt23NetIfaces()).flat();
+  const v4 = all.find((i) => i && i.family === "IPv4" && !i.internal);
+  return v4 ? v4.address : null;
+}
+// The per-app key names that collide with OCP's internal authKeyName buckets. None may confer admin.
+const LT23_RESERVED_NAMES = ["remote", "local", "shared", "admin", "unverified", "anonymous"];
 const LT23_CF = { "cf-connecting-ip": "203.0.113.7" };
 const LT23_XFF = { "x-forwarded-for": "203.0.113.7" };
 const LT23_CHAT = { model: "sonnet", messages: [{ role: "user", content: "hi" }] };
@@ -32371,6 +32381,60 @@ ltTest("ADR 0023: shared mode — through the tunnel the admin API takes the adm
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+ltTest("ADR 0023: shared mode, direct LAN peer — no per-app key NAME confers admin (remote, local, shared, admin, unverified, anonymous)", async () => {
+  if (!LT_POSIX) return;
+  const NAME = "ADR 0023: shared mode, direct LAN peer — no per-app key NAME confers admin (remote, local, shared, admin, unverified, anonymous)";
+  const lan = lt23LanAddress();
+  if (!lan) skipRemainingTest(NAME, "no non-internal IPv4 interface on this host, so no non-loopback peer can be produced");
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // Found by independent review of PR #5: `(!relayedBy && authKeyName === "remote")` made a DB key
+  // NAMED "remote" admin for a direct LAN caller. Reproduced there as 200 on /api/keys and /settings.
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, CLAUDE_BIND: lan, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    // PREMISE: this peer really is non-loopback. A loopback peer is never refused, so a 401 here
+    // proves the requests below are classified remote without any relay header.
+    const premise = await lt23Fetch(port, { host: lan, path: "/api/keys" });
+    assert.equal(premise.status, 401, `premise: a direct LAN request with no token must be 401 in shared mode; got ${premise.status} ${premise.text.slice(0, 200)}`);
+    for (const name of [...LT23_RESERVED_NAMES, "app1"]) {
+      const mint = await lt23Fetch(port, { host: lan, method: "POST", path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, body: { name } });
+      assert.equal(mint.status, 201, `premise: minting a key named ${name} with the admin key must succeed; got ${mint.status} ${mint.text.slice(0, 200)}`);
+      const key = JSON.parse(mint.text).key;
+      for (const path of ["/api/keys", "/settings"]) {
+        const r = await lt23Fetch(port, { host: lan, path, token: key });
+        assert.equal(r.status, 403, `a per-app key NAMED "${name}" from a direct LAN peer must not be admin on ${path}; got ${r.status}`);
+      }
+    }
+    // THE CONTROLS: the two admin credentials still work from the same peer.
+    const admin = await lt23Fetch(port, { host: lan, path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY });
+    assert.equal(admin.status, 200, `control: OCP_ADMIN_KEY from a LAN peer is admin; got ${admin.status}`);
+    const shared = await lt23Fetch(port, { host: lan, path: "/settings", token: LT_SECRETS.PROXY_API_KEY });
+    assert.equal(shared.status, 200, `control: PROXY_API_KEY from a LAN peer is admin; got ${shared.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0023: shared mode with NO PROXY_API_KEY — a keyless direct LAN caller keeps upstream admin, a key named \"remote\" and a relayed caller do not", async () => {
+  if (!LT_POSIX) return;
+  const NAME = "ADR 0023: shared mode with NO PROXY_API_KEY — a keyless direct LAN caller keeps upstream admin, a key named \"remote\" and a relayed caller do not";
+  const lan = lt23LanAddress();
+  if (!lan) skipRemainingTest(NAME, "no non-internal IPv4 interface on this host, so no non-loopback peer can be produced");
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "shared", CLAUDE_BIND: lan, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    // Upstream behaviour kept: the boot warning says every request passes unauthenticated, and an
+    // unrelayed caller that was never asked for a key is admin. This is the arm the flag tracks.
+    const keyless = await lt23Fetch(port, { host: lan, path: "/api/keys" });
+    assert.equal(keyless.status, 200, `a keyless direct LAN caller keeps upstream admin in this mode; got ${keyless.status} ${keyless.text.slice(0, 200)}`);
+    const mint = await lt23Fetch(port, { host: lan, method: "POST", path: "/api/keys", body: { name: "remote" } });
+    assert.equal(mint.status, 201, `premise: minting a key named remote must succeed; got ${mint.status}`);
+    const named = await lt23Fetch(port, { host: lan, path: "/api/keys", token: JSON.parse(mint.text).key });
+    assert.equal(named.status, 403, `a key NAMED "remote" must not borrow the keyless caller's admin; got ${named.status}`);
+    const relayed = await lt23Fetch(port, { host: lan, path: "/api/keys", relay: LT23_CF });
+    assert.equal(relayed.status, 403, `a RELAYED keyless caller in this mode must not be admin; got ${relayed.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 ltTest("ADR 0023: OCP_REMOTE_AUTH_OBSERVE=1 admits a bogus tunneled key as \"unverified\", logs auth_would_reject, and is not admin", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
@@ -32389,6 +32453,10 @@ ltTest("ADR 0023: OCP_REMOTE_AUTH_OBSERVE=1 admits a bogus tunneled key as \"unv
     assert.equal(ev.keyPreview, LT23_BOGUS.slice(0, 8), "the log carries an 8-character preview");
     assert.ok(!line.includes(LT23_BOGUS), "and never the whole token");
     assert.equal(ev.relayedBy, "cf-connecting-ip");
+    // No token at all is the other reason, and must be admitted and logged the same way.
+    const bare = await lt23Fetch(port, { method: "POST", relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(bare.status, 200, `observe mode must admit a request with NO token too; got ${bare.status}`);
+    assert.ok(await ltWait(() => /"reason":"missing_key"/.test(buf.err), 5000), `a missing token must log reason missing_key — ${ltDiag(buf)}`);
     const rows = await lt23UsageByKey(port, "unverified");
     assert.ok(rows.some((row) => row.key_name === "unverified"), `usage must be attributed to "unverified"; byKey=${JSON.stringify(rows)}`);
     // Admitted is not trusted: the same bogus key still cannot reach the admin API.
@@ -32412,6 +32480,22 @@ ltTest("ADR 0023: none mode — a tunneled request is still admitted, but is not
     assert.equal(tunneledAdmin.status, 403, `a tunneled request in none mode must not be admin; got ${tunneledAdmin.status}`);
     const localAdmin = await lt23Fetch(port, { path: "/api/keys" });
     assert.equal(localAdmin.status, 200, `control: real loopback in none mode is still admin; got ${localAdmin.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0023: none mode, direct LAN peer — upstream admin is kept for the unrelayed caller, and the same peer relayed loses it", async () => {
+  if (!LT_POSIX) return;
+  const NAME = "ADR 0023: none mode, direct LAN peer — upstream admin is kept for the unrelayed caller, and the same peer relayed loses it";
+  const lan = lt23LanAddress();
+  if (!lan) skipRemainingTest(NAME, "no non-internal IPv4 interface on this host, so no non-loopback peer can be produced");
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIND: lan, CLAUDE_BIN: fake }, dir); // base env: none mode
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const direct = await lt23Fetch(port, { host: lan, path: "/api/keys" });
+    assert.equal(direct.status, 200, `none mode: an unrelayed LAN caller keeps upstream admin; got ${direct.status} ${direct.text.slice(0, 200)}`);
+    const relayed = await lt23Fetch(port, { host: lan, path: "/api/keys", relay: LT23_CF });
+    assert.equal(relayed.status, 403, `none mode: the same peer RELAYED is not admin; got ${relayed.status}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
