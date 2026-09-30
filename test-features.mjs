@@ -6,7 +6,7 @@
 // MUST come before keys.mjs: redirects the key store to a scratch dir (see test-env.mjs).
 import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
-import { isLoopbackBind } from "./lib/net.mjs";
+import { isLoopbackBind, relayHeaderOf } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
@@ -32229,6 +32229,207 @@ test("ADR 0020: the gate's verdict and its REASON across the whole matrix", () =
   }
   // A malformed Host cannot vouch for anything, even for an Origin that stringifies the same way.
   assert.equal(g("http://a b", "a b").allow, false, "an unparseable pair must fail closed");
+});
+
+// ── ADR 0023: a request relayed by a tunnel or reverse proxy is REMOTE ─────────────────────────
+//
+// Measured in production 2026-09-30 (Windows host, cloudflared ingress `http://localhost:3456`,
+// CLAUDE_AUTH_MODE=shared): cloudflared connects from loopback, so every internet request was
+// classified as localhost. A made-up `ocp_bogus` got 200 on /v1/chat/completions, the admin API was
+// open to anyone past Cloudflare Access, and all 720 recorded requests were attributed to "local".
+//
+// Every live test below sends the SAME request twice, once as the tunnel sends it (with
+// `cf-connecting-ip`) and once as a real loopback caller sends it (without), so each half is the
+// other's control: a build that refuses everything fails the loopback half, and a build that still
+// trusts the socket fails the tunneled half.
+console.log("\nADR 0023 (relayed requests are remote):");
+
+test("ADR 0023: relayHeaderOf reports cf-connecting-ip and x-forwarded-for by PRESENCE, and nothing else", () => {
+  assert.equal(relayHeaderOf({ "cf-connecting-ip": "203.0.113.7" }), "cf-connecting-ip");
+  assert.equal(relayHeaderOf({ "x-forwarded-for": "203.0.113.7" }), "x-forwarded-for");
+  // Presence, not value: an empty header still means something relayed the request.
+  assert.equal(relayHeaderOf({ "cf-connecting-ip": "" }), "cf-connecting-ip", "an EMPTY relay header still marks the request as relayed");
+  // Controls: an ordinary request, and headers deliberately NOT on the list.
+  assert.equal(relayHeaderOf({ host: "127.0.0.1:3456", authorization: "Bearer x" }), null, "an ordinary loopback request is not relayed");
+  assert.equal(relayHeaderOf({ forwarded: "for=203.0.113.7", "x-real-ip": "203.0.113.7" }), null,
+    "Forwarded / X-Real-IP alone are NOT detected (ADR 0023 § What this does not do) — if this reddens, update the ADR");
+  assert.equal(relayHeaderOf(undefined), null);
+});
+
+async function lt23Fetch(port, { method = "GET", path = "/v1/chat/completions", token = null, relay = null, body = null } = {}) {
+  const headers = {};
+  if (token !== null) headers.Authorization = `Bearer ${token}`;
+  if (relay) Object.assign(headers, relay);
+  if (body !== null) headers["Content-Type"] = "application/json";
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body === null ? undefined : JSON.stringify(body) });
+    return { status: r.status, text: await r.text() };
+  } catch (e) { return { status: 0, text: String(e && e.message) }; }
+}
+const LT23_CF = { "cf-connecting-ip": "203.0.113.7" };
+const LT23_XFF = { "x-forwarded-for": "203.0.113.7" };
+const LT23_CHAT = { model: "sonnet", messages: [{ role: "user", content: "hi" }] };
+const LT23_BOGUS = "ocp_bogus_not_a_real_key_1234";
+// The production configuration, minus the host. LT_SECRETS holds the two inbound secrets.
+const LT23_SHARED = { CLAUDE_AUTH_MODE: "shared", PROXY_API_KEY: LT_SECRETS.PROXY_API_KEY, OCP_ADMIN_KEY: LT_SECRETS.OCP_ADMIN_KEY };
+
+// Mint a per-app key over the real admin API, from real loopback (which is admin).
+async function lt23MintKey(port, name) {
+  const r = await lt23Fetch(port, { method: "POST", path: "/api/keys", body: { name } });
+  assert.equal(r.status, 201, `premise: minting key ${name} from loopback must succeed; got ${r.status} ${r.text.slice(0, 200)}`);
+  const key = JSON.parse(r.text).key;
+  assert.match(key, /^ocp_/, `premise: the minted key must be a real ocp_ key; got ${r.text.slice(0, 200)}`);
+  return key;
+}
+// Usage rows by key name, read as admin from real loopback. Polls, because recordUsage runs after
+// the response is written — wait for the thing asserted, not a proxy for it. (ltWait takes a
+// SYNCHRONOUS predicate — a promise is always truthy — so this loop polls on its own.)
+async function lt23UsageByKey(port, wantName, ms = 9000) {
+  let rows = [];
+  const until = Date.now() + ms;
+  do {
+    const r = await lt23Fetch(port, { path: "/api/usage?all=true" });
+    if (r.status === 200) rows = JSON.parse(r.text).byKey || [];
+    if (rows.some((row) => row.key_name === wantName)) return rows;
+    await new Promise((res) => setTimeout(res, 50));
+  } while (Date.now() < until);
+  return rows;
+}
+
+ltTest("ADR 0023: shared mode — a bogus key is REFUSED through the tunnel and still admitted on real loopback", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    // THE CONTROL FIRST: a real loopback caller is still trusted, whatever token it sends. Without
+    // this the 401 below would be indistinguishable from a build that refuses everything.
+    const local = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, body: LT23_CHAT });
+    assert.equal(local.status, 200, `real loopback (no relay header) must still be admitted; got ${local.status} ${local.text.slice(0, 200)}`);
+    // THE PRODUCTION REPRO: the same request as cloudflared delivers it.
+    const tunneled = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(tunneled.status, 401, `a TUNNELED bogus key must be refused (this was 200 in production); got ${tunneled.status} ${tunneled.text.slice(0, 200)}`);
+    assert.match(tunneled.text, /"type":"auth_error"/, "the refusal must be the existing shared-mode auth_error shape");
+    assert.match(tunneled.text, /invalid or missing Bearer token/, "and carry the existing shared-mode message");
+    // No token at all, through the tunnel: also refused.
+    const bare = await lt23Fetch(port, { method: "POST", relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(bare.status, 401, `a TUNNELED request with no token must be refused; got ${bare.status}`);
+    // x-forwarded-for counts too (ADR 0023 § Decision 1).
+    const xff = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, relay: LT23_XFF, body: LT23_CHAT });
+    assert.equal(xff.status, 401, `a request relayed with x-forwarded-for must be refused the same way; got ${xff.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0023: shared mode — tunneled requests are attributed to the key that made them, never to \"local\"", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const key = await lt23MintKey(port, "lt23-app");
+    const r = await lt23Fetch(port, { method: "POST", token: key, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(r.status, 200, `a valid per-app key through the tunnel must be admitted; got ${r.status} ${r.text.slice(0, 200)}`);
+    let rows = await lt23UsageByKey(port, "lt23-app");
+    const mine = rows.find((row) => row.key_name === "lt23-app");
+    assert.ok(mine, `the tunneled request must be recorded under the key's own name; byKey=${JSON.stringify(rows)}`);
+    assert.equal(mine.requests, 1, `exactly the one tunneled request; byKey=${JSON.stringify(rows)}`);
+    // THE PRODUCTION SYMPTOM (all 720 rows "local"). The localhost branch names only the admin key,
+    // the anonymous key and DB keys, so the shared PROXY_API_KEY arriving through the tunnel was
+    // recorded as "local". A DB key alone does not reach it: on the pre-fix server the assertions
+    // above PASS, which is why this half exists.
+    const s = await lt23Fetch(port, { method: "POST", token: LT_SECRETS.PROXY_API_KEY, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(s.status, 200, `PROXY_API_KEY through the tunnel must be admitted; got ${s.status} ${s.text.slice(0, 200)}`);
+    rows = await lt23UsageByKey(port, "shared");
+    assert.ok(rows.some((row) => row.key_name === "shared"), `the shared key's request must be recorded as "shared"; byKey=${JSON.stringify(rows)}`);
+    // Only tunneled chat requests were made in this boot, so ANY "local" row is a misattribution.
+    assert.ok(!rows.some((row) => row.key_name === "local"), `no row may be attributed to "local"; byKey=${JSON.stringify(rows)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0023: shared mode — through the tunnel the admin API takes the admin or shared key, and refuses a per-app key", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const key = await lt23MintKey(port, "lt23-app");
+    // A DB key may be NAMED "admin". Admin must come from the credential, never from the name.
+    const namedAdmin = await lt23MintKey(port, "admin");
+    const perApp = await lt23Fetch(port, { path: "/api/keys", token: key, relay: LT23_CF });
+    assert.equal(perApp.status, 403, `a per-app key must NOT reach the admin API through the tunnel; got ${perApp.status} ${perApp.text.slice(0, 200)}`);
+    const impostor = await lt23Fetch(port, { path: "/api/keys", token: namedAdmin, relay: LT23_CF });
+    assert.equal(impostor.status, 403, `a per-app key NAMED "admin" must not be admin; got ${impostor.status}`);
+    // THE CONTROLS: the two admin credentials still work through the same tunnel, so the 403s above
+    // are about the key, not about the route being closed to everyone.
+    const admin = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, relay: LT23_CF });
+    assert.equal(admin.status, 200, `OCP_ADMIN_KEY through the tunnel must be admin; got ${admin.status} ${admin.text.slice(0, 200)}`);
+    const shared = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.PROXY_API_KEY, relay: LT23_CF });
+    assert.equal(shared.status, 200, `PROXY_API_KEY through the tunnel stays admin, as upstream treats it; got ${shared.status}`);
+    // And real loopback, with no token, is still admin.
+    const local = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(local.status, 200, `real loopback must still reach the admin API; got ${local.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0023: OCP_REMOTE_AUTH_OBSERVE=1 admits a bogus tunneled key as \"unverified\", logs auth_would_reject, and is not admin", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, OCP_REMOTE_AUTH_OBSERVE: "1", CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    assert.ok(await ltWait(() => /WARNING: OCP_REMOTE_AUTH_OBSERVE=1 — remote requests/.test(buf.out + buf.err), 5000),
+      `observe mode must announce itself at boot — ${ltDiag(buf)}`);
+    const r = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(r.status, 200, `observe mode must ADMIT the request enforcement would refuse; got ${r.status} ${r.text.slice(0, 200)}`);
+    assert.ok(await ltWait(() => /"event":"auth_would_reject"/.test(buf.err), 5000), `auth_would_reject was never logged — ${ltDiag(buf)}`);
+    const line = buf.err.split("\n").find((l) => l.includes('"event":"auth_would_reject"'));
+    const ev = JSON.parse(line);
+    assert.equal(ev.level, "warn");
+    assert.equal(ev.reason, "unknown_key");
+    assert.equal(ev.keyPreview, LT23_BOGUS.slice(0, 8), "the log carries an 8-character preview");
+    assert.ok(!line.includes(LT23_BOGUS), "and never the whole token");
+    assert.equal(ev.relayedBy, "cf-connecting-ip");
+    const rows = await lt23UsageByKey(port, "unverified");
+    assert.ok(rows.some((row) => row.key_name === "unverified"), `usage must be attributed to "unverified"; byKey=${JSON.stringify(rows)}`);
+    // Admitted is not trusted: the same bogus key still cannot reach the admin API.
+    const adminApi = await lt23Fetch(port, { path: "/api/keys", token: LT23_BOGUS, relay: LT23_CF });
+    assert.equal(adminApi.status, 403, `an "unverified" caller must not be admin; got ${adminApi.status}`);
+    // Control: observe mode did not also weaken the admin credential path.
+    const admin = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, relay: LT23_CF });
+    assert.equal(admin.status, 200, `the admin key must still be admin in observe mode; got ${admin.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0023: none mode — a tunneled request is still admitted, but is not admin; real loopback still is", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir); // ltBoot's base env is CLAUDE_AUTH_MODE=none
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const chat = await lt23Fetch(port, { method: "POST", relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(chat.status, 200, `none mode means no auth: a tunneled request is still served; got ${chat.status} ${chat.text.slice(0, 200)}`);
+    const tunneledAdmin = await lt23Fetch(port, { path: "/api/keys", relay: LT23_CF });
+    assert.equal(tunneledAdmin.status, 403, `a tunneled request in none mode must not be admin; got ${tunneledAdmin.status}`);
+    const localAdmin = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(localAdmin.status, 200, `control: real loopback in none mode is still admin; got ${localAdmin.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0023: multi mode — a tunneled request is no longer localhost-admin; real loopback still is", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", OCP_ADMIN_KEY: LT_SECRETS.OCP_ADMIN_KEY, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const tunneled = await lt23Fetch(port, { path: "/api/keys", relay: LT23_CF });
+    assert.equal(tunneled.status, 403, `a tunneled multi-mode request is anonymous, not admin; got ${tunneled.status}`);
+    const bogus = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(bogus.status, 401, `multi mode's own rule applies to a tunneled bogus key; got ${bogus.status}`);
+    const local = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(local.status, 200, `control: real loopback in multi mode is still admin; got ${local.status}`);
+    const admin = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, relay: LT23_CF });
+    assert.equal(admin.status, 200, `control: the admin key through the tunnel is admin; got ${admin.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // ── The Node prerequisite: one table, and everything else derived from it ─────────────────

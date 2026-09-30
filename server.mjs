@@ -46,7 +46,7 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { scheduleKillEscalation } from "./lib/child-tree.mjs";
-import { isLoopbackBind } from "./lib/net.mjs";
+import { isLoopbackBind, relayHeaderOf } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
@@ -574,6 +574,11 @@ const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
 // LAN-reachable device (issue #109 P0). Localhost callers always see it regardless,
 // since localhost is already fully trusted by the auth path.
 const ADVERTISE_ANON_KEY = process.env.PROXY_ADVERTISE_ANON_KEY === "1";
+// ADR 0023. Observe mode for remote shared-mode auth. When "1", a remote request whose Bearer
+// token is missing or unknown is ADMITTED as "unverified" (never admin) and logged as
+// `auth_would_reject`, instead of refused with 401. For finding stale clients before enforcing.
+// Default off: enforce.
+const REMOTE_AUTH_OBSERVE = process.env.OCP_REMOTE_AUTH_OBSERVE === "1";
 
 // #327, additive under ADR 0012. A non-primary OCP instance names itself.
 //
@@ -1030,6 +1035,16 @@ if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
 
 if (AUTH_MODE === "shared" && !PROXY_API_KEY) {
   console.warn("WARNING: AUTH_MODE=shared but PROXY_API_KEY is not set — all requests will pass unauthenticated");
+}
+
+// ADR 0023: observe mode ADMITS requests that would otherwise be refused, so it must be loud.
+if (REMOTE_AUTH_OBSERVE) {
+  console.warn(
+    AUTH_MODE === "shared" && PROXY_API_KEY
+      ? "WARNING: OCP_REMOTE_AUTH_OBSERVE=1 — remote requests with a missing or unknown Bearer token are ADMITTED as \"unverified\" (not admin) and logged as auth_would_reject instead of refused with 401. Unset it to enforce (ADR 0023)."
+      : "WARNING: OCP_REMOTE_AUTH_OBSERVE=1 has no effect: it applies only to CLAUDE_AUTH_MODE=shared with PROXY_API_KEY set (ADR 0023).");
+} else if (process.env.OCP_REMOTE_AUTH_OBSERVE) {
+  console.warn(`WARNING: OCP_REMOTE_AUTH_OBSERVE=${JSON.stringify(process.env.OCP_REMOTE_AUTH_OBSERVE)} is not "1" — observe mode is OFF and remote requests are enforced (ADR 0023).`);
 }
 
 const VERSION = _pkg.version;
@@ -5195,9 +5210,24 @@ async function handleRequest(req, res) {
   const pathname = req.url.split("?")[0];
   const isPublicEndpoint = pathname === "/health" || pathname === "/dashboard";
   const remoteAddr = req.socket.remoteAddress || "";
-  const isLocalhost = remoteAddr === "127.0.0.1" || remoteAddr === "::1" || remoteAddr === "::ffff:127.0.0.1";
+  // ADR 0023: a request relayed by a reverse proxy or tunnel is REMOTE even when its socket is
+  // loopback. cloudflared connects from 127.0.0.1, so before this every internet request through
+  // the tunnel was "localhost": any token admitted, admin on, usage attributed to "local".
+  // The relay check can only downgrade, so a local caller sending the header gains nothing.
+  const relayedBy = relayHeaderOf(req.headers);
+  const isLoopbackPeer = remoteAddr === "127.0.0.1" || remoteAddr === "::1" || remoteAddr === "::ffff:127.0.0.1";
+  const isLocalhost = isLoopbackPeer && !relayedBy;
   let authKeyName = isLocalhost ? "local" : "remote";
   let authKeyId = null;
+  // ADR 0023: set only when the token matched OCP_ADMIN_KEY or PROXY_API_KEY on the remote
+  // shared-mode path. Admin is decided from this, never from authKeyName, because a key in the
+  // DB may legitimately be NAMED "admin" or "shared".
+  let remoteCredentialIsAdmin = false;
+  const tokenIs = (token, secret) => {
+    if (!token || !secret) return false;
+    const a = Buffer.from(token); const b = Buffer.from(secret);
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
 
   if (!isPublicEndpoint) {
     const auth = req.headers["authorization"] || "";
@@ -5227,13 +5257,34 @@ async function handleRequest(req, res) {
         }
       }
     } else if (AUTH_MODE === "shared") {
-      if (PROXY_API_KEY) {
-        const tokenBuf = Buffer.from(token);
-        const keyBuf = Buffer.from(PROXY_API_KEY);
-        if (tokenBuf.length !== keyBuf.length || !timingSafeEqual(tokenBuf, keyBuf)) {
-          return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or missing Bearer token", type: "auth_error" } });
-        }
+      // ADR 0023: a remote shared-mode caller presents the admin key (admin), the shared key
+      // (admin, as before), or a per-app key from the keys DB (attributed, quota-bound, NOT admin).
+      if (tokenIs(token, ADMIN_KEY)) {
+        authKeyName = "admin";
+        remoteCredentialIsAdmin = true;
+      } else if (tokenIs(token, PROXY_API_KEY)) {
         authKeyName = "shared";
+        remoteCredentialIsAdmin = true;
+      } else {
+        const keyInfo = token ? validateKey(token) : null;
+        if (keyInfo) {
+          authKeyName = keyInfo.name;
+          authKeyId = keyInfo.id;
+        } else if (PROXY_API_KEY) {
+          if (!REMOTE_AUTH_OBSERVE) {
+            return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or missing Bearer token", type: "auth_error" } });
+          }
+          authKeyName = "unverified";
+          logEvent("warn", "auth_would_reject", {
+            reason: token ? "unknown_key" : "missing_key",
+            keyPreview: token ? token.slice(0, 8) : null,
+            relayedBy,
+            clientIp: String(req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"] || remoteAddr),
+            method: req.method,
+            path: pathname,
+          });
+        }
+        // PROXY_API_KEY unset: unchanged pass-through as "remote" (the boot warning says so).
       }
     } else if (AUTH_MODE === "multi") {
       // If a token is provided, validate it; if not, allow as anonymous
@@ -5278,7 +5329,15 @@ async function handleRequest(req, res) {
   // GET /logs, GET /usage, GET /status, PATCH /settings
   // can all gate on it.  Localhost and explicit admin key are always admin;
   // in multi-tenant mode only the "admin" named key qualifies.
-  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isLocalhost;
+  //
+  // ADR 0023, none/shared: admin is localhost, a remote caller holding OCP_ADMIN_KEY or
+  // PROXY_API_KEY, or an UNRELAYED remote caller that was never asked for a key (none mode, or
+  // shared mode with no PROXY_API_KEY), which is upstream's behaviour for a direct LAN client.
+  // Not admin: a per-app DB key, "unverified" (observe mode), and any relayed request that did not
+  // present one of the two admin credentials.
+  const isAdmin = AUTH_MODE === "multi"
+    ? authKeyName === "admin" || isLocalhost
+    : isLocalhost || remoteCredentialIsAdmin || (!relayedBy && authKeyName === "remote");
 
   // GET /v1/models
   if (req.url === "/v1/models" && req.method === "GET") {
