@@ -174,6 +174,11 @@ grandfather clause, and none adds a field or an endpoint, so none is filed under
   never a keys-DB key's **name**. A multi-mode request carrying a DB key named `admin` that executed
   as admin now gets `403` on the admin-gated endpoints. A semantics change, ADR 0006 route (b), not
   ADR 0012.
+- [ADR 0025](docs/adr/0025-loopback-trust-switch.md) adds an operator switch to that same auth block.
+  `OCP_TRUST_LOOPBACK=0` stops a loopback socket conferring any trust, so a loopback request
+  authenticates like a remote one under the mode's rules. Default on, which leaves every endpoint
+  exactly as before. With the switch set, a loopback request that executed now gets `401` or `403`:
+  a semantics change, ADR 0006 route (b), not ADR 0012.
 
 > Recorded here rather than only in the ADR because **this paragraph is what a reviewer reads when
 > CLAUDE.md tells them to "independently confirm the declared class against the `ALIGNMENT.md`

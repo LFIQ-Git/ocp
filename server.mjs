@@ -579,6 +579,14 @@ const ADVERTISE_ANON_KEY = process.env.PROXY_ADVERTISE_ANON_KEY === "1";
 // `auth_would_reject`, instead of refused with 401. For finding stale clients before enforcing.
 // Default off: enforce.
 const REMOTE_AUTH_OBSERVE = process.env.OCP_REMOTE_AUTH_OBSERVE === "1";
+// ADR 0025. Whether a loopback socket confers trust. Default on: a loopback request with no relay
+// header is localhost (never refused, admin), exactly as before. `OCP_TRUST_LOOPBACK=0` turns that
+// off entirely, so a loopback caller authenticates like a remote one under the mode's own rules.
+// For hosts where something reaches the port from loopback WITHOUT a relay header (a cloudflared
+// tcp:// ingress, WARP private routing, an SSH -L forward, a header-stripping proxy), which ADR 0023
+// cannot see. `!== "0"` follows the repo's convention for default-on switches (OCP_TOOL_CALLING,
+// OCP_MULTIBLOCK_INPUT); any other value keeps trust ON and gets a boot warning below.
+const TRUST_LOOPBACK = process.env.OCP_TRUST_LOOPBACK !== "0";
 
 // #327, additive under ADR 0012. A non-primary OCP instance names itself.
 //
@@ -1045,6 +1053,19 @@ if (REMOTE_AUTH_OBSERVE) {
       : "WARNING: OCP_REMOTE_AUTH_OBSERVE=1 has no effect: it applies only to CLAUDE_AUTH_MODE=shared with PROXY_API_KEY set (ADR 0023).");
 } else if (process.env.OCP_REMOTE_AUTH_OBSERVE) {
   console.warn(`WARNING: OCP_REMOTE_AUTH_OBSERVE=${JSON.stringify(process.env.OCP_REMOTE_AUTH_OBSERVE)} is not "1" — observe mode is OFF and remote requests are enforced (ADR 0023).`);
+}
+
+// ADR 0025: say when loopback trust is off, and when the switch was set to something it does not
+// understand (the fail-open direction: trust stays on).
+if (!TRUST_LOOPBACK) {
+  console.warn(
+    "OCP_TRUST_LOOPBACK=0 — loopback trust is OFF: a request on a loopback socket authenticates like a remote one. " +
+    "Local tools that call the admin API (ocp usage, ocp keys, ocp settings, ...) must send OCP_ADMIN_KEY (ADR 0025).");
+  if (AUTH_MODE === "none" || (AUTH_MODE === "shared" && !PROXY_API_KEY)) {
+    console.warn(`WARNING: OCP_TRUST_LOOPBACK=0 changes nothing in CLAUDE_AUTH_MODE=${AUTH_MODE}${AUTH_MODE === "shared" ? " without PROXY_API_KEY" : ""}: that configuration admits an unrelayed remote caller without a credential, and a loopback caller is now exactly that (ADR 0025).`);
+  }
+} else if (process.env.OCP_TRUST_LOOPBACK !== undefined && process.env.OCP_TRUST_LOOPBACK !== "1") {
+  console.warn(`WARNING: OCP_TRUST_LOOPBACK=${JSON.stringify(process.env.OCP_TRUST_LOOPBACK)} is not "0" — loopback trust stays ON (ADR 0025).`);
 }
 
 const VERSION = _pkg.version;
@@ -5216,7 +5237,9 @@ async function handleRequest(req, res) {
   // The relay check can only downgrade, so a local caller sending the header gains nothing.
   const relayedBy = relayHeaderOf(req.headers);
   const isLoopbackPeer = remoteAddr === "127.0.0.1" || remoteAddr === "::1" || remoteAddr === "::ffff:127.0.0.1";
-  const isLocalhost = isLoopbackPeer && !relayedBy;
+  // ADR 0025: with OCP_TRUST_LOOPBACK=0 a loopback socket confers nothing, and the request takes the
+  // remote path below exactly as a direct LAN caller does.
+  const isLocalhost = TRUST_LOOPBACK && isLoopbackPeer && !relayedBy;
   let authKeyName = isLocalhost ? "local" : "remote";
   let authKeyId = null;
   // ADR 0023: set only when the token matched OCP_ADMIN_KEY or PROXY_API_KEY on the remote
@@ -6039,6 +6062,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  console.log(`Loopback trust: ${TRUST_LOOPBACK ? "on (a loopback request with no relay header is localhost)" : "OFF (OCP_TRUST_LOOPBACK=0; loopback callers authenticate like remote ones)"}`);
   // Which of the three system-prompt wrappers this boot selected. Operator-facing because the
   // choice is invisible otherwise (the prompt travels in a 0600 temp file, #453) and because the
   // defect it replaces was exactly a mismatch between what the operator believed the model was
