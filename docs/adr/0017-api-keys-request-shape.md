@@ -1,9 +1,9 @@
 # 0017 — `POST /api/keys` Request Shape, and What the Grandfather Is a Snapshot Of
 
-- **Date**: 2026-08-10
-- **Status**: Accepted (maintainer sign-off 2026-08-11)
+- **Date**: 2026-08-10 (**Amendment 1** accepted 2026-09-30 — see under Decision)
+- **Status**: Accepted (maintainer sign-off 2026-08-11). Amendment 1: Accepted (maintainer sign-off 2026-09-30, after independent review on PR #6)
 - **Authors**: project maintainer (with AI advisory drafting)
-- **Related**: ADR 0006 (Class A/B taxonomy and the B.2 grandfather), ADR 0012 (additive fields on grandfathered B.2), ADR 0016 (how B.2 surface may be *removed*), `ALIGNMENT.md:114`, issues #383, #360, #114
+- **Related**: ADR 0006 (Class A/B taxonomy and the B.2 grandfather), ADR 0012 (additive fields on grandfathered B.2), ADR 0016 (how B.2 surface may be *removed*), ADR 0023 (the follow-up Amendment 1 closes), `ALIGNMENT.md:114`, issues #383, #360, #114
 
 > **Citations in this ADR name symbols, not line numbers.** The draft cited `server.mjs:3928` and
 > `:3929`; between drafting and sign-off those lines moved to `:4050`/`:4051` (#395, #403) and then
@@ -84,6 +84,61 @@ It is **not** re-opened for redesign by this ADR. Anyone wanting to widen or nar
 ### 3. Correct the comment
 
 The `#360:` block comment in the `POST /api/keys` branch must stop asserting the endpoint sits at its v3.16.4 snapshot. Under this ADR the scalar path is fixed and the regex is authorized, so the comment's job changes entirely: it should record what the endpoint accepts and under which authorization, not argue for inaction.
+
+> **Amendment 1 (accepted 2026-09-30; maintainer sign-off after independent review on PR #6).** `POST /api/keys` refuses a
+> new key whose name, **trimmed and compared case-insensitively**, is one of OCP's internal bucket
+> names:
+>
+> ```
+> admin  local  remote  shared  unverified  anonymous
+> ```
+>
+> with the status and error shape the handler already uses for a bad name: `400`,
+> `{ "error": { "message": "Invalid key name: \"<name>\" is reserved …", "type": "invalid_request_error" } }`.
+> The list lives once, in `keys.mjs` § `RESERVED_KEY_NAMES`; the handler and `createKey()` both read
+> it, so `createKey()` throws on a reserved name even if a future caller skips the handler.
+>
+> **Why.** These six strings are the `authKeyName` values the auth block assigns when no per-app key
+> matched (`server.mjs`, grep `// 3-mode auth`). ADR 0023 stopped any of them conferring admin, but a
+> DB key carrying one still **shares that bucket**: usage is recorded under `key_name`, and
+> `/api/usage` scopes a non-admin caller to its own `key_name`. A key named `local` therefore reads
+> every loopback caller's usage rows and has its own requests mixed into theirs. ADR 0023 recorded this
+> as a follow-up and said it belonged here, because it narrows the request shape this ADR governs.
+> Measured before the change: on `d1fa70e`, `POST /api/keys {"name":"admin"}` from loopback answered
+> `201` with a live key (the ADR 0023 tests minted all six names that way).
+>
+> **Existing keys are not touched.** Only creation is refused. `validateKey()` never consults the
+> list, so a key minted before this amendment keeps authenticating, keeps its name, stays listed and
+> keeps its usage rows. It is still not admin, which ADR 0023 already settled. Revoking or renaming
+> such a key is left to the operator; nothing here does it for them.
+>
+> **Why case-insensitive and trimmed.** The name regex admits spaces and both cases, so `Admin` and
+> `admin ` pass it. They are not the same SQLite string as `admin` today, so they would not collide
+> with the bucket; they are refused anyway, because a name an operator reads as `admin` on the
+> dashboard should not be one a reviewer has to diff byte-by-byte to know is harmless.
+>
+> **Why an amendment rather than a new ADR.** Decision 2 says widening or narrowing *the charset*
+> needs its own ADR. The charset and length are unchanged, byte for byte. This excludes six values
+> of the same field, in the same handler, with the same error, on the same grounds this ADR already
+> uses: the endpoint mints credentials, and refusing a request no correct client needs to send costs
+> nothing. `ALIGNMENT.md`'s `/api/keys` row already names this ADR as the authority for the POST
+> request shape, so a separate ADR would be a second authority for one field. If a reviewer reads
+> Decision 2's clause as covering any narrowing of accepted names, this text moves into its own ADR
+> unchanged.
+>
+> **Consumers.** `ocp keys add <name>` posts `{"name": "<name>"}` to this endpoint, so it inherits the
+> refusal; its HTTP-error message now names reserved names as a cause. `dashboard.html` posts
+> `{ name }` and shows nothing on a non-key response, which is its existing behaviour for every
+> `400`. `scripts/b2-key-snapshot.mjs` posts `b2-key-snapshot`, which is not reserved, so the B.2
+> response snapshot does not move.
+>
+> **Evidence.** `test-features.mjs` § `ADR 0017 Amendment 1`: the list and the trimmed,
+> case-insensitive match, with near-miss controls (`admins`, `local-dev`, `my remote`); `createKey()`
+> throwing and writing no row; the live endpoint answering `400` for all six names plus six
+> case/padding variants, minting none, and still minting near-miss names and `{}`; and a key seeded
+> straight into the store under the name `remote`, as an older release left it, still answering `200`
+> through the tunnel, attributed to `remote`, listed, and `403` on the admin API. ADR 0023's own tests
+> now seed their reserved-name keys the same way instead of minting them.
 
 ## Alternatives rejected
 

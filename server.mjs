@@ -42,7 +42,7 @@ import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, isReservedKeyName, RESERVED_KEY_NAMES, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { scheduleKillEscalation } from "./lib/child-tree.mjs";
@@ -5553,6 +5553,9 @@ async function handleRequest(req, res) {
     //   {"name":<anything else>}              -> 400 "Invalid key name"  (below; shipped since
     //                                            v3.18.0 in 879b40f, retroactively authorized by
     //                                            ADR 0017 § Decision 2 — NOT grandfathered)
+    //   {"name":<a reserved bucket name>}     -> 400 "Invalid key name"  (below; ADR 0017
+    //                                            Amendment 1: admin, local, remote, shared,
+    //                                            unverified, anonymous — trimmed, any case)
     //   anything that is not a JSON object    -> 400, here                (ADR 0017 § Decision 1)
     //
     // Class B.2, `/api/keys*` in ALIGNMENT.md's inventory. The guard below is a REQUEST-SHAPE
@@ -5596,6 +5599,13 @@ async function handleRequest(req, res) {
     // it. Not re-opened for redesign: widening or narrowing the charset needs its own ADR.
     if (!/^[A-Za-z0-9 ._-]{1,64}$/.test(name)) {
       return jsonResponse(res, 400, { error: { message: "Invalid key name: 1-64 chars of letters, digits, space, dot, underscore, hyphen", type: "invalid_request_error" } });
+    }
+    // Authorized by ADR 0017 Amendment 1: a new key may not take one of OCP's internal bucket
+    // names (keys.mjs § RESERVED_KEY_NAMES), compared trimmed and case-insensitively. Same status
+    // and error shape as the name check above. Existing keys with such a name keep working;
+    // validateKey() does not consult the list.
+    if (isReservedKeyName(name)) {
+      return jsonResponse(res, 400, { error: { message: `Invalid key name: "${name.trim()}" is reserved for OCP's internal usage buckets (${RESERVED_KEY_NAMES.join(", ")})`, type: "invalid_request_error" } });
     }
     const newKey = createKey(name);
     return jsonResponse(res, 201, newKey);
