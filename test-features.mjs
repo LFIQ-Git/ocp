@@ -32483,6 +32483,161 @@ ltTest("ADR 0023: none mode — a tunneled request is still admitted, but is not
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── ADR 0025: OCP_TRUST_LOOPBACK=0 — a loopback socket confers no trust ──────────────────────────
+//
+// ADR 0023 left one fail-open: anything that reaches the port from loopback WITHOUT a relay header
+// (a cloudflared tcp:// ingress, WARP private routing, an SSH -L forward, a header-stripping proxy)
+// is still localhost, never refused and admin. OCP_TRUST_LOOPBACK=0 switches loopback trust off
+// entirely. Every test boots with and without the switch against the SAME request, so each is the
+// other's control; the default (unset) must behave exactly as before.
+console.log("\nADR 0025 (OCP_TRUST_LOOPBACK=0):");
+const LT25_OFF = { OCP_TRUST_LOOPBACK: "0" };
+
+ltTest("ADR 0025: OCP_TRUST_LOOPBACK=0, shared mode — a loopback request with no token is 401; the admin key is 200 on an admin route", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, ...LT25_OFF, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    assert.ok(await ltWait(() => /OCP_TRUST_LOOPBACK=0 — loopback trust is OFF/.test(buf.err) && /Loopback trust: OFF/.test(buf.out), 5000),
+      `the switch must announce itself at boot, in the warning and in the banner — ${ltDiag(buf)}`);
+    // THE CLAIM: real loopback, no relay header, no token. With trust on this is admin (the control
+    // test below); with it off it is a remote caller with no credential.
+    const bare = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(bare.status, 401, `a loopback request with no token must be refused with trust off; got ${bare.status} ${bare.text.slice(0, 200)}`);
+    assert.match(bare.text, /invalid or missing Bearer token/, "with the existing shared-mode 401 body");
+    const bareChat = await lt23Fetch(port, { method: "POST", body: LT23_CHAT });
+    assert.equal(bareChat.status, 401, `and on the chat route too; got ${bareChat.status}`);
+    const bogus = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, body: LT23_CHAT });
+    assert.equal(bogus.status, 401, `a bogus key from loopback must be refused with trust off; got ${bogus.status}`);
+    // THE PAIRED CONTROL: the admin key from the same socket is admin, so the 401s are about the
+    // missing credential and not about loopback being shut out.
+    const admin = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY });
+    assert.equal(admin.status, 200, `OCP_ADMIN_KEY from loopback must be admin with trust off; got ${admin.status} ${admin.text.slice(0, 200)}`);
+    const settings = await lt23Fetch(port, { path: "/settings", token: LT_SECRETS.OCP_ADMIN_KEY });
+    assert.equal(settings.status, 200, `and on /settings; got ${settings.status}`);
+    // The rest of the shared-mode remote rules, from loopback: PROXY_API_KEY is admin, a DB key is
+    // admitted but not admin.
+    const shared = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.PROXY_API_KEY });
+    assert.equal(shared.status, 200, `PROXY_API_KEY from loopback is admin, as for any remote caller; got ${shared.status}`);
+    const mint = await lt23Fetch(port, { method: "POST", path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, body: { name: "lt25-app" } });
+    assert.equal(mint.status, 201, `premise: the admin key can mint from loopback; got ${mint.status}`);
+    const appKey = JSON.parse(mint.text).key;
+    const appChat = await lt23Fetch(port, { method: "POST", token: appKey, body: LT23_CHAT });
+    assert.equal(appChat.status, 200, `a DB key from loopback is admitted; got ${appChat.status}`);
+    const appAdmin = await lt23Fetch(port, { path: "/api/keys", token: appKey });
+    assert.equal(appAdmin.status, 403, `a DB key from loopback is not admin with trust off; got ${appAdmin.status}`);
+    // /health stays public.
+    const health = await lt23Fetch(port, { path: "/health" });
+    assert.equal(health.status, 200, `/health is public in every configuration; got ${health.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0025 control: OCP_TRUST_LOOPBACK unset — the same loopback requests keep localhost trust, exactly as before", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    // Behaviour first, so a mutation to the default reddens on the behaviour and not on the banner.
+    const bare = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(bare.status, 200, `default: a loopback request with no token is admin, as upstream; got ${bare.status}`);
+    const bogus = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, body: LT23_CHAT });
+    assert.equal(bogus.status, 200, `default: a loopback request is never refused, whatever token it sends; got ${bogus.status}`);
+    const admin = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY });
+    assert.equal(admin.status, 200, `default: the admin key from loopback is admin; got ${admin.status}`);
+    assert.ok(await ltWait(() => /Loopback trust: on/.test(buf.out), 5000), `the banner must say loopback trust is on — ${ltDiag(buf)}`);
+    assert.ok(!/OCP_TRUST_LOOPBACK/.test(buf.err), `no OCP_TRUST_LOOPBACK warning when it is unset — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0025: OCP_TRUST_LOOPBACK=0, multi mode — loopback with no token is anonymous (403 on the admin API), the admin key is 200, a bogus key 401", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", OCP_ADMIN_KEY: LT_SECRETS.OCP_ADMIN_KEY, ...LT25_OFF, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const bare = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(bare.status, 403, `multi mode, trust off: a keyless loopback caller is anonymous, not admin; got ${bare.status}`);
+    const bogus = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, body: LT23_CHAT });
+    assert.equal(bogus.status, 401, `multi mode's own rule applies to a loopback bogus key; got ${bogus.status}`);
+    const admin = await lt23Fetch(port, { path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY });
+    assert.equal(admin.status, 200, `control: the admin key from loopback is admin; got ${admin.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0025: OCP_TRUST_LOOPBACK=0 with OCP_REMOTE_AUTH_OBSERVE=1 — a bogus loopback key is admitted as \"unverified\", logged, and not admin", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, ...LT25_OFF, OCP_REMOTE_AUTH_OBSERVE: "1", CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const r = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, body: LT23_CHAT });
+    assert.equal(r.status, 200, `observe mode applies to loopback callers with trust off; got ${r.status} ${r.text.slice(0, 200)}`);
+    assert.ok(await ltWait(() => /"event":"auth_would_reject"/.test(buf.err), 5000), `auth_would_reject was never logged — ${ltDiag(buf)}`);
+    const ev = JSON.parse(buf.err.split("\n").find((l) => l.includes('"event":"auth_would_reject"')));
+    assert.equal(ev.reason, "unknown_key");
+    assert.equal(ev.relayedBy, null, "an unrelayed loopback caller is logged with no relay header");
+    const adminApi = await lt23Fetch(port, { path: "/api/keys", token: LT23_BOGUS });
+    assert.equal(adminApi.status, 403, `an "unverified" loopback caller is not admin; got ${adminApi.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0025: OCP_TRUST_LOOPBACK set to anything but 0 keeps trust ON and warns; =0 in none mode warns that it changes nothing", async () => {
+  if (!LT_POSIX) return;
+  // (a) A misspelled value is the fail-open direction, so it must be loud.
+  {
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, OCP_TRUST_LOOPBACK: "false", CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => /WARNING: OCP_TRUST_LOOPBACK="false" is not "0" — loopback trust stays ON/.test(buf.err), 5000),
+        `an unrecognised value must warn that trust stays on — ${ltDiag(buf)}`);
+      const bare = await lt23Fetch(port, { path: "/api/keys" });
+      assert.equal(bare.status, 200, `and trust really does stay on; got ${bare.status}`);
+    } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+  }
+  // (b) none mode admits an unrelayed caller without a credential, so the switch has nothing to do.
+  {
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    const { child, buf, port } = await ltBootFresh({ ...LT25_OFF, CLAUDE_BIN: fake }, dir); // base env: none mode
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => /WARNING: OCP_TRUST_LOOPBACK=0 changes nothing in CLAUDE_AUTH_MODE=none/.test(buf.err), 5000),
+        `none mode must say the switch changes nothing — ${ltDiag(buf)}`);
+      const bare = await lt23Fetch(port, { path: "/api/keys" });
+      assert.equal(bare.status, 200, `none mode: an unrelayed caller is admitted and admin, loopback or not (ADR 0023 Decision 4); got ${bare.status}`);
+    } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+  }
+});
+
+test("ADR 0025: the ocp CLI sends the admin key on every local admin call (usage, status, logs, models, settings get and set)", () => {
+  // With OCP_TRUST_LOOPBACK=0 a loopback caller must authenticate, so every `ocp` subcommand that
+  // reaches a non-public route has to send the key it already knows (OCP_ADMIN_KEY or
+  // ~/.ocp/admin-key, via _curl). Before this change only the /api/keys and /api/usage calls did.
+  const KEY = "lt25-admin-key-marker";
+  const cases = [
+    { args: ["usage"], path: "/usage", body: `${JSON.stringify({ proxy: {} })}\n200` },
+    { args: ["status"], path: "/status", body: JSON.stringify({ ok: true }) },
+    { args: ["logs"], path: "/logs?n=20&level=error", body: JSON.stringify({ lines: [] }) },
+    { args: ["models"], path: "/v1/models", body: JSON.stringify({ data: [] }) },
+    { args: ["settings"], path: "/settings", body: JSON.stringify({}) },
+    { args: ["settings", "timeout", "60000"], path: "/settings", body: JSON.stringify({ ok: true }) },
+  ];
+  for (const c of cases) {
+    const withKey = _bwHarnessRun({ args: c.args, adminKey: KEY, curlResponses: [{ match: c.path, body: c.body }] });
+    const call = withKey.log.find((l) => l.startsWith("FAKE-CURL-CALL") && l.includes(c.path));
+    assert.ok(call, `premise: \`ocp ${c.args.join(" ")}\` called curl for ${c.path}; log=${JSON.stringify(withKey.log)}`);
+    assert.ok(call.includes(`Authorization: Bearer ${KEY}`), `\`ocp ${c.args.join(" ")}\` must send the admin key; curl argv: ${call}`);
+    // Control: with no key available the same call sends no Authorization header, so the check above
+    // is about the key reaching curl, not about a header that is always there.
+    const noKey = _bwHarnessRun({ args: c.args, curlResponses: [{ match: c.path, body: c.body }] });
+    const bare = noKey.log.find((l) => l.startsWith("FAKE-CURL-CALL") && l.includes(c.path));
+    assert.ok(bare, `premise: without a key \`ocp ${c.args.join(" ")}\` still called curl; log=${JSON.stringify(noKey.log)}`);
+    assert.ok(!bare.includes("Authorization:"), `with no key available no Authorization header is sent; curl argv: ${bare}`);
+  }
+});
+
 ltTest("ADR 0023: none mode, direct LAN peer — upstream admin is kept for the unrelayed caller, and the same peer relayed loses it", async () => {
   if (!LT_POSIX) return;
   const NAME = "ADR 0023: none mode, direct LAN peer — upstream admin is kept for the unrelayed caller, and the same peer relayed loses it";
