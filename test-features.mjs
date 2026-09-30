@@ -32291,6 +32291,21 @@ async function lt23MintKey(port, name) {
   assert.match(key, /^ocp_/, `premise: the minted key must be a real ocp_ key; got ${r.text.slice(0, 200)}`);
   return key;
 }
+// ADR 0017 Amendment 1 refuses the reserved bucket names at POST /api/keys, so a key carrying one
+// can no longer be MINTED. It can still EXIST: one created before the amendment. This writes that
+// row straight into the server's own key store, the way an older release left it. The admin GET
+// first is a premise, not decoration: it makes the server open (and migrate) the store before a
+// second connection writes to it, and proves the caller's credential really is admin.
+async function lt23SeedLegacyKey(port, dir, name, { host = "127.0.0.1", token = null } = {}) {
+  const pre = await lt23Fetch(port, { host, path: "/api/keys", token });
+  assert.equal(pre.status, 200, `premise: the key store must be open and readable as admin before seeding ${name}; got ${pre.status} ${pre.text.slice(0, 200)}`);
+  const db = new _lt17Db(join(dir, "ocp.db"));
+  try {
+    const key = "ocp_" + randomBytes(24).toString("base64url");
+    db.prepare("INSERT INTO api_keys (key, name) VALUES (?, ?)").run(key, name);
+    return key;
+  } finally { db.close(); }
+}
 // Usage rows by key name, read as admin from real loopback. Polls, because recordUsage runs after
 // the response is written — wait for the thing asserted, not a proxy for it. (ltWait takes a
 // SYNCHRONOUS predicate — a promise is always truthy — so this loop polls on its own.)
@@ -32363,8 +32378,9 @@ ltTest("ADR 0023: shared mode — through the tunnel the admin API takes the adm
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
     const key = await lt23MintKey(port, "lt23-app");
-    // A DB key may be NAMED "admin". Admin must come from the credential, never from the name.
-    const namedAdmin = await lt23MintKey(port, "admin");
+    // A DB key may be NAMED "admin" (one created before ADR 0017 Amendment 1). Admin must come
+    // from the credential, never from the name.
+    const namedAdmin = await lt23SeedLegacyKey(port, dir, "admin");
     const perApp = await lt23Fetch(port, { path: "/api/keys", token: key, relay: LT23_CF });
     assert.equal(perApp.status, 403, `a per-app key must NOT reach the admin API through the tunnel; got ${perApp.status} ${perApp.text.slice(0, 200)}`);
     const impostor = await lt23Fetch(port, { path: "/api/keys", token: namedAdmin, relay: LT23_CF });
@@ -32378,6 +32394,104 @@ ltTest("ADR 0023: shared mode — through the tunnel the admin API takes the adm
     // And real loopback, with no token, is still admin.
     const local = await lt23Fetch(port, { path: "/api/keys" });
     assert.equal(local.status, 200, `real loopback must still reach the admin API; got ${local.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── ADR 0017 Amendment 1: the internal bucket names are reserved at key creation ────────────────
+//
+// ADR 0023 made admin a property of the credential, so no key NAME confers admin any more. A key
+// named after a bucket still SHARES that bucket's rows: /api/usage scopes a non-admin caller to its
+// own key_name, and usage is recorded under it. So creation of those names is refused; keys that
+// already carry one keep working. The two halves are each other's control.
+import { DatabaseSync as _lt17Db } from "node:sqlite";
+import { RESERVED_KEY_NAMES as LT17_RESERVED, isReservedKeyName as lt17IsReserved } from "./keys.mjs";
+console.log("\nADR 0017 Amendment 1 (reserved key names):");
+
+test("ADR 0017 Amendment 1: the reserved list is exactly OCP's six internal bucket names, matched trimmed and case-insensitively", () => {
+  assert.deepEqual([...LT17_RESERVED].sort(), ["admin", "anonymous", "local", "remote", "shared", "unverified"]);
+  // The same six ADR 0023's tests call LT23_RESERVED_NAMES. If one list moves without the other,
+  // either a bucket became mintable or the tests stopped covering one.
+  assert.deepEqual([...LT17_RESERVED].sort(), [...LT23_RESERVED_NAMES].sort());
+  for (const n of ["admin", "Admin", "ADMIN", " admin", "admin ", "  LoCaL  ", "remote", "Shared", "UNVERIFIED", "anonymous"]) {
+    assert.equal(lt17IsReserved(n), true, `${JSON.stringify(n)} must be reserved`);
+  }
+  // Controls: near-misses are ordinary names. Without these the six trues above would pass for a
+  // predicate that refuses everything.
+  for (const n of ["admins", "admin1", "local-dev", "my remote", "shared.key", "app1", "", "key-1786399662735"]) {
+    assert.equal(lt17IsReserved(n), false, `${JSON.stringify(n)} must NOT be reserved`);
+  }
+  assert.equal(lt17IsReserved(undefined), false);
+  assert.equal(lt17IsReserved(42), false);
+});
+
+test("ADR 0017 Amendment 1: keys.mjs createKey refuses a reserved name and writes nothing; an ordinary name still mints", () => {
+  const before = listKeys().length;
+  for (const n of ["admin", " Shared ", "UNVERIFIED"]) {
+    assert.throws(() => createKey(n), /reserved key name/, `createKey(${JSON.stringify(n)}) must throw`);
+  }
+  assert.equal(listKeys().length, before, "a refused createKey must not leave a row behind");
+  const ok = createKey("lt17-admins");
+  assert.match(ok.key, /^ocp_/, "control: an ordinary name still mints a real key");
+  assert.equal(listKeys().length, before + 1);
+});
+
+ltTest("ADR 0017 Amendment 1: POST /api/keys answers 400 for every reserved name in any case or padding, mints none, and still mints ordinary names", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const variants = [...LT17_RESERVED, "Admin", "LOCAL", " remote", "Shared ", "  Unverified  ", "ANONYMOUS"];
+    for (const name of variants) {
+      const r = await lt23Fetch(port, { method: "POST", path: "/api/keys", body: { name } });
+      assert.equal(r.status, 400, `a key named ${JSON.stringify(name)} must be refused; got ${r.status} ${r.text.slice(0, 200)}`);
+      const body = JSON.parse(r.text);
+      // The endpoint's existing name-refusal shape: { error: { message, type: "invalid_request_error" } }.
+      assert.equal(body.error?.type, "invalid_request_error", `the refusal must reuse the existing error shape; got ${r.text}`);
+      assert.match(body.error?.message, /^Invalid key name: .* is reserved/, `the message must say the name is reserved; got ${r.text}`);
+    }
+    // Admin-key callers get the same answer; the refusal is about the name, not the caller.
+    const viaAdmin = await lt23Fetch(port, { method: "POST", path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, relay: LT23_CF, body: { name: "admin" } });
+    assert.equal(viaAdmin.status, 400, `the admin key through the tunnel must get the same 400; got ${viaAdmin.status}`);
+    // Nothing was minted: the store holds no key with a reserved name.
+    const list = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(list.status, 200);
+    const names = JSON.parse(list.text).keys.map((k) => k.name);
+    assert.deepEqual(names.filter((n) => lt17IsReserved(n)), [], `no reserved-name key may exist after the refusals; keys=${JSON.stringify(names)}`);
+    // THE CONTROLS: near-miss names and the auto-name still mint, so the 400s above are about the
+    // reserved set and not about POST /api/keys being closed.
+    for (const name of ["admins", "local-dev", "lt17-app"]) {
+      const r = await lt23Fetch(port, { method: "POST", path: "/api/keys", body: { name } });
+      assert.equal(r.status, 201, `control: ${JSON.stringify(name)} must still mint; got ${r.status} ${r.text.slice(0, 200)}`);
+    }
+    const auto = await lt23Fetch(port, { method: "POST", path: "/api/keys", body: {} });
+    assert.equal(auto.status, 201, `control: {} still mints an auto-named key; got ${auto.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0017 Amendment 1: a key that ALREADY carries a reserved name keeps authenticating and is attributed to it; only creation is refused", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    // A pre-amendment key named "remote", written the way an older release left it.
+    const legacy = await lt23SeedLegacyKey(port, dir, "remote");
+    // Premise: the same name cannot be minted today.
+    const mint = await lt23Fetch(port, { method: "POST", path: "/api/keys", body: { name: "remote" } });
+    assert.equal(mint.status, 400, `premise: "remote" is refused at creation; got ${mint.status}`);
+    // The legacy key still authenticates through the tunnel, where an unknown key is 401.
+    const chat = await lt23Fetch(port, { method: "POST", token: legacy, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(chat.status, 200, `an existing key named "remote" must keep working; got ${chat.status} ${chat.text.slice(0, 200)}`);
+    const bogus = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(bogus.status, 401, `control: an unknown key through the tunnel is still refused; got ${bogus.status}`);
+    const rows = await lt23UsageByKey(port, "remote");
+    assert.ok(rows.some((row) => row.key_name === "remote"), `the legacy key's request is recorded under its name; byKey=${JSON.stringify(rows)}`);
+    // It is listed, and it is not admin (ADR 0023), so the amendment removed nothing it had.
+    const list = await lt23Fetch(port, { path: "/api/keys" });
+    assert.ok(JSON.parse(list.text).keys.some((k) => k.name === "remote" && !k.revoked), "the legacy key is still listed and live");
+    const adminApi = await lt23Fetch(port, { path: "/api/keys", token: legacy, relay: LT23_CF });
+    assert.equal(adminApi.status, 403, `the legacy key is not admin; got ${adminApi.status}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -32397,9 +32511,16 @@ ltTest("ADR 0023: shared mode, direct LAN peer — no per-app key NAME confers a
     const premise = await lt23Fetch(port, { host: lan, path: "/api/keys" });
     assert.equal(premise.status, 401, `premise: a direct LAN request with no token must be 401 in shared mode; got ${premise.status} ${premise.text.slice(0, 200)}`);
     for (const name of [...LT23_RESERVED_NAMES, "app1"]) {
-      const mint = await lt23Fetch(port, { host: lan, method: "POST", path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, body: { name } });
-      assert.equal(mint.status, 201, `premise: minting a key named ${name} with the admin key must succeed; got ${mint.status} ${mint.text.slice(0, 200)}`);
-      const key = JSON.parse(mint.text).key;
+      // The reserved names can no longer be minted (ADR 0017 Amendment 1), so they are seeded as
+      // pre-amendment keys; "app1" still goes through the API.
+      let key;
+      if (LT23_RESERVED_NAMES.includes(name)) {
+        key = await lt23SeedLegacyKey(port, dir, name, { host: lan, token: LT_SECRETS.OCP_ADMIN_KEY });
+      } else {
+        const mint = await lt23Fetch(port, { host: lan, method: "POST", path: "/api/keys", token: LT_SECRETS.OCP_ADMIN_KEY, body: { name } });
+        assert.equal(mint.status, 201, `premise: minting a key named ${name} with the admin key must succeed; got ${mint.status} ${mint.text.slice(0, 200)}`);
+        key = JSON.parse(mint.text).key;
+      }
       for (const path of ["/api/keys", "/settings"]) {
         const r = await lt23Fetch(port, { host: lan, path, token: key });
         assert.equal(r.status, 403, `a per-app key NAMED "${name}" from a direct LAN peer must not be admin on ${path}; got ${r.status}`);
@@ -32426,9 +32547,8 @@ ltTest("ADR 0023: shared mode with NO PROXY_API_KEY — a keyless direct LAN cal
     // unrelayed caller that was never asked for a key is admin. This is the arm the flag tracks.
     const keyless = await lt23Fetch(port, { host: lan, path: "/api/keys" });
     assert.equal(keyless.status, 200, `a keyless direct LAN caller keeps upstream admin in this mode; got ${keyless.status} ${keyless.text.slice(0, 200)}`);
-    const mint = await lt23Fetch(port, { host: lan, method: "POST", path: "/api/keys", body: { name: "remote" } });
-    assert.equal(mint.status, 201, `premise: minting a key named remote must succeed; got ${mint.status}`);
-    const named = await lt23Fetch(port, { host: lan, path: "/api/keys", token: JSON.parse(mint.text).key });
+    const remoteKey = await lt23SeedLegacyKey(port, dir, "remote", { host: lan }); // pre-ADR 0017 Amendment 1 key
+    const named = await lt23Fetch(port, { host: lan, path: "/api/keys", token: remoteKey });
     assert.equal(named.status, 403, `a key NAMED "remote" must not borrow the keyless caller's admin; got ${named.status}`);
     const relayed = await lt23Fetch(port, { host: lan, path: "/api/keys", relay: LT23_CF });
     assert.equal(relayed.status, 403, `a RELAYED keyless caller in this mode must not be admin; got ${relayed.status}`);

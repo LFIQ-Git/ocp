@@ -128,7 +128,21 @@ function initSchema() {
 
 // ── Key CRUD ──
 
+// ADR 0017 Amendment 1. The names OCP gives its own auth buckets: the authKeyName a request is
+// recorded under when no per-app key matched (`local`, `remote`, `shared`, `admin`, `unverified`,
+// `anonymous`). A per-app key carrying one of them shares that bucket's rows on /api/usage and in
+// usage attribution, so a new key may not take one. Compared after trimming, case-insensitively.
+// EXISTING rows are not touched: validateKey() never consults this list, so a key created before
+// the amendment keeps authenticating under its old name. Only creation is refused.
+export const RESERVED_KEY_NAMES = Object.freeze(["admin", "local", "remote", "shared", "unverified", "anonymous"]);
+
+export function isReservedKeyName(name) {
+  return typeof name === "string" && RESERVED_KEY_NAMES.includes(name.trim().toLowerCase());
+}
+
 export function createKey(name) {
+  // Backstop for any caller that skips POST /api/keys's own 400: nothing may mint a reserved name.
+  if (isReservedKeyName(name)) throw new Error(`createKey: "${name}" is a reserved key name (ADR 0017 Amendment 1)`);
   const key = "ocp_" + randomBytes(24).toString("base64url");
   const d = getDb();
   const stmt = d.prepare("INSERT INTO api_keys (key, name) VALUES (?, ?)");

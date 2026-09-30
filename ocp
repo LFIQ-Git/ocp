@@ -522,7 +522,7 @@ cmd_keys() {
     add)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys add <name>"; return 1; fi
       local result
-      result=$(_CURL_HTTP_ERROR_LABEL="the proxy refused the key request — unauthorized, or key management not available (is OCP_ADMIN_KEY set and correct?)" \
+      result=$(_CURL_HTTP_ERROR_LABEL="the proxy refused the key request — unauthorized, key management not available (is OCP_ADMIN_KEY set and correct?), or the name is invalid or reserved (admin, local, remote, shared, unverified and anonymous are reserved)" \
         _curl_or_die "proxy unreachable" _curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$2\"}") || exit 1
