@@ -32468,6 +32468,71 @@ ltTest("ADR 0023: OCP_REMOTE_AUTH_OBSERVE=1 admits a bogus tunneled key as \"unv
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── Logged client IP: the relayed caller, not the tunnel's loopback socket ──────────────────────
+//
+// ADR 0023 derived `auth_would_reject`'s clientIp from the relay headers, inline, but
+// `admin_usage_full_scope` kept logging req.socket.remoteAddress, which is 127.0.0.1 for every
+// tunneled caller. Both now read lib/net.mjs § clientIpOf. Logging only: no status, body or trust
+// decision moves, which the premise assertions below pin alongside the log fields.
+import { clientIpOf, CLIENT_IP_LOG_CAP } from "./lib/net.mjs";
+console.log("\nLogged client IP (relayed caller, lib/net.mjs clientIpOf):");
+
+test("clientIpOf: relay header first (cf-connecting-ip, then x-forwarded-for), socket peer otherwise, capped at 200", () => {
+  assert.equal(clientIpOf({ "cf-connecting-ip": "203.0.113.7" }, "127.0.0.1"), "203.0.113.7");
+  assert.equal(clientIpOf({ "x-forwarded-for": "198.51.100.4, 10.0.0.1" }, "127.0.0.1"), "198.51.100.4, 10.0.0.1",
+    "x-forwarded-for is logged as sent (a chain), never parsed into a trust decision");
+  assert.equal(clientIpOf({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "198.51.100.4" }, "127.0.0.1"), "203.0.113.7",
+    "cf-connecting-ip wins, in RELAY_HEADERS order");
+  // Controls: an unrelayed request logs its socket peer, and an EMPTY relay header falls through,
+  // exactly as the inline `||` chain it replaces did.
+  assert.equal(clientIpOf({ host: "127.0.0.1:3456" }, "192.168.1.20"), "192.168.1.20");
+  assert.equal(clientIpOf({ "cf-connecting-ip": "" }, "127.0.0.1"), "127.0.0.1");
+  assert.equal(clientIpOf(undefined, undefined), "");
+  assert.equal(CLIENT_IP_LOG_CAP, 200);
+  assert.equal(clientIpOf({ "x-forwarded-for": "9".repeat(500) }, "127.0.0.1").length, 200, "a long header is capped at 200");
+});
+
+ltTest("logged client IP: admin_usage_full_scope and auth_would_reject name the relayed client, not 127.0.0.1; real loopback still logs its socket", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT23_SHARED, OCP_REMOTE_AUTH_OBSERVE: "1", CLAUDE_BIN: fake }, dir);
+  const events = (name) => buf.out.concat(buf.err).split("\n").filter((l) => l.includes(`"event":"${name}"`)).map((l) => JSON.parse(l));
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    // 1. admin_usage_full_scope through the tunnel, with cf-connecting-ip.
+    const viaCf = await lt23Fetch(port, { path: "/api/usage?all=true", token: LT_SECRETS.OCP_ADMIN_KEY, relay: LT23_CF });
+    assert.equal(viaCf.status, 200, `premise: the admin key through the tunnel reads full-scope usage; got ${viaCf.status}`);
+    assert.ok(await ltWait(() => events("admin_usage_full_scope").length >= 1, 5000), `admin_usage_full_scope was never logged — ${ltDiag(buf)}`);
+    const cf = events("admin_usage_full_scope")[0];
+    assert.equal(cf.ip, LT23_CF["cf-connecting-ip"], `the logged ip must be the relayed client, not the tunnel's socket; got ${JSON.stringify(cf)}`);
+    assert.equal(cf.relayedBy, "cf-connecting-ip", `and the relay header is named; got ${JSON.stringify(cf)}`);
+    assert.equal(cf.caller, "admin");
+    // 2. x-forwarded-for, over the cap: logged, capped at 200.
+    const longXff = "198.51.100.4, " + "10.0.0.1, ".repeat(40);
+    const viaXff = await lt23Fetch(port, { path: "/api/usage?all=true", token: LT_SECRETS.OCP_ADMIN_KEY, relay: { "x-forwarded-for": longXff } });
+    assert.equal(viaXff.status, 200, `premise: got ${viaXff.status}`);
+    assert.ok(await ltWait(() => events("admin_usage_full_scope").length >= 2, 5000), `second admin_usage_full_scope missing — ${ltDiag(buf)}`);
+    const xff = events("admin_usage_full_scope")[1];
+    assert.equal(xff.ip, longXff.slice(0, 200), `x-forwarded-for is logged, capped at 200; got ${JSON.stringify(xff.ip)}`);
+    assert.equal(xff.relayedBy, "x-forwarded-for");
+    // 3. THE CONTROL: real loopback, no relay header, logs its socket peer and no relay.
+    const local = await lt23Fetch(port, { path: "/api/usage?all=true" });
+    assert.equal(local.status, 200);
+    assert.ok(await ltWait(() => events("admin_usage_full_scope").length >= 3, 5000), `third admin_usage_full_scope missing — ${ltDiag(buf)}`);
+    const lo = events("admin_usage_full_scope")[2];
+    assert.match(lo.ip, /^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/, `an unrelayed loopback caller logs its socket peer; got ${JSON.stringify(lo)}`);
+    assert.equal(lo.relayedBy, null);
+    // Logging only: the response the tunneled and loopback admin callers got has the same key set.
+    assert.deepEqual(Object.keys(JSON.parse(viaCf.text)).sort(), Object.keys(JSON.parse(local.text)).sort(),
+      "the /api/usage response shape does not depend on the relay header");
+    // 4. auth_would_reject still derives clientIp the same way (now through the shared helper).
+    const bogus = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(bogus.status, 200, `premise: observe mode admits the bogus key; got ${bogus.status}`);
+    assert.ok(await ltWait(() => events("auth_would_reject").length >= 1, 5000), `auth_would_reject was never logged — ${ltDiag(buf)}`);
+    assert.equal(events("auth_would_reject")[0].clientIp, LT23_CF["cf-connecting-ip"]);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 ltTest("ADR 0023: none mode — a tunneled request is still admitted, but is not admin; real loopback still is", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);

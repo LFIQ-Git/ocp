@@ -46,7 +46,7 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { scheduleKillEscalation } from "./lib/child-tree.mjs";
-import { isLoopbackBind, relayHeaderOf } from "./lib/net.mjs";
+import { isLoopbackBind, relayHeaderOf, clientIpOf } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
@@ -5308,7 +5308,7 @@ async function handleRequest(req, res) {
             keyPreview: token ? token.slice(0, 8) : null,
             relayedBy,
             // Capped: x-forwarded-for's leftmost entry is client-controlled. Not for blocking decisions.
-            clientIp: String(req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"] || remoteAddr).slice(0, 200),
+            clientIp: clientIpOf(req.headers, remoteAddr),
             method: req.method,
             path: pathname,
           });
@@ -5696,7 +5696,9 @@ async function handleRequest(req, res) {
     const scopeName = fullScope ? null : callerName;
 
     if (fullScope) {
-      logEvent("info", "admin_usage_full_scope", { caller: callerName, ip: req.socket.remoteAddress || null });
+      // The relayed client, not the socket peer: behind a tunnel the peer is always 127.0.0.1.
+      // Logging only; lib/net.mjs § clientIpOf. `|| null` keeps this field's previous empty value.
+      logEvent("info", "admin_usage_full_scope", { caller: callerName, ip: clientIpOf(req.headers, req.socket.remoteAddress) || null, relayedBy: relayHeaderOf(req.headers) });
     }
 
     const byKeyAll = getUsageByKey({ since, until });
