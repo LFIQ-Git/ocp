@@ -11,6 +11,7 @@
   - Admin is decided from which credential matched, never from the key name, so no DB key name (`remote`, `local`, `shared`, `admin`, `unverified`, `anonymous`) confers admin in shared or none mode. A direct LAN shared-mode caller with a DB key used to get 401; it is now admitted without admin. Multi mode's formula is unchanged apart from relayed requests no longer being localhost.
   - `none` mode still serves relayed requests but they are not admin. Real loopback callers are unchanged in every mode.
   - README: `OCP_REMOTE_AUTH_OBSERVE` row, `OCP_ADMIN_KEY` row, and a bootstrap-quirk entry.
+- **Multi mode: a key named `admin` is no longer admin (ADR 0024).** Class Hybrid; ADR 0006 route (b), a semantics change on the Class B.2 admin-gated endpoints: a request that executed now gets `403`. No field or endpoint is added. In `CLAUDE_AUTH_MODE=multi` admin was `authKeyName === "admin" || isLocalhost`, and a keys-DB key's name lands in `authKeyName`, so whoever held a key named `admin` could mint and revoke keys and change `/settings` remotely, even with `OCP_ADMIN_KEY` unset. Admin is now genuine localhost or a token matching `OCP_ADMIN_KEY`, through ADR 0023's `remoteCredentialIsAdmin` flag, and no arm of `isAdmin` reads a key name. The key still authenticates and is attributed as before. If you used such a key as your remote admin credential, set `OCP_ADMIN_KEY`; to retire it, `ocp keys revoke admin`. Closes the second ADR 0023 follow-up.
 
 ## v3.41.0 — 2026-09-25
 

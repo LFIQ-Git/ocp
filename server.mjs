@@ -5220,7 +5220,8 @@ async function handleRequest(req, res) {
   let authKeyName = isLocalhost ? "local" : "remote";
   let authKeyId = null;
   // ADR 0023: set only when the token matched OCP_ADMIN_KEY or PROXY_API_KEY on the remote
-  // shared-mode path. Admin is decided from this, never from authKeyName, because a key in the
+  // shared-mode path. ADR 0024: also set when the token matched OCP_ADMIN_KEY on the remote
+  // multi-mode path. Admin is decided from this, never from authKeyName, because a key in the
   // DB may legitimately be NAMED "admin" or "shared".
   let remoteCredentialIsAdmin = false;
   // ADR 0023: set only when a remote request was admitted WITHOUT being asked for any credential
@@ -5303,6 +5304,7 @@ async function handleRequest(req, res) {
           if (adminBuf.length === tokenBuf2.length && timingSafeEqual(adminBuf, tokenBuf2)) {
             authKeyName = "admin";
             isAdminToken = true;
+            remoteCredentialIsAdmin = true; // ADR 0024: the credential, not the name, makes admin
           }
         }
         // === NEW: anonymous allowlist (issue #12 §14 Path A) ===
@@ -5345,8 +5347,11 @@ async function handleRequest(req, res) {
   // shared mode with no PROXY_API_KEY), which is upstream's behaviour for a direct LAN client.
   // Not admin: a per-app DB key, "unverified" (observe mode), and any relayed request that did not
   // present one of the two admin credentials.
+  //
+  // ADR 0024, multi: admin is localhost or a remote caller whose token matched OCP_ADMIN_KEY. It
+  // used to be `authKeyName === "admin" || isLocalhost`, so a keys-DB key NAMED "admin" was admin.
   const isAdmin = AUTH_MODE === "multi"
-    ? authKeyName === "admin" || isLocalhost
+    ? remoteCredentialIsAdmin || isLocalhost
     : isLocalhost || remoteCredentialIsAdmin || (!relayedBy && admittedWithoutCredential);
 
   // GET /v1/models
