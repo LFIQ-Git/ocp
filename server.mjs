@@ -64,7 +64,7 @@ import { createSerialMutex, createTtlCache, orderLabelsLastGoodFirst, scrubInbou
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
 import { classifyCapabilityProbe, capabilityBootError } from "./lib/claude-capability.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
-import { parsePositiveInt } from "./lib/env.mjs";
+import { parsePositiveInt, authModeBootError } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -547,6 +547,15 @@ function noteCacheBreakpointRejection(errText, spawnCarried) {
 // OAuth token is resolvable. Provided as an escape hatch in case a host depends on the real
 // HOME's claude config for the spawned process.
 const SPAWN_REAL_HOME = process.env.OCP_SPAWN_REAL_HOME === "1";
+// An unrecognised CLAUDE_AUTH_MODE used to fall through to the `none` branch: a typo booted an open
+// proxy. Refuse it here, before AUTH_MODE is derived, the same way the other boot gates refuse an
+// unsafe configuration (FATAL line, exit 1). Unset or empty keeps the derivation below unchanged.
+// The rule and the message live in lib/env.mjs § authModeBootError.
+const _authModeBootError = authModeBootError(process.env.CLAUDE_AUTH_MODE);
+if (_authModeBootError) {
+  console.error(`FATAL: ${_authModeBootError}`);
+  process.exit(1);
+}
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 
 // ── system-prompt wrapper selection (moved here from ~line 233) ─────────────────────────────────
@@ -5352,7 +5361,8 @@ async function handleRequest(req, res) {
         authKeyName = "anonymous";
       }
     } else {
-      // none (or any unrecognised mode): no auth, so a remote caller is admitted without a credential.
+      // none: no auth, so a remote caller is admitted without a credential. (An unrecognised mode
+      // used to land here too; it is now refused at boot, lib/env.mjs § authModeBootError.)
       admittedWithoutCredential = true;
     }
   }

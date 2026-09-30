@@ -32435,6 +32435,85 @@ ltTest("ADR 0023: shared mode with NO PROXY_API_KEY — a keyless direct LAN cal
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── An unrecognised CLAUDE_AUTH_MODE refuses to boot ──────────────────────────────────────────
+//
+// Every `AUTH_MODE === …` test in the auth block missed on a typo, so `sharde` or `Shared` fell to
+// the `none` branch and served an open proxy to an operator who believed shared-key auth was on.
+// Now it is a FATAL at boot. Paired with valid boots, so a gate that refuses everything fails too.
+import { AUTH_MODES as LTAM_MODES, authModeBootError as ltamBootError } from "./lib/env.mjs";
+console.log("\nCLAUDE_AUTH_MODE validated at boot:");
+
+test("authModeBootError: none, shared and multi pass exactly; unset and empty pass; anything else is refused and named", () => {
+  assert.deepEqual([...LTAM_MODES], ["none", "shared", "multi"]);
+  for (const ok of ["none", "shared", "multi", undefined, null, ""]) {
+    assert.equal(ltamBootError(ok), null, `${JSON.stringify(ok)} must be accepted`);
+  }
+  for (const bad of ["sharde", "Shared", "SHARED", " shared", "shared ", "open", "multi-user", "0"]) {
+    const msg = ltamBootError(bad);
+    assert.ok(msg, `${JSON.stringify(bad)} must be refused`);
+    assert.ok(msg.includes(JSON.stringify(bad)), `the message must name the value as given; got ${msg}`);
+    assert.ok(msg.includes("Allowed values: none, shared, multi"), `the message must list the allowed values; got ${msg}`);
+  }
+});
+
+ltTest("CLAUDE_AUTH_MODE=sharde exits non-zero with a FATAL naming the value and the allowed ones; =shared boots", async () => {
+  if (!LT_POSIX) return;
+  // THE CLAIM: a typo refuses to boot.
+  {
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    const { child, buf } = await ltBootFresh({ CLAUDE_AUTH_MODE: "sharde", PROXY_API_KEY: LT_SECRETS.PROXY_API_KEY, CLAUDE_BIN: fake }, dir);
+    try {
+      // Wait for `closed`, not `exit`: the assertions read buf.err (#203).
+      assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `process never closed — ${ltDiag(buf)}`);
+      assert.ok(buf.err.length > 0, `child wrote nothing to stderr at all — ${ltDiag(buf)}`);
+      assert.notEqual(buf.exit, 0, `a bogus auth mode must exit non-zero — ${ltDiag(buf)}`);
+      assert.ok(buf.err.includes('FATAL: CLAUDE_AUTH_MODE="sharde" is not a recognised auth mode. Allowed values: none, shared, multi'),
+        `the FATAL must name the value and the allowed ones — ${ltDiag(buf)}`);
+      assert.ok(!buf.out.includes("listening on"), `it must refuse BEFORE listening — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+  }
+  // The case rule: `Shared` is not `shared`, and is refused rather than silently served open.
+  {
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    const { child, buf } = await ltBootFresh({ CLAUDE_AUTH_MODE: "Shared", PROXY_API_KEY: LT_SECRETS.PROXY_API_KEY, CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `process never closed — ${ltDiag(buf)}`);
+      assert.notEqual(buf.exit, 0, `"Shared" must exit non-zero — ${ltDiag(buf)}`);
+      assert.ok(buf.err.includes('FATAL: CLAUDE_AUTH_MODE="Shared"'), `the FATAL must name "Shared" — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+  }
+  // THE CONTROL: the correctly spelled mode boots and enforces.
+  {
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "shared", PROXY_API_KEY: LT_SECRETS.PROXY_API_KEY, CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `a valid mode must boot — ${ltDiag(buf)}`);
+      assert.ok(!/FATAL/.test(buf.err), `no FATAL for a valid mode — ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => /Auth mode: shared/.test(buf.out), 5000), `banner must report shared — ${ltDiag(buf)}`);
+      const bogus = await lt23Fetch(port, { method: "POST", token: LT23_BOGUS, relay: LT23_CF, body: LT23_CHAT });
+      assert.equal(bogus.status, 401, `and shared mode is really enforcing; got ${bogus.status}`);
+    } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+  }
+});
+
+ltTest("CLAUDE_AUTH_MODE unset or empty keeps today's derivation: shared with PROXY_API_KEY, none without", async () => {
+  if (!LT_POSIX) return;
+  // `undefined` really unsets it: child_process drops undefined env values (measured), which
+  // overrides ltBoot's base CLAUDE_AUTH_MODE=none.
+  for (const [label, env, want] of [
+    ["unset + PROXY_API_KEY", { CLAUDE_AUTH_MODE: undefined, PROXY_API_KEY: LT_SECRETS.PROXY_API_KEY }, "shared"],
+    ["unset, no key", { CLAUDE_AUTH_MODE: undefined, PROXY_API_KEY: undefined }, "none"],
+    ["empty + PROXY_API_KEY", { CLAUDE_AUTH_MODE: "", PROXY_API_KEY: LT_SECRETS.PROXY_API_KEY }, "shared"],
+  ]) {
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    const { child, buf } = await ltBootFresh({ ...env, CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `[${label}] must boot — ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => new RegExp(`Auth mode: ${want}`).test(buf.out), 5000), `[${label}] must derive ${want} — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+  }
+});
+
 ltTest("ADR 0023: OCP_REMOTE_AUTH_OBSERVE=1 admits a bogus tunneled key as \"unverified\", logs auth_would_reject, and is not admin", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
