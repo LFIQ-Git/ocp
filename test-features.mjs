@@ -32516,6 +32516,94 @@ ltTest("ADR 0023: multi mode — a tunneled request is no longer localhost-admin
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── ADR 0024: in multi mode admin comes from OCP_ADMIN_KEY, never from a key's name ──────────────
+//
+// Until this change multi mode computed `isAdmin = authKeyName === "admin" || isLocalhost`, so a
+// keys-DB key NAMED "admin" was admin for any remote caller. ADR 0023 fixed the same shape in shared
+// and none mode with an explicit flag and left multi mode alone; this carries the flag over. Each
+// test pairs the named key (must be 403) with OCP_ADMIN_KEY on the same route and path (must be 200),
+// so a build that closes the route to everyone fails the control and a build that still reads the
+// name fails the claim.
+import { DatabaseSync as _lt24Db } from "node:sqlite";
+console.log("\nADR 0024 (multi mode: admin by credential, not by name):");
+
+// A key named "admin" is written straight into the server's own store: that is how one exists on a
+// host that minted it before ADR 0017 Amendment 1 reserved the name, and it keeps this test
+// independent of whether that amendment has landed. The admin GET first opens and migrates the
+// store, and proves the credential used for it is admin.
+async function lt24SeedKey(port, dir, name, { host = "127.0.0.1", token = null } = {}) {
+  const pre = await lt23Fetch(port, { host, path: "/api/keys", token });
+  assert.equal(pre.status, 200, `premise: the key store must be open and readable as admin before seeding ${name}; got ${pre.status} ${pre.text.slice(0, 200)}`);
+  const db = new _lt24Db(join(dir, "ocp.db"));
+  try {
+    const key = "ocp_" + randomBytes(24).toString("base64url");
+    db.prepare("INSERT INTO api_keys (key, name) VALUES (?, ?)").run(key, name);
+    return key;
+  } finally { db.close(); }
+}
+const LT24_MULTI = { CLAUDE_AUTH_MODE: "multi", OCP_ADMIN_KEY: LT_SECRETS.OCP_ADMIN_KEY };
+const LT24_ADMIN_ROUTES = ["/api/keys", "/settings"];
+
+ltTest("ADR 0024: multi mode, through the tunnel — a DB key NAMED \"admin\" gets 403 on the admin API, OCP_ADMIN_KEY gets 200", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT24_MULTI, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const named = await lt24SeedKey(port, dir, "admin");
+    // PREMISE: the named key is a valid credential. Multi mode 401s an unknown key, so a 200 here
+    // proves the 403s below are about admin, not about the key failing to authenticate.
+    const chat = await lt23Fetch(port, { method: "POST", token: named, relay: LT23_CF, body: LT23_CHAT });
+    assert.equal(chat.status, 200, `premise: the key named "admin" authenticates in multi mode; got ${chat.status} ${chat.text.slice(0, 200)}`);
+    for (const path of LT24_ADMIN_ROUTES) {
+      const impostor = await lt23Fetch(port, { path, token: named, relay: LT23_CF });
+      assert.equal(impostor.status, 403, `a DB key NAMED "admin" must not be admin on ${path} (it was 200 before ADR 0024); got ${impostor.status} ${impostor.text.slice(0, 200)}`);
+      const admin = await lt23Fetch(port, { path, token: LT_SECRETS.OCP_ADMIN_KEY, relay: LT23_CF });
+      assert.equal(admin.status, 200, `control: OCP_ADMIN_KEY on ${path} through the tunnel is admin; got ${admin.status} ${admin.text.slice(0, 200)}`);
+    }
+    // Genuine localhost keeps its semantics: admin with no token at all.
+    const local = await lt23Fetch(port, { path: "/api/keys" });
+    assert.equal(local.status, 200, `control: real loopback in multi mode is still admin; got ${local.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0024: multi mode, direct LAN peer — a DB key NAMED \"admin\" gets 403, OCP_ADMIN_KEY gets 200", async () => {
+  if (!LT_POSIX) return;
+  const NAME = "ADR 0024: multi mode, direct LAN peer — a DB key NAMED \"admin\" gets 403, OCP_ADMIN_KEY gets 200";
+  const lan = lt23LanAddress();
+  if (!lan) skipRemainingTest(NAME, "no non-internal IPv4 interface on this host, so no non-loopback peer can be produced");
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT24_MULTI, CLAUDE_BIND: lan, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    // PREMISE: this peer is non-loopback. Multi mode admits a keyless caller as "anonymous", which
+    // is not admin, so the keyless 403 proves the peer is not classified as localhost.
+    const keyless = await lt23Fetch(port, { host: lan, path: "/api/keys" });
+    assert.equal(keyless.status, 403, `premise: a keyless direct LAN caller in multi mode is not admin; got ${keyless.status} ${keyless.text.slice(0, 200)}`);
+    const named = await lt24SeedKey(port, dir, "admin", { host: lan, token: LT_SECRETS.OCP_ADMIN_KEY });
+    for (const path of LT24_ADMIN_ROUTES) {
+      const impostor = await lt23Fetch(port, { host: lan, path, token: named });
+      assert.equal(impostor.status, 403, `a DB key NAMED "admin" from a direct LAN peer must not be admin on ${path}; got ${impostor.status}`);
+      const admin = await lt23Fetch(port, { host: lan, path, token: LT_SECRETS.OCP_ADMIN_KEY });
+      assert.equal(admin.status, 200, `control: OCP_ADMIN_KEY from the same peer on ${path} is admin; got ${admin.status}`);
+    }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0024: multi mode with NO OCP_ADMIN_KEY — a DB key NAMED \"admin\" is not a remote admin path; loopback still is", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start — ${ltDiag(buf)}`);
+    const named = await lt24SeedKey(port, dir, "admin");
+    const impostor = await lt23Fetch(port, { path: "/api/keys", token: named, relay: LT23_CF });
+    assert.equal(impostor.status, 403, `with no OCP_ADMIN_KEY there is no remote admin, and a key NAMED "admin" does not become one; got ${impostor.status}`);
+    const local = await lt23Fetch(port, { path: "/api/keys", token: named });
+    assert.equal(local.status, 200, `control: the same key from real loopback is admin, because loopback is; got ${local.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── The Node prerequisite: one table, and everything else derived from it ─────────────────
 //
 // WHAT WAS WRONG. `package.json` declared `>=22.5` and `setup.mjs` gated on

@@ -392,6 +392,6 @@ When a key exceeds its quota, OCP returns HTTP 429 with a structured error:
 - All users share your Claude Pro/Max **rate limits** (5h session + 7d weekly)
 - `ocp usage` shows how much quota remains
 - Keys are stored in `~/.ocp/ocp.db` (SQLite, zero external dependencies)
-- Admin key is required for key management API endpoints
+- Admin key is required for key management API endpoints. Remotely, only a token matching `OCP_ADMIN_KEY` is admin; a key from `/api/keys` is never admin, whatever it is named ([ADR 0024](adr/0024-multi-mode-admin-by-credential.md))
 - The dashboard (`/dashboard`) and health check (`/health`) are always public
 - File modes for `~/.ocp` (0700), `admin-key` + `ocp.db` (0600) are auto-tightened at server startup as of v3.14.0

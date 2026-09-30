@@ -137,13 +137,13 @@ ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory tabl
 
 > The citation above is anchored on a **grep-able marker**, not on a bare line number, because the bare line number is what rotted: this note cited `server.mjs` line 845–849 from before v3.16.4 until #292, and by then those lines were the `OCP_LOCAL_TOOLS` boot gate — a reviewer following the citation as instructed landed on unrelated code. The block had moved to 2374–2379, and even #292's own corrected range (2349–2354) was stale again by the time the fix was written. `// ALIGNMENT:` appears exactly once in `server.mjs` and marks this block deliberately, so it survives the drift a line number cannot. Line numbers in this document are always secondary to a named anchor, and are pinned to a stated version so that staleness is visible rather than silent.
 
-**Cross-cutting authorizations (ADR 0019, ADR 0020, ADR 0023).** The table above maps each endpoint to the
-ADR that authorized *its existence*. Three authorizations are not endpoint-scoped and therefore have
-no row. The first two govern the same gate at the top of `handleRequest`, which runs before `OPTIONS`,
-before auth and before routing; the third governs the auth block right after it. All three change
-**semantics** for every endpoint in this table — a request that previously executed now receives
-`401` or `403` — which is why each is ADR 0006 route **(b)** and not the grandfather clause, and
-none adds a field or an endpoint, so none is filed under ADR 0012.
+**Cross-cutting authorizations.** The table above maps each endpoint to the ADR that authorized
+*its existence*. The authorizations listed below are not endpoint-scoped and therefore have no row.
+ADR 0019 and ADR 0020 govern the same gate at the top of `handleRequest`, which runs before
+`OPTIONS`, before auth and before routing; the others govern the auth block right after it. Each
+changes **semantics** for the endpoints in this table it reaches — a request that previously
+executed now receives `401` or `403` — which is why each is ADR 0006 route **(b)** and not the
+grandfather clause, and none adds a field or an endpoint, so none is filed under ADR 0012.
 
 - [ADR 0019](docs/adr/0019-inbound-origin-gate.md) refuses any request carrying a non-allowlisted
   `Origin` header on a method other than `GET`/`HEAD`. Its two admitting arms are the
@@ -168,6 +168,12 @@ none adds a field or an endpoint, so none is filed under ADR 0012.
   admits the rest as non-admin `unverified` for a transition window. Also a **semantics** change on
   every endpoint in the table above (a request that executed now gets `401` or `403`), so again ADR
   0006 route (b), not the grandfather clause and not ADR 0012.
+
+- [ADR 0024](docs/adr/0024-multi-mode-admin-by-credential.md) changes the `isAdmin` rule in that same
+  auth block for `multi` mode only: admin is genuine localhost or a token that matched `OCP_ADMIN_KEY`,
+  never a keys-DB key's **name**. A multi-mode request carrying a DB key named `admin` that executed
+  as admin now gets `403` on the admin-gated endpoints. A semantics change, ADR 0006 route (b), not
+  ADR 0012.
 
 > Recorded here rather than only in the ADR because **this paragraph is what a reviewer reads when
 > CLAUDE.md tells them to "independently confirm the declared class against the `ALIGNMENT.md`
