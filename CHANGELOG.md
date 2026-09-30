@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Security
+
+- **A request relayed by a tunnel or reverse proxy is remote, even on a loopback socket (ADR 0023).** Class Hybrid; ADR 0006 route (b), a semantics change: a request that executed now gets `401` or `403`. No field or endpoint is added. Measured in production on 2026-09-30 behind a Cloudflare Tunnel (`cloudflared` ingress `http://localhost:3456`, `CLAUDE_AUTH_MODE=shared`): `cloudflared` connects from loopback, so every internet request was classified as localhost. A made-up `ocp_bogus` token got 200 on `/v1/chat/completions`, `isAdmin` was true so `/api/keys`, `/settings`, `/logs` and `/api/usage` were open to anyone past Cloudflare Access, and all 720 usage rows since May were attributed to `local`.
+  - A request carrying `cf-connecting-ip` or `x-forwarded-for` is never localhost (`lib/net.mjs` § `RELAY_HEADERS`). Presence can only downgrade a request, so a local caller sending the header gains nothing and no trusted-proxy list is needed.
+  - Shared mode, remote caller: `OCP_ADMIN_KEY` (admin), `PROXY_API_KEY` (`shared`, admin as before), or a keys-DB key (its own name and id, quota-bound, **not** admin). Anything else gets the existing `401`.
+  - `OCP_REMOTE_AUTH_OBSERVE=1` admits a missing or unknown key as `unverified` (not admin) and logs `auth_would_reject` (`reason`, 8-character `keyPreview`, `relayedBy`, `clientIp`, `method`, `path`). Default off. Boot warnings when it is on, when it cannot take effect, and when it is set to anything other than `1`.
+  - Admin is decided from which credential matched, never from the key name, so no DB key name (`remote`, `local`, `shared`, `admin`, `unverified`, `anonymous`) confers admin in shared or none mode. A direct LAN shared-mode caller with a DB key used to get 401; it is now admitted without admin. Multi mode's formula is unchanged apart from relayed requests no longer being localhost.
+  - `none` mode still serves relayed requests but they are not admin. Real loopback callers are unchanged in every mode.
+  - README: `OCP_REMOTE_AUTH_OBSERVE` row, `OCP_ADMIN_KEY` row, and a bootstrap-quirk entry.
+
 ## v3.41.0 — 2026-09-25
 
 ### Added
